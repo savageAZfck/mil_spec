@@ -1,0 +1,23 @@
+[package]
+name = "mil_spec"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Write Apple CoreML .mlpackage programs in pure Rust: MIL ops, stateful graphs, weight blobs. No Python, no coremltools."
+license = "MIT OR Apache-2.0"
+authors = ["Adam Clark <savagetism@icloud.com>"]
+repository = "https://github.com/savageAZfck/mil_spec"
+homepage = "https://github.com/savageAZfck/mil_spec"
+keywords = ["coreml", "neural-engine", "apple-silicon", "mil", "mlmodel"]
+categories = ["compilers", "encoding", "parsing"]
+readme = "README.md"
+
+[dependencies]
+half = "2"
+
+[dev-dependencies]
+tempfile = "3.8"
+
+[profile.release]
+lto = true
+codegen-units = 1

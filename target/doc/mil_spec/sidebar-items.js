@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["Binding","DType","Immediate","Value","ValueType"],"fn":["bind","bind_const","bind_many","encode_model","write_mlpackage"],"struct":["Argument","BlobWriter","Block","Feature","ModelMeta","NVT","Op","TensorType","WeightBin"]};
