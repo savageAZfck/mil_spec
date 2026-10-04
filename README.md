@@ -46,10 +46,36 @@ Compile with `xcrun coremlc compile model.mlpackage .` and you have a real
 | `weight.bin` v2, in-memory | [`WeightBin`] |
 | `.mlpackage` + `Manifest.json` | [`write_mlpackage`] |
 | RMSNorm peephole (fp16-safe prescaling) | [`Block::rms_norm`] |
+| Validated IR front-end (text → checked graph) | [`ir::compile`] |
 
 `ModelMeta` carries `spec_version` + `opset` — e.g. `(8, "CoreML5")`,
 `(10, "CoreML9")` — the Function's block specialization and the
 specification version move together.
+
+## The IR front-end
+
+`mil_spec::ir` is a compiler: a line-oriented SSA text form that lowers
+onto the typed `Block` helpers and **validates before it emits** — names
+must resolve, shapes must check out (broadcast, reshape element counts,
+matmul inner dims, permutations, concat ranks, state reads/writes), and
+declared outputs must be defined.
+
+```text
+input  x: fp16[1,4,1,1]
+k    = const_f16(2.0)
+y    = mul(x, k)
+z    = reshape(y, [4,1,1,1])
+output z
+```
+
+```rust
+let prog = mil_spec::ir::compile(src)?;          // parse + lower + validate
+let spec = mil_spec::encode_model(&prog.inputs, &prog.outputs, &prog.states,
+                                  &prog.block, &prog.fn_inputs, &meta);
+mil_spec::write_mlpackage(dir, &spec, weights)?;
+```
+
+See `examples/compile_ir.rs` for a stateful KV-cache program.
 
 ## Why a hand-rolled writer
 

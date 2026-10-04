@@ -41,6 +41,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ir;
+
 use std::io::{Seek, SeekFrom, Write};
 
 // ======== protobuf wire primitives ========
@@ -130,7 +132,7 @@ fn map_entry_str(buf: &mut Vec<u8>, field: u32, key: &str, val: &[u8]) {
 ///
 /// The numeric mappings are the MIL/ArrayFeatureType/BlobDataType enum
 /// values from Apple's format — they are wire constants, not indices.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DType {
     Bool,
     Fp16,
@@ -1414,7 +1416,14 @@ mod tests {
             dtype: DType::Fp16,
             is_state: false,
         }];
-        let spec = encode_model(&inputs, outs, &[], blk, fn_inputs, &ModelMeta::new(8, "CoreML5"));
+        let spec = encode_model(
+            &inputs,
+            outs,
+            &[],
+            blk,
+            fn_inputs,
+            &ModelMeta::new(8, "CoreML5"),
+        );
         write_mlpackage(dir, &spec, weights).unwrap();
         assert!(dir.join("Manifest.json").exists());
         assert!(dir.join("Data/com.apple.CoreML/model.mlmodel").exists());

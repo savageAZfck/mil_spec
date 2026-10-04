@@ -1,6 +1,6 @@
 [package]
 name = "mil_spec"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Write Apple CoreML .mlpackage programs in pure Rust: MIL ops, stateful graphs, weight blobs. No Python, no coremltools."

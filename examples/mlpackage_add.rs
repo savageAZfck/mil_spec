@@ -27,7 +27,14 @@ fn main() -> std::io::Result<()> {
         ty: ValueType::Tensor(TensorType::f16(&[1, 4, 1, 1])),
     }];
 
-    let spec = encode_model(&inputs, &outputs, &[], &b, &fn_inputs, &ModelMeta::new(8, "CoreML5"));
+    let spec = encode_model(
+        &inputs,
+        &outputs,
+        &[],
+        &b,
+        &fn_inputs,
+        &ModelMeta::new(8, "CoreML5"),
+    );
 
     let dir = std::path::Path::new("/tmp/mil_spec_add.mlpackage");
     write_mlpackage(dir, &spec, None)?;
