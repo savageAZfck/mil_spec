@@ -86,12 +86,6 @@ impl Ty {
     fn numel(&self) -> i64 {
         self.shape.iter().product()
     }
-    fn value_type(&self) -> ValueType {
-        ValueType::Tensor(TensorType {
-            dtype: self.dtype,
-            shape: self.shape.clone(),
-        })
-    }
 }
 
 /// A compiled program — everything `encode_model` needs.
@@ -806,8 +800,7 @@ impl Compiler {
             .ok_or_else(|| IrError {
                 line: n,
                 message: format!("undefined state {}", parts[0]),
-            })?
-            .clone();
+            })?;
         let v = self.lookup(parts[1], n)?;
         if v.dtype != st.dtype {
             return err(

@@ -90,7 +90,7 @@ fn f_str(buf: &mut Vec<u8>, field: u32, v: &str) {
     f_bytes(buf, field, v.as_bytes());
 }
 
-fn f_msg(buf: &mut Vec<u8>, field: u32, v: &Vec<u8>) {
+fn f_msg(buf: &mut Vec<u8>, field: u32, v: &[u8]) {
     f_bytes(buf, field, v);
 }
 
@@ -1399,6 +1399,29 @@ pub fn write_mlpackage(
     std::fs::write(dir.join("Manifest.json"), manifest)
 }
 
+fn uuid_str() -> String {
+    // RFC4122 v4 UUID, uppercased — matches Apple's package identifiers.
+    let mut b = [0u8; 16];
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0) as u64;
+    let mut s = seed ^ 0x9E3779B97F4A7C15;
+    for x in b.iter_mut() {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        *x = (s & 0xff) as u8;
+    }
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    format!(
+        "{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1586,27 +1609,4 @@ mod tests {
         assert_eq!(mem_bytes, file_bytes);
         let _ = std::fs::remove_dir_all(&root);
     }
-}
-
-fn uuid_str() -> String {
-    // RFC4122 v4 UUID, uppercased — matches Apple's package identifiers.
-    let mut b = [0u8; 16];
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0) as u64;
-    let mut s = seed ^ 0x9E3779B97F4A7C15;
-    for x in b.iter_mut() {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        *x = (s & 0xff) as u8;
-    }
-    b[6] = (b[6] & 0x0f) | 0x40;
-    b[8] = (b[8] & 0x3f) | 0x80;
-    format!(
-        "{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
-    )
 }
