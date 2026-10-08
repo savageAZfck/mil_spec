@@ -1,0 +1,17 @@
+[package]
+name = "mil_infer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Run compiled CoreML models in-process: MLModel predict via the Objective-C runtime, MLMultiArray marshalling, stateful KV. macOS only."
+license = "MIT OR Apache-2.0"
+authors = ["Adam Clark <savagetism@icloud.com>"]
+repository = "https://github.com/savageAZfck/mil_spec"
+keywords = ["coreml", "inference", "ane", "apple-silicon"]
+
+[dependencies]
+mil_spec = { path = "../..", version = "0.3.0" }
+half = "2"
+
+[dev-dependencies]
+mil_compile = { path = "../mil_compile", version = "0.1.0" }

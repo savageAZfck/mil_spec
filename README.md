@@ -77,6 +77,31 @@ mil_spec::write_mlpackage(dir, &spec, weights)?;
 
 See `examples/compile_ir.rs` for a stateful KV-cache program.
 
+## The workspace
+
+`mil_spec` is the core of a full native-Rust CoreML pipeline — the pieces
+`coremltools` monopolizes, split into focused crates:
+
+| Crate | Job |
+|---|---|
+| **`mil_convert`** | safetensors → `.mlpackage`. Streams HF checkpoints into fat single-graph decoders: packed-KV state (`slice_update` at runtime `pos`), GQA attention, per-channel int8 or fp16 conv weights. Config-driven — Qwen2/Qwen3/Llama-class today. |
+| **`mil_passes`** | Optimizer over `Block`: const dedup (the helpers emit ~5 identical consts per conv — this is the big spec shrinker), constant folding, no-op elimination, dead code, fixpoint. Deterministic, reports every change. |
+| **`mil_lint`** | The differentiator — static **ANE-placement analysis**. Predicts per-op execution unit (ANE/GPU/CPU) with a stated rule *before* you compile, flags CPU islands and fp32 regions, and estimates dispatch count — the number that decides whether a graph lives or dies on the ANE. coremltools can't do this at all. |
+| **`mil_compile`** | `.mlpackage` → `.mlmodelc`. Two backends: in-process `MLModel compileModelAtURL:` via the Objective-C runtime (no `xcrun`, no subprocess), and an `xcrun coremlc` driver with structured errors and `.mlmodelc` discovery. |
+| **`mil_verify`** | Reads specs back: generic protobuf decoder, structural diff (`milc diff` shows why `coremlc` rejected your graph), name-resolution validation, `weight.bin` integrity, and a conformance battery — valid graphs must pass, planted-invalid controls must fail, or the verifier itself is broken. |
+| **`milc`** | The CLI over all of it: `convert`, `lint`, `inspect`, `diff`, `compile`, `verify`, `check`. |
+
+```bash
+cargo build --release -p milc
+milc convert Qwen3-0.6B -o drafter.mlpackage --seq 1 --max-kv 2048
+milc lint drafter.mlpackage     # per-op ANE/GPU/CPU + dispatch estimate
+milc compile drafter.mlpackage  # via CoreML.framework, in-process
+milc verify                     # conformance battery
+```
+
+A converted decoder reports ~100% ANE placement and 1 estimated dispatch —
+the fat-graph shape the 11-shard drafter needed.
+
 ## Why a hand-rolled writer
 
 - **No toolchain.** coremltools drags in Python, protobuf codegen, and a

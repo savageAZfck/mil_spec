@@ -1,6 +1,19 @@
+[workspace]
+members = [
+    ".",
+    "crates/mil_convert",
+    "crates/mil_passes",
+    "crates/mil_lint",
+    "crates/mil_compile",
+    "crates/mil_verify",
+    "crates/mil_infer",
+    "crates/milc",
+]
+resolver = "2"
+
 [package]
 name = "mil_spec"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Write Apple CoreML .mlpackage programs in pure Rust: MIL ops, stateful graphs, weight blobs. No Python, no coremltools."

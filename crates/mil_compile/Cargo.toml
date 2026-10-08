@@ -1,0 +1,13 @@
+[package]
+name = "mil_compile"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Compile .mlpackage specs to .mlmodelc: coremlc driver with structured errors; in-process CoreML.framework compile on macOS."
+license = "MIT OR Apache-2.0"
+authors = ["Adam Clark <savagetism@icloud.com>"]
+repository = "https://github.com/savageAZfck/mil_spec"
+keywords = ["coreml", "mil", "compiler", "apple-silicon"]
+
+[dependencies]
+mil_spec = { path = "../..", version = "0.3.0" }

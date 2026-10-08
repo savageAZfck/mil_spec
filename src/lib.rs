@@ -345,6 +345,13 @@ impl Value {
         )
     }
 
+    /// The value's wire encoding. Passes and inspectors fingerprint consts
+    /// by these bytes — two `Value`s that encode identically are the same
+    /// value and may be merged.
+    pub fn wire_bytes(&self) -> Vec<u8> {
+        self.encode()
+    }
+
     fn encode(&self) -> Vec<u8> {
         let mut b = Vec::new();
         match self {
@@ -528,7 +535,8 @@ impl Block {
         }
     }
 
-    fn fresh(&mut self, hint: &str) -> String {
+    /// Fresh unique name with a hint prefix (for synthesized const names).
+    pub fn fresh(&mut self, hint: &str) -> String {
         self.counter += 1;
         format!("{hint}_{}", self.counter)
     }
@@ -1387,6 +1395,42 @@ pub fn write_mlpackage(
         let wdir = data_dir.join("weights");
         std::fs::create_dir_all(&wdir)?;
         std::fs::write(wdir.join("weight.bin"), w)?;
+        entries.push_str(&format!(
+            ",\n    \"{}\": {{\"path\": \"com.apple.CoreML/weights\", \"author\": \"com.apple.CoreML\", \"name\": \"weights\", \"description\": \"CoreML Model Weights\"}}",
+            uuid_str()
+        ));
+    }
+    let manifest = format!(
+        "{{\n  \"fileFormatVersion\": \"1.0.0\",\n  \"itemInfoEntries\": {{\n{}\n  }},\n  \"rootModelIdentifier\": \"{}\"\n}}\n",
+        entries, model_id
+    );
+    std::fs::write(dir.join("Manifest.json"), manifest)
+}
+
+/// Like [`write_mlpackage`] but takes `weight.bin` as a file path and
+/// copies it into the package — for models whose weights are too large
+/// to keep in memory. `None` omits the weights directory.
+pub fn write_mlpackage_stream(
+    dir: &std::path::Path,
+    spec: &[u8],
+    weight_src: Option<&std::path::Path>,
+) -> std::io::Result<()> {
+    let data_dir = dir.join("Data").join("com.apple.CoreML");
+    std::fs::create_dir_all(&data_dir)?;
+    std::fs::write(data_dir.join("model.mlmodel"), spec)?;
+
+    let model_id = uuid_str();
+    let mut entries = String::new();
+    entries.push_str(&format!(
+        "    \"{}\": {{\"path\": \"com.apple.CoreML/model.mlmodel\", \"author\": \"com.apple.CoreML\", \"name\": \"model.mlmodel\", \"description\": \"CoreML Model Specification\"}}",
+        model_id
+    ));
+    if let Some(wsrc) = weight_src {
+        let wdir = data_dir.join("weights");
+        std::fs::create_dir_all(&wdir)?;
+        if wsrc != wdir.join("weight.bin") {
+            std::fs::copy(wsrc, wdir.join("weight.bin"))?;
+        }
         entries.push_str(&format!(
             ",\n    \"{}\": {{\"path\": \"com.apple.CoreML/weights\", \"author\": \"com.apple.CoreML\", \"name\": \"weights\", \"description\": \"CoreML Model Weights\"}}",
             uuid_str()

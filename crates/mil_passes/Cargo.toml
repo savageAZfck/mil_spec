@@ -1,0 +1,15 @@
+[package]
+name = "mil_passes"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Optimization passes over mil_spec Blocks: const dedup, folding, dead code, no-op elimination. Deterministic, in-order, diffable."
+license = "MIT OR Apache-2.0"
+authors = ["Adam Clark <savagetism@icloud.com>"]
+repository = "https://github.com/savageAZfck/mil_spec"
+keywords = ["coreml", "mil", "optimizer", "apple-silicon"]
+categories = ["compilers"]
+
+[dependencies]
+mil_spec = { path = "../..", version = "0.3.0" }
+half = "2"
