@@ -15,3 +15,4 @@ half = "2"
 
 [dev-dependencies]
 mil_compile = { path = "../mil_compile", version = "0.1.0" }
+mil_verify = { path = "../mil_verify", version = "0.1.0" }

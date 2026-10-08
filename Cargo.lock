@@ -106,6 +106,7 @@ dependencies = [
  "half",
  "mil_compile",
  "mil_spec",
+ "mil_verify",
 ]
 
 [[package]]
