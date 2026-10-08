@@ -16,6 +16,7 @@
 //! - [`dedup_consts`] — merge identical const ops (the big win)
 //! - [`noop_elim`] — remove reshapes/transposes/squeezes that change nothing
 //! - [`const_fold`] — evaluate ops whose inputs are all inline consts
+//! - [`fuse_silu`] — `mul(a, sigmoid(a))` → `silu(a)` (SwiGLU pattern)
 //! - [`dead_code`] — drop ops whose outputs feed nothing
 //! - [`optimize`] — all of the above to a fixpoint
 
@@ -593,7 +594,54 @@ fn strides(shape: &[i64]) -> Vec<i64> {
     s
 }
 
-// ---------- pass 4: dead code ----------
+// ---------- pass 4: activation fusion ----------
+
+/// Fuse `mul(a, sigmoid(a))` (either operand order) into `silu(a)` —
+/// the exact pattern every SwiGLU decoder emits per layer. The mul is
+/// rewritten in place (its output name/type are preserved); the now
+/// unused sigmoid dies in [`dead_code`].
+pub fn fuse_silu(b: &mut Block) -> PassReport {
+    // map: sigmoid output name → its input name
+    let mut sigmoid_in: HashMap<String, String> = HashMap::new();
+    for op in &b.ops {
+        if op.ty == "sigmoid" {
+            if let (Some(x), Some(out)) = (arg_name(op, "x"), op.outputs.first()) {
+                sigmoid_in.insert(out.name.clone(), x);
+            }
+        }
+    }
+    if sigmoid_in.is_empty() {
+        return PassReport::default();
+    }
+    let mut fused = 0;
+    for op in &mut b.ops {
+        if op.ty != "mul" {
+            continue;
+        }
+        let (xn, yn) = match (arg_name(op, "x"), arg_name(op, "y")) {
+            (Some(a), Some(b)) => (a, b),
+            _ => continue,
+        };
+        // is one operand a sigmoid of the other?
+        let base = if sigmoid_in.get(&xn) == Some(&yn) {
+            yn.clone()
+        } else if sigmoid_in.get(&yn) == Some(&xn) {
+            xn.clone()
+        } else {
+            continue;
+        };
+        op.ty = "silu".into();
+        op.inputs = vec![("x".into(), mil_spec::bind(&base).1)];
+        fused += 1;
+    }
+    PassReport {
+        removed: 0,
+        added: 0,
+        renamed: fused,
+    }
+}
+
+// ---------- pass 5: dead code ----------
 
 /// Remove ops whose outputs are consumed by nothing. Iterates to a
 /// fixpoint so chains die leaf-to-root. `write_state` never dies — it
@@ -629,16 +677,17 @@ pub fn dead_code(b: &mut Block) -> PassReport {
 // ---------- orchestration ----------
 
 /// Run every pass to a fixpoint. Order: no-ops first (cheap aliases),
-/// fold, dedup, then dead code; loop until nothing changes — folding
-/// can expose new no-ops, dedup can expose new dead code.
+/// fusion, fold, dedup, then dead code; loop until nothing changes —
+/// folding can expose new no-ops, dedup can expose new dead code.
 pub fn optimize(b: &mut Block) -> PassReport {
     let mut total = PassReport::default();
     for _ in 0..16 {
         let a = noop_elim(b);
+        let f = fuse_silu(b);
         let c = const_fold(b);
         let d = dedup_consts(b);
         let e = dead_code(b);
-        let round = [a, c, d, e];
+        let round = [a, f, c, d, e];
         let changed: usize = round.iter().map(|r| r.removed + r.added + r.renamed).sum();
         total.removed += round.iter().map(|r| r.removed).sum::<usize>();
         total.added += round.iter().map(|r| r.added).sum::<usize>();
@@ -751,6 +800,29 @@ mod tests {
             Binding::Name(n) => assert_eq!(n, "a"),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn fuse_silu_pattern() {
+        let mut b = Block::new();
+        let sg = {
+            let vt = ValueType::Tensor(TensorType::f16(&[1, 4, 1, 1]));
+            b.o1(
+                "sigmoid",
+                vec![("x".into(), mil_spec::bind("gate").1)],
+                "sg",
+                vt,
+            )
+        };
+        let s = b.mul("gate", &sg, &[1, 4, 1, 1], "swiglu");
+        b.outputs = vec![s];
+        let r = fuse_silu(&mut b);
+        assert_eq!(r.renamed, 1);
+        let op = b.ops.iter().find(|o| o.ty == "silu").unwrap();
+        assert_eq!(op.outputs[0].name, "swiglu");
+        // dead code reaps the orphaned sigmoid
+        dead_code(&mut b);
+        assert!(b.ops.iter().all(|o| o.ty != "sigmoid"));
     }
 
     #[test]
