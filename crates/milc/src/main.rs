@@ -32,6 +32,7 @@ fn main() -> ExitCode {
         "run" => cmd_run(&args[1..]),
         "verify" => ExitCode::from(mil_verify::run_battery() as u8),
         "check" => cmd_check(&args[1..]),
+        "machine" => cmd_machine(&args[1..]),
         "help" | "-h" | "--help" => {
             usage();
             ExitCode::SUCCESS
@@ -60,7 +61,10 @@ fn usage() {
          \x20 milc compile <pkg.mlpackage> [-o <out_dir>]\n\
          \x20 milc run     <model.mlmodelc> [--units ane|gpu|all|cpu] [--steps N]\n\
          \x20 milc verify\n\
-         \x20 milc check   <pkg.mlpackage>\n"
+         \x20 milc check   <pkg.mlpackage>\n\
+         \x20 milc machine dfa <patterns.txt> -o <pkg.mlpackage>   # blocklist → stateful DFA\n\
+         \x20 milc machine sentinel -o <pkg.mlpackage> [--alpha A] [--eps E] [--thresh T]\n\
+         \x20 milc machine memory -o <pkg.mlpackage> [--slots N] [--dim D]\n"
     );
 }
 
@@ -493,5 +497,115 @@ fn cmd_check(args: &[String]) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+fn cmd_machine(args: &[String]) -> ExitCode {
+    if args.is_empty() {
+        eprintln!("milc machine: needs dfa|sentinel|memory");
+        return ExitCode::from(2);
+    }
+    let mut out: Option<PathBuf> = None;
+    let mut path: Option<PathBuf> = None;
+    let (mut alpha, mut eps, mut thresh) = (0.1f32, 1e-3f32, 3.0f32);
+    let (mut slots, mut dim) = (64i64, 32i64);
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" | "--out" => {
+                out = args.get(i + 1).map(PathBuf::from);
+                i += 2;
+            }
+            "--alpha" => {
+                alpha = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(alpha);
+                i += 2;
+            }
+            "--eps" => {
+                eps = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(eps);
+                i += 2;
+            }
+            "--thresh" => {
+                thresh = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(thresh);
+                i += 2;
+            }
+            "--slots" => {
+                slots = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(slots);
+                i += 2;
+            }
+            "--dim" => {
+                dim = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(dim);
+                i += 2;
+            }
+            other if !other.starts_with('-') => {
+                if path.is_none() {
+                    path = Some(PathBuf::from(other));
+                }
+                i += 1;
+            }
+            other => {
+                eprintln!("milc machine: unknown flag {other}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(out) = out else {
+        eprintln!("milc machine: needs -o <pkg.mlpackage>");
+        return ExitCode::from(2);
+    };
+    let res = match args[0].as_str() {
+        "dfa" => {
+            let Some(p) = path else {
+                eprintln!("milc machine dfa: needs <patterns.txt>");
+                return ExitCode::from(2);
+            };
+            let text = match std::fs::read_to_string(&p) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("{}: {e}", p.display());
+                    return ExitCode::FAILURE;
+                }
+            };
+            let pats: Vec<&[u8]> = text
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|l| l.as_bytes())
+                .collect();
+            if pats.is_empty() {
+                eprintln!("milc machine dfa: no patterns in {}", p.display());
+                return ExitCode::FAILURE;
+            }
+            let ac = mil_machines::Automaton::build(&pats);
+            let (n, np) = (ac.states(), pats.len());
+            mil_machines::write_dfa_package(&out, &ac)
+                .map_err(|e| e.to_string())
+                .map(|()| println!("{n} states from {np} patterns → {}", out.display()))
+        }
+        "sentinel" => mil_machines::write_sentinel_package(&out, alpha, eps, thresh)
+            .map_err(|e| e.to_string())
+            .map(|()| println!("sentinel a={alpha} e={eps} z>{thresh} → {}", out.display())),
+        "memory" => mil_machines::write_memory_package(&out, slots, dim)
+            .map_err(|e| e.to_string())
+            .map(|()| println!("memory [{slots}x{dim}] fp16 → {}", out.display())),
+        other => {
+            eprintln!("milc machine: unknown kind {other} (dfa|sentinel|memory)");
+            return ExitCode::from(2);
+        }
+    };
+    match res {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{}: {e}", out.display());
+            ExitCode::FAILURE
+        }
     }
 }

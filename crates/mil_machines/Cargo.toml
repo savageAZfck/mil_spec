@@ -1,0 +1,14 @@
+[package]
+name = "mil_machines"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Non-neural state machines compiled to stateful MIL programs: Aho-Corasick automata, EWMA scorers, mutable memory banks. Silicon a regex can live on."
+license = "MIT OR Apache-2.0"
+authors = ["Adam Clark <savagetism@icloud.com>"]
+repository = "https://github.com/savageAZfck/mil_spec"
+keywords = ["coreml", "mil", "automaton", "ane", "state-machine"]
+categories = ["compilers", "embedded"]
+
+[dependencies]
+mil_spec = { path = "../..", version = "0.3.0" }

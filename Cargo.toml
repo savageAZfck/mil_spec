@@ -7,6 +7,7 @@ members = [
     "crates/mil_compile",
     "crates/mil_verify",
     "crates/mil_infer",
+    "crates/mil_machines",
     "crates/milc",
 ]
 resolver = "2"

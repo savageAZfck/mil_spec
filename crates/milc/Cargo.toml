@@ -16,6 +16,7 @@ mil_lint = { path = "../mil_lint", version = "0.1.0" }
 mil_compile = { path = "../mil_compile", version = "0.1.0" }
 mil_verify = { path = "../mil_verify", version = "0.1.0" }
 mil_infer = { path = "../mil_infer", version = "0.1.0" }
+mil_machines = { path = "../mil_machines", version = "0.1.0" }
 half = "2"
 mil_convert = { path = "../mil_convert", version = "0.1.0" }
 
