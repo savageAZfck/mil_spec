@@ -134,3 +134,24 @@ Espresso-net input bundle (per `NetworkSourcePath`): `Manifest.json`,
 `_quantization_fusion_log.json`, `_max_shape.plist`,
 `{online,offline}_options.plist`, `*.macho` (magic `0xcefaefbe`, segments
 `__FVMLIB`, graph symbols like `main`, `z@output`, embedded flag line).
+
+## Toolchain interface
+
+The rules above are executable, not just documented:
+
+- `mil_spec::ane_lower::lower_for_ane(text, pos)` — lowers a CoreML-emitted
+  stateful MIL file to this dialect: bakes int32 index math
+  (`concat`/`add`/`pos` chains) to consts, stripe-partitions each shared
+  `state<tensor<T,[D,..]>>` along dim 0 into per-stripe states, rewrites
+  the update chain into per-stripe `read_state → slice_update →
+  write_state` triples, rebases `slice_by_index` readers to local
+  indices, forces `ios18`, and prunes dead params/consts. Verified to
+  produce a byte-equivalent compile result on the 8-layer shard.
+- `mil_infer::anec::Anec` — direct `ANECompiler.framework` wrapper:
+  `Anec::open()`, `.validate(mil, arch)`, `.compile(mil, dir, arch)` →
+  typed `Verdict` (status, errors, `ModelMaxDramUsage`, artifact path).
+- `milc ane lower|validate|compile <model.mil> [-o out] [--arch h16g]
+  [--pos N]` — CLI for the full path:
+
+      milc ane lower model.mil -o model.ane.mil   # → this dialect
+      milc ane compile model.ane.mil -o out/      # → *.macho, no CoreML

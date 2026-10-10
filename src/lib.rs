@@ -41,6 +41,9 @@
 
 #![forbid(unsafe_code)]
 
+/// Text-level MIL → ANE-eligible lowering (state striping, index baking).
+pub mod ane_lower;
+
 pub mod ir;
 pub mod proto;
 pub mod sha256;

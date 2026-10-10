@@ -84,6 +84,7 @@ fn usage() {
          \x20 milc machine dfa <patterns.txt> -o <pkg.mlpackage>   # blocklist → stateful DFA\n\
          \x20 milc machine sentinel -o <pkg.mlpackage> [--alpha A] [--eps E] [--thresh T]\n\
          \x20 milc machine memory -o <pkg.mlpackage> [--slots N] [--dim D]\n\
+         \x20 milc ane lower    <model.mil> [-o <out.mil>] [--pos N] # stripe-split states, bake indices → ANE dialect\n\
          \x20 milc ane validate <model.mil> [--arch h16g]            # direct ANEC verdict, no CoreML\n\
          \x20 milc ane compile  <model.mil> [-o <dir>] [--arch h16g] # direct ANE Mach-O, no CoreML\n"
     );
@@ -99,11 +100,12 @@ fn cmd_ane(args: &[String]) -> ExitCode {
     let mut mil: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut arch = "h16g".to_string();
+    let mut pos = 0i64;
     let mut detail = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "validate" | "compile" => {
+            "lower" | "validate" | "compile" => {
                 if mode.is_empty() {
                     mode = args[i].as_str();
                 }
@@ -117,6 +119,13 @@ fn cmd_ane(args: &[String]) -> ExitCode {
                 if let Some(a) = args.get(i) {
                     arch = a.clone();
                 }
+            }
+            "--pos" => {
+                i += 1;
+                pos = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
             }
             "--detail" => detail = true,
             s if !s.starts_with('-') => {
@@ -132,12 +141,45 @@ fn cmd_ane(args: &[String]) -> ExitCode {
         i += 1;
     }
     let Some(mil) = mil else {
-        eprintln!("milc ane <validate|compile> <model.mil> [-o <dir>] [--arch h16g]");
+        eprintln!("milc ane <lower|validate|compile> <model.mil> [-o <out>] [--arch h16g] [--pos N]");
         return ExitCode::from(2);
     };
     if mode.is_empty() {
-        eprintln!("milc ane: need validate or compile");
+        eprintln!("milc ane: need lower, validate, or compile");
         return ExitCode::from(2);
+    }
+    if mode == "lower" {
+        let text = match std::fs::read_to_string(&mil) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("milc ane lower: {}: {e}", mil.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        return match mil_spec::ane_lower::lower_for_ane(&text, pos) {
+            Ok((lowered, rep)) => {
+                let dst = out.unwrap_or_else(|| mil.with_extension("ane.mil"));
+                match std::fs::write(&dst, &lowered) {
+                    Ok(()) => {
+                        println!("lowered → {}", dst.display());
+                        println!(
+                            "  states_split={} updates={} reads={} writes={} dropped={} params_dropped={}",
+                            rep.states_split, rep.updates_localized, rep.reads_localized,
+                            rep.writes_emitted, rep.ops_dropped, rep.params_dropped
+                        );
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("milc ane lower: {}: {e}", dst.display());
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("milc ane lower: {e}");
+                ExitCode::FAILURE
+            }
+        };
     }
     if !mil_infer::anec::ARCHES.contains(&arch.as_str()) {
         eprintln!("milc ane: arch {arch} not in target table {:?}", mil_infer::anec::ARCHES);
