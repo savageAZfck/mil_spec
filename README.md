@@ -108,13 +108,60 @@ milc convert Qwen3-0.6B -o tuned.mlpackage --lora adapters/dream  # LoRA bake-in
 milc gguf model.gguf --tokenizer tok.json     # inspect + tokenizer export
 milc onnx model.onnx -o m.mlpackage --dim batch=1   # ONNX (symbolic dims bound with --dim)
 milc onnx glm.json -o m.mlpackage                   # classical-ML JSON (or --classical)
+milc convert model -o s.milshards --shard 8 --head-shards 4   # ANE-sized bundle (see below)
 milc lint drafter.mlpackage     # per-op ANE/GPU/CPU + dispatch estimate
+milc plan drafter.mlpackage [--units ane] [--vs-lint]  # real placement from MLComputePlan
 milc compile drafter.mlpackage  # via CoreML.framework, in-process
 milc verify                     # conformance battery
 ```
 
-A converted decoder reports ~100% ANE placement and 1 estimated dispatch —
-the fat-graph shape the 11-shard drafter needed.
+## Getting real models onto the Neural Engine
+
+The ANE execution-plan builder has a hard size limit — measured here,
+a monolithic program fails `Model::load` with CoreML error **-14**
+somewhere between 3,164 and 3,284 ops (~51 MB of fp16 weights at
+d=576; it's op count, not weight bytes — an int8 variant at 29 MB
+still fails). Anything past ~26 SmolLM2-sized layers simply will not
+load on `cpuAndNeuralEngine` or `all` — though it runs fine on CPU and
+GPU. `milc convert` warns when a package crosses the line.
+
+`--shard N` is the fix — the layout Bad Apple's production converter
+measured on real hardware:
+
+```bash
+milc convert SmolLM2-135M -o s.milshards --seq 5 --max-kv 64 --fp16 --shard 8 --head-shards 4
+milc run s.milshards --units ane
+```
+
+The bundle is a directory: `layer_AA-BB.mlpackage` per N-layer group
+(each with its own packed-KV state over its local rows), `head_vLO-HI.mlpackage`
+per vocab slice (final RMSNorm + a slice of the projection), and
+`manifest.json`. `mil_infer::ShardedModel` compiles every member,
+loads them on the requested `ComputeUnits`, threads hidden state
+through the layer shards and concatenates the head logits.
+`milc run <bundle>` works directly. Every member package carries full
+provenance, so `milc attest` applies per package.
+
+Measured on SmolLM2-135M fp16 (`--shard 8 --head-shards 4`, seq 5):
+all members load and predict on **every** unit set — under
+`cpuAndNeuralEngine` the plan places **84% of ops on the ANE** (535 of
+634, 65% of estimated cost; `milc plan` output), and top-1 agrees with
+the reference at all positions on all units. The ANE is an approximate
+engine: same-package `CpuOnly`-vs-`CpuAndNeuralEngine` logits diverge
+(cosine ~0.99 on 2–16 layer models, worse at later sequence positions
+where the KV-state path compounds); expect correct tokens, not
+bit-faithful logits. Sharded bundles are fixed-`--seq` only
+(`--seq-lens`/`--seq-range` + `--shard` is rejected for now).
+
+`--embed` emits the token-embedding gather into the graph — the
+package then takes `ids (1,S) int32` instead of `x`, verified against
+the host-side embed path end-to-end.
+
+`milc plan` reads CoreML's own `MLComputePlan` (no heuristics): per-op
+device assignment and estimated cost, plus a device summary.
+`--vs-lint` diffs it against `mil_lint`'s predictions — on a layer
+shard they agree on 93% of ops; disagreements are small elementwise
+ops the scheduler leaves on CPU to avoid transfer cost.
 
 ## Package surgery
 
@@ -162,19 +209,27 @@ a `ShapeRange` (`ArrayFeatureType.shapeRange`, field 31) instead of
 unbounded rejected). Apple recommends enumerated shapes for performance
 and range-flexible models may not run on the Neural Engine; measured on
 Qwen3-0.6B fp16 here, the range package runs ~19% slower than a fixed
-package on `ComputeUnits::All` (ANE placement not verified) — prefer
-`--seq-lens` for ANE workloads.
+package on `ComputeUnits::All` — prefer
+`--seq-lens` for ANE workloads, or `--shard` for monoliths past the
+ANE plan-builder limit.
 
-**Known issue — flexible packages need a non-CPU-only compute unit.**
-Packages from `--seq-lens` (with more than one length) or `--seq-range` load and predict on
-`ComputeUnits::All`, but `CpuOnly` fails at load with CoreML error -14
-("Failed to build the model execution plan"). Fixed-shape packages are
-unaffected, and a hand-built one-op flexible program loads on CPU, so
-the trigger is specific to this converter's flexible graph: a linear
-prefix bisect fails first at the runtime-shape `reshape` in
-`seq_to_heads` (op 83 of the tiny test model), while the same reshape
-in isolation loads fine. Root cause not yet found; reproduce with
-`cargo test -p mil_convert --release --test enum_shapes_e2e -- --ignored cpu_only_flex_matrix`.
+**Known limitation — flexible packages and compute units.** Measured
+with corrected `MLComputeUnits` mapping on a converted package:
+
+| | cpu | cpu+gpu | all | cpu+ane |
+|---|---|---|---|---|
+| fixed `--seq` | ok | ok | ok | ok |
+| `--seq-lens` (EnumeratedShapes) | ok | **-14** | **-14** | ok |
+| `--seq-range` (ShapeRange) | ok | **-14** | **-14** | **-14** |
+
+EnumeratedShapes reaches the ANE (as Apple's docs recommend) but the
+GPU/scheduler path rejects dynamic dims, so `cpu+gpu` and `all` fail
+to plan. ShapeRange only plans on CPU — matching Apple's own caveat
+that range-flexible models may not use the Neural Engine. For ANE
+workloads use fixed `--seq` (or `--shard` for big models); for
+enumerated flexibility pick `--units cpu` or `--units ane`. Reproduce
+with `cargo test -p mil_convert --release --test enum_shapes_e2e --
+--ignored cpu_only_flex_matrix`.
 
 ## Provenance (`milc attest`)
 

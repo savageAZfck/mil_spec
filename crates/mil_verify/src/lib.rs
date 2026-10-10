@@ -733,24 +733,44 @@ fn dtype_of(code: u64) -> Option<mil_spec::DType> {
         21 => Some(mil_spec::DType::Int8),
         23 => Some(mil_spec::DType::Int32),
         24 => Some(mil_spec::DType::Int64),
+        25 => Some(mil_spec::DType::Int4),
+        35 => Some(mil_spec::DType::Uint4),
         _ => None,
     }
 }
 
-/// Decode an op output NVT: name, dtype, rank.
-fn op_out_info(nvt: &Msg) -> (Option<String>, Option<mil_spec::DType>, usize) {
+/// Decode a MIL `TensorType` (`dataType = 1`, `rank = 2`, repeated
+/// `Dimension { constant = 1 { size = 1 } | unknown = 2 }` at 3): dtype
+/// and shape, with `-1` for an unknown dim. This is the layout
+/// `mil_spec` writes for op outputs and function inputs — *not* the
+/// `ArrayFeatureType` layout (`shape = 1`, `dataType = 2`) feature
+/// descriptions use.
+fn tensor_type_info(t: &Msg) -> (Option<mil_spec::DType>, Vec<i64>) {
+    let dtype = t.varint(1).and_then(dtype_of);
+    let shape = t
+        .msgs(3)
+        .iter()
+        .map(|dim| match dim.msg(1) {
+            Some(c) => c.varint(1).map(|v| v as i64).unwrap_or(-1),
+            None => -1,
+        })
+        .collect();
+    (dtype, shape)
+}
+
+/// Decode an op output NVT: name, dtype, shape.
+fn op_out_info(nvt: &Msg) -> (Option<String>, Option<mil_spec::DType>, Vec<i64>) {
     let name = nvt.str(1);
-    // NVT field 2 = ValueType → field 1 tensorType → {1 shape, 2 dtype}
+    // NVT field 2 = ValueType → field 1 tensorType (field 2 = stateType)
     let tt = nvt
         .msg(2)
         .and_then(|vt| vt.msg(1).or_else(|| vt.msg(2).and_then(|st| st.msg(1))));
     match tt {
         Some(t) => {
-            let dt = t.varint(2).and_then(dtype_of);
-            let rank = shape_of(t).len();
-            (name, dt, rank)
+            let (dt, shape) = tensor_type_info(&t);
+            (name, dt, shape)
         }
-        None => (name, None, 0),
+        None => (name, None, Vec::new()),
     }
 }
 
@@ -771,11 +791,12 @@ pub fn lint_spec(spec: &[u8]) -> Option<mil_lint::LintReport> {
                         for op in blk.msgs(3) {
                             let ty = op.str(1).unwrap_or_else(|| "?".into());
                             // first output NVT carries name + type
-                            let (name, dtype, rank) = op
+                            let (name, dtype, oshape) = op
                                 .msgs(3)
                                 .first()
                                 .map(|n| op_out_info(n))
-                                .unwrap_or((None, None, 0));
+                                .unwrap_or((None, None, Vec::new()));
+                            let rank = oshape.len();
                             let str_const = dtype == Some(mil_spec::DType::Str);
                             let (unit, rule) = mil_lint::classify_op(&ty, dtype, rank, str_const);
                             verdicts.push(mil_lint::Verdict {
@@ -783,12 +804,11 @@ pub fn lint_spec(spec: &[u8]) -> Option<mil_lint::LintReport> {
                                 op: ty,
                                 unit,
                                 rule: rule.to_string(),
-                                shape: op
-                                    .msgs(3)
-                                    .first()
-                                    .and_then(|n| n.msg(2))
-                                    .and_then(|vt| vt.msg(1))
-                                    .map(shape_of),
+                                shape: if oshape.is_empty() && dtype.is_none() {
+                                    None
+                                } else {
+                                    Some(oshape)
+                                },
                             });
                         }
                     }

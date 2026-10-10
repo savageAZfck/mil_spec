@@ -38,13 +38,18 @@ fn write_safetensors(path: &Path, tensors: &[(&str, Vec<i64>, Vec<f32>)]) {
 }
 
 fn tiny_qwen3(dir: &Path) {
+    tiny_qwen3_n(dir, 2);
+}
+
+fn tiny_qwen3_n(dir: &Path, nl: usize) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(
         dir.join("config.json"),
-        r#"{
+        format!(
+            r#"{{
             "model_type": "qwen3",
             "hidden_size": 16,
-            "num_hidden_layers": 2,
+            "num_hidden_layers": {nl},
             "num_attention_heads": 2,
             "num_key_value_heads": 1,
             "head_dim": 8,
@@ -54,7 +59,8 @@ fn tiny_qwen3(dir: &Path) {
             "rope_theta": 1000000.0,
             "max_position_embeddings": 512,
             "tie_word_embeddings": false
-        }"#,
+        }}"#
+        ),
     )
     .unwrap();
     let mut tensors: Vec<(String, Vec<i64>, Vec<f32>)> = Vec::new();
@@ -66,7 +72,7 @@ fn tiny_qwen3(dir: &Path) {
             (0..n).map(|i| fill + (i as f32 % 7.0) * 0.01).collect(),
         ));
     };
-    for l in 0..2 {
+    for l in 0..nl {
         push(
             &format!("model.layers.{l}.input_layernorm.weight"),
             vec![16],
@@ -348,13 +354,49 @@ fn enum_prefix_bisect() {
     use mil_convert::{plan, ModelConfig};
     let root = std::env::temp_dir().join(format!("enum_bisect_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    let model = root.join("model");
-    tiny_qwen3(&model);
+    std::fs::create_dir_all(&root).unwrap();
+    if let Ok(spec) = std::env::var("MIL_BISECT_SYNTH") {
+        let v: Vec<i64> = spec.split(',').map(|t| t.parse().unwrap()).collect();
+        synth_qwen3(
+            &root.join("synth"),
+            v[0] as usize,
+            v[1],
+            v[2],
+            v[3],
+            v[4],
+            v[5],
+            v[6],
+        );
+        std::env::set_var("MIL_BISECT_MODEL", root.join("synth"));
+    }
+    let model = match std::env::var("MIL_BISECT_MODEL") {
+        Ok(p) => std::path::PathBuf::from(p),
+        Err(_) => {
+            let m = root.join("model");
+            tiny_qwen3(&m);
+            m
+        }
+    };
     let cfg = ModelConfig::from_json(&std::fs::read(model.join("config.json")).unwrap()).unwrap();
     let opts = Options {
-        seq_lens: vec![1, 4, 8],
-        max_kv: 16,
-        quant: Quant::Int8,
+        seq_lens: if std::env::var("MIL_BISECT_FIXED").is_ok() {
+            vec![]
+        } else {
+            vec![1, 4, 8]
+        },
+        seq: std::env::var("MIL_BISECT_SEQ")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4),
+        max_kv: std::env::var("MIL_BISECT_KV")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(16),
+        quant: if std::env::var("MIL_BISECT_FP16").is_ok() {
+            Quant::Fp16
+        } else {
+            Quant::Int8
+        },
         lm_head: true,
         embed: false,
         spec_version: 10,
@@ -472,14 +514,23 @@ fn enum_prefix_bisect() {
         mil_spec::write_mlpackage_stream(&pkg, &spec, Some(&root.join("w.bin")))
             .map_err(|e| format!("pkg: {e}"))?;
         let comp = mil_compile::compile(&pkg, &dir.join("c")).map_err(|e| format!("cc: {e}"))?;
-        let cpu = std::env::var("MIL_BISECT_CPU").is_ok();
-        let units = if cpu {
-            mil_infer::ComputeUnits::CpuOnly
-        } else {
-            mil_infer::ComputeUnits::All
+        // MIL_BISECT_UNITS=cpu|gpu|ane|all: load-only on that unit set
+        // (MIL_BISECT_CPU is the legacy alias for `cpu`); unset: load on
+        // All and predict.
+        let sel = std::env::var("MIL_BISECT_UNITS").ok().or_else(|| {
+            std::env::var("MIL_BISECT_CPU")
+                .ok()
+                .map(|_| "cpu".to_string())
+        });
+        let units = match sel.as_deref() {
+            Some("cpu") => mil_infer::ComputeUnits::CpuOnly,
+            Some("gpu") => mil_infer::ComputeUnits::CpuAndGpu,
+            Some("ane") => mil_infer::ComputeUnits::CpuAndNeuralEngine,
+            _ => mil_infer::ComputeUnits::All,
         };
+        let load_only = sel.is_some();
         let m = mil_infer::Model::load(&comp.path, units).map_err(|e| format!("load: {e}"))?;
-        if cpu {
+        if load_only {
             let _ = std::fs::remove_dir_all(&dir);
             return Ok(true);
         }
@@ -864,7 +915,9 @@ fn verdict(pkg: &Path, work: &Path, s: i64, with_seq: bool) -> String {
     let mut parts = Vec::new();
     for (n, cu) in [
         ("cpu", mil_infer::ComputeUnits::CpuOnly),
+        ("gpu", mil_infer::ComputeUnits::CpuAndGpu),
         ("all", mil_infer::ComputeUnits::All),
+        ("ane", mil_infer::ComputeUnits::CpuAndNeuralEngine),
     ] {
         parts.push(match mil_infer::Model::load(&c.path, cu) {
             Err(e) => format!(
@@ -1262,4 +1315,490 @@ fn cpu_only_flex_matrix() {
         &resh("e6", false, 2),
     );
     say("e6b same, s0=1", &resh("e6b", false, 1));
+}
+
+/// Load + predict a compiled bundle on all four (correctly mapped)
+/// compute-unit settings; one-line verdict per unit.
+fn verdict4(pkg: &Path, work: &Path, s: i64, with_seq: bool) -> String {
+    let c = match mil_compile::compile(pkg, work) {
+        Ok(c) => c,
+        Err(e) => {
+            return format!(
+                "coremlc REJECTS: {}",
+                e.to_string().lines().next().unwrap_or("")
+            )
+        }
+    };
+    let mut parts = Vec::new();
+    for (n, cu) in [
+        ("cpu", mil_infer::ComputeUnits::CpuOnly),
+        ("gpu", mil_infer::ComputeUnits::CpuAndGpu),
+        ("all", mil_infer::ComputeUnits::All),
+        ("ane", mil_infer::ComputeUnits::CpuAndNeuralEngine),
+    ] {
+        parts.push(match mil_infer::Model::load(&c.path, cu) {
+            Err(e) => format!(
+                "{n}:FAIL({})",
+                e.message.rsplit("error code").next().unwrap_or("").trim()
+            ),
+            Ok(m) => {
+                let st = m.new_state().ok();
+                match m.predict_with_state(st.as_ref(), &inputs_at(s, 16, with_seq)) {
+                    Ok(_) => format!("{n}:ok"),
+                    Err(e) => format!("{n}:PREDICT-FAIL({e})"),
+                }
+            }
+        });
+    }
+    parts.join(" ")
+}
+
+/// Which converter feature stops the ANE-allowed unit sets loading?
+/// Prints `ANEDIAG` rows; asserts nothing.
+#[test]
+#[ignore = "diagnostic: needs coremlc; prints a matrix"]
+fn ane_load_matrix() {
+    if mil_compile::coremlc_path().is_none() {
+        return;
+    }
+    let root = Root::new("anediag");
+    let model = root.0.join("model");
+    tiny_qwen3(&model);
+    let rows: Vec<(&str, Options)> = vec![
+        ("int8 seq4 head", tiny_opts(4)),
+        ("int8 seq1 head", tiny_opts(1)),
+        (
+            "int8 seq4 no-head",
+            Options {
+                lm_head: false,
+                ..tiny_opts(4)
+            },
+        ),
+        (
+            "fp16 seq4 head",
+            Options {
+                quant: Quant::Fp16,
+                ..tiny_opts(4)
+            },
+        ),
+        (
+            "fp16 seq4 no-head",
+            Options {
+                quant: Quant::Fp16,
+                lm_head: false,
+                ..tiny_opts(4)
+            },
+        ),
+    ];
+    for (i, (name, o)) in rows.iter().enumerate() {
+        let pkg = root.0.join(format!("r{i}.mlpackage"));
+        convert(&model, &pkg, o).unwrap();
+        let v = verdict4(&pkg, &root.0.join(format!("c{i}")), o.seq, false);
+        println!("ANEDIAG {name:<20} {v}");
+        let _ = std::fs::remove_dir_all(&pkg);
+    }
+}
+
+/// Layer-count scan on the tiny fixture (fp16, fixed seq 4): at what
+/// depth do the ANE-allowed unit sets stop loading, and does it track
+/// op count or state rows (2 per layer)?
+#[test]
+#[ignore = "diagnostic: needs coremlc; prints a matrix"]
+fn ane_layer_scan() {
+    if mil_compile::coremlc_path().is_none() {
+        return;
+    }
+    let root = Root::new("anescan");
+    let counts: Vec<usize> = std::env::var("MIL_SCAN_LAYERS")
+        .ok()
+        .map(|s| s.split(',').filter_map(|t| t.parse().ok()).collect())
+        .unwrap_or_else(|| vec![8, 16, 24, 26, 32, 48]);
+    for nl in counts {
+        let model = root.0.join(format!("model{nl}"));
+        tiny_qwen3_n(&model, nl);
+        let o = Options {
+            quant: Quant::Fp16,
+            ..tiny_opts(4)
+        };
+        let pkg = root.0.join("s.mlpackage");
+        let rep = convert(&model, &pkg, &o).unwrap();
+        let v = verdict4(&pkg, &root.0.join("sc"), 4, false);
+        println!(
+            "ANESCAN layers={nl:<3} state_rows={:<3} ops={:<5} {v}",
+            nl * 2,
+            rep.op_count
+        );
+        let _ = std::fs::remove_dir_all(&pkg);
+        let _ = std::fs::remove_dir_all(root.0.join("sc"));
+        let _ = std::fs::remove_dir_all(&model);
+    }
+}
+
+/// Synthetic qwen3 checkpoint with arbitrary dims (small constant fills).
+#[allow(clippy::too_many_arguments)]
+fn synth_qwen3(
+    dir: &Path,
+    nl: usize,
+    d: i64,
+    heads: i64,
+    kvh: i64,
+    hd: i64,
+    inter: i64,
+    vocab: i64,
+) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("config.json"),
+        format!(
+            r#"{{"model_type":"qwen3","hidden_size":{d},"num_hidden_layers":{nl},
+            "num_attention_heads":{heads},"num_key_value_heads":{kvh},"head_dim":{hd},
+            "intermediate_size":{inter},"vocab_size":{vocab},"rms_norm_eps":1e-6,
+            "rope_theta":1000000.0,"max_position_embeddings":512,
+            "tie_word_embeddings":false}}"#
+        ),
+    )
+    .unwrap();
+    let mut t: Vec<(String, Vec<i64>, Vec<f32>)> = Vec::new();
+    let mut push = |n: String, shape: Vec<i64>, fill: f32| {
+        let cnt: i64 = shape.iter().product();
+        t.push((
+            n,
+            shape,
+            (0..cnt).map(|i| fill + (i % 7) as f32 * 0.001).collect(),
+        ));
+    };
+    for l in 0..nl {
+        let p = format!("model.layers.{l}");
+        push(format!("{p}.input_layernorm.weight"), vec![d], 1.0);
+        push(format!("{p}.post_attention_layernorm.weight"), vec![d], 1.0);
+        push(
+            format!("{p}.self_attn.q_proj.weight"),
+            vec![heads * hd, d],
+            0.02,
+        );
+        push(
+            format!("{p}.self_attn.k_proj.weight"),
+            vec![kvh * hd, d],
+            0.02,
+        );
+        push(
+            format!("{p}.self_attn.v_proj.weight"),
+            vec![kvh * hd, d],
+            0.02,
+        );
+        push(
+            format!("{p}.self_attn.o_proj.weight"),
+            vec![d, heads * hd],
+            0.02,
+        );
+        push(format!("{p}.self_attn.q_norm.weight"), vec![hd], 1.0);
+        push(format!("{p}.self_attn.k_norm.weight"), vec![hd], 1.0);
+        push(format!("{p}.mlp.gate_proj.weight"), vec![inter, d], 0.02);
+        push(format!("{p}.mlp.up_proj.weight"), vec![inter, d], 0.02);
+        push(format!("{p}.mlp.down_proj.weight"), vec![d, inter], 0.02);
+    }
+    push("model.norm.weight".into(), vec![d], 1.0);
+    push("lm_head.weight".into(), vec![vocab, d], 0.02);
+    let refs: Vec<(&str, Vec<i64>, Vec<f32>)> = t
+        .iter()
+        .map(|(n, s, v)| (n.as_str(), s.clone(), v.clone()))
+        .collect();
+    write_safetensors(&dir.join("model.safetensors"), &refs);
+}
+
+fn load4(pkg: &Path, work: &Path) -> String {
+    let c = match mil_compile::compile(pkg, work) {
+        Ok(c) => c,
+        Err(e) => {
+            return format!(
+                "coremlc REJECTS: {}",
+                e.to_string().lines().next().unwrap_or("")
+            )
+        }
+    };
+    [
+        ("cpu", mil_infer::ComputeUnits::CpuOnly),
+        ("gpu", mil_infer::ComputeUnits::CpuAndGpu),
+        ("all", mil_infer::ComputeUnits::All),
+        ("ane", mil_infer::ComputeUnits::CpuAndNeuralEngine),
+    ]
+    .iter()
+    .map(|(n, cu)| match mil_infer::Model::load(&c.path, *cu) {
+        Ok(_) => format!("{n}:ok"),
+        Err(_) => format!("{n}:FAIL"),
+    })
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
+/// Does the ANE load limit follow attention/state dims or weight size?
+/// Load-only matrix on synthetic checkpoints with SmolLM2-like
+/// attention dims (heads 9, kv 3, head_dim 64) and tiny/huge MLPs.
+#[test]
+#[ignore = "diagnostic: needs coremlc; prints a matrix"]
+fn ane_shape_scan() {
+    if mil_compile::coremlc_path().is_none() {
+        return;
+    }
+    let root = Root::new("anesh");
+    // (label, layers, d, heads, kvh, hd, inter, vocab, max_kv)
+    let rows: Vec<(&str, usize, i64, i64, i64, i64, i64, i64, i64)> = std::env::var("MIL_SHAPE_L")
+        .unwrap_or("30".into())
+        .split(',')
+        .map(|l| {
+            (
+                "d576 qk-norm",
+                l.parse().unwrap(),
+                576,
+                9,
+                3,
+                64,
+                64,
+                64,
+                64,
+            )
+        })
+        .collect();
+    for (i, (name, nl, d, h, kvh, hd, inter, v, mkv)) in rows.into_iter().enumerate() {
+        let model = root.0.join(format!("m{i}"));
+        synth_qwen3(&model, nl, d, h, kvh, hd, inter, v);
+        let pkg = root.0.join("p.mlpackage");
+        let o = Options {
+            quant: if std::env::var("MIL_SHAPE_QUANT").as_deref() == Ok("i8") {
+                Quant::Int8
+            } else {
+                Quant::Fp16
+            },
+            max_kv: mkv,
+            ..tiny_opts(
+                std::env::var("MIL_SHAPE_SEQ")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(5),
+            )
+        };
+        let rep = convert(&model, &pkg, &o).unwrap();
+        let verdict = load4(&pkg, &root.0.join("c"));
+        println!(
+            "ANESHAPE {name:<28} L={nl:<3} rows={:<3} ops={:<5} w={}KB {verdict}",
+            nl * 2,
+            rep.op_count,
+            rep.weight_bytes / 1024
+        );
+        if std::env::var("MIL_SHAPE_KEEP").is_ok() {
+            let dst = std::env::var("MIL_SHAPE_KEEP").unwrap();
+            let _ = std::fs::remove_dir_all(&dst);
+            std::fs::rename(&pkg, &dst).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&pkg);
+        let _ = std::fs::remove_dir_all(root.0.join("c"));
+        let _ = std::fs::remove_dir_all(&model);
+    }
+}
+
+/// Hand-built chain of `n` 1x1 convs, each with its own blob weight:
+/// does the ANE compiler's "too many fvmlibs (>255)" limit track the
+/// number of distinct weight constants? Load-only on ANE.
+#[test]
+#[ignore = "diagnostic: needs coremlc; prints a matrix"]
+fn ane_const_count_scan() {
+    if mil_compile::coremlc_path().is_none() {
+        return;
+    }
+    let root = Root::new("aneconst");
+    let counts: Vec<usize> = std::env::var("MIL_SCAN_N")
+        .ok()
+        .map(|s| s.split(',').filter_map(|t| t.parse().ok()).collect())
+        .unwrap_or_else(|| vec![100, 200, 250, 260, 300]);
+    let (c, s) = (256i64, 8i64);
+    let shape = [1, c, 1, s];
+    for shared in [false, true] {
+        for &n in &counts {
+            let mut b = mil_spec::Block::new();
+            let mut wb = mil_spec::WeightBin::new();
+            let wdata: Vec<u8> = (0..c * c)
+                .flat_map(|i| half::f16::from_f32(((i % 5) as f32 - 2.0) * 0.001).to_le_bytes())
+                .collect();
+            let mut cur = "x".to_string();
+            let mut shared_w: Option<String> = None;
+            for i in 0..n {
+                let w = if shared && shared_w.is_some() {
+                    shared_w.clone().unwrap()
+                } else {
+                    let off = wb.put(
+                        &format!("w{i}"),
+                        mil_spec::DType::Fp16,
+                        &[c, c, 1, 1],
+                        &wdata,
+                    );
+                    let w = b.konst_blob(
+                        &format!("w{i}"),
+                        "@model_path/weights/weight.bin",
+                        off,
+                        mil_spec::DType::Fp16,
+                        &[c, c, 1, 1],
+                    );
+                    shared_w = Some(w.clone());
+                    w
+                };
+                cur = {
+                    let t = b.mul(&cur, &cur, &shape, &format!("sq{i}"));
+                    let t2 = b.add(&t, &cur, &shape, &format!("ad{i}"));
+                    conv_seq_test(&mut b, &t2, &w, c, s, &format!("cv{i}"))
+                };
+            }
+            b.outputs = vec![cur.clone()];
+            let f = |name: &str| mil_spec::Feature {
+                name: name.into(),
+                shape: shape.to_vec(),
+                dtype: mil_spec::DType::Fp16,
+                is_state: false,
+            };
+            let fin = vec![mil_spec::NVT {
+                name: "x".into(),
+                ty: mil_spec::ValueType::Tensor(mil_spec::TensorType::f16(&shape)),
+            }];
+            let spec = mil_spec::encode_model(
+                &[f("x")],
+                &[f(&cur)],
+                &[],
+                &b,
+                &fin,
+                &mil_spec::ModelMeta::new(10, "CoreML9"),
+            );
+            let pkg = root.0.join("p.mlpackage");
+            mil_spec::write_mlpackage(&pkg, &spec, Some(&wb.finish())).unwrap();
+            let v = load4(&pkg, &root.0.join("c"));
+            println!(
+                "ANECONST n={n:<4} {} {v}",
+                if shared {
+                    "one shared weight "
+                } else {
+                    "distinct weights  "
+                }
+            );
+            let _ = std::fs::remove_dir_all(&pkg);
+            let _ = std::fs::remove_dir_all(root.0.join("c"));
+        }
+    }
+}
+
+fn conv_seq_test(
+    b: &mut mil_spec::Block,
+    x: &str,
+    w: &str,
+    cout: i64,
+    s: i64,
+    name: &str,
+) -> String {
+    use mil_spec::bind;
+    let st = b.fresh("stride");
+    let st = b.konst_i32(&st, &[1, 1]);
+    let pt = b.fresh("padtype");
+    let pt = b.konst_str(&pt, "valid");
+    let pd = b.fresh("pad");
+    let pd = b.konst_i32(&pd, &[0, 0, 0, 0]);
+    let dl = b.fresh("dil");
+    let dl = b.konst_i32(&dl, &[1, 1]);
+    let gp = b.fresh("grp");
+    let gp = b.konst_scalar_i32(&gp, 1);
+    b.o1(
+        "conv",
+        vec![
+            ("x".into(), bind(x).1),
+            ("weight".into(), bind(w).1),
+            ("strides".into(), bind(&st).1),
+            ("pad_type".into(), bind(&pt).1),
+            ("pad".into(), bind(&pd).1),
+            ("dilations".into(), bind(&dl).1),
+            ("groups".into(), bind(&gp).1),
+        ],
+        name,
+        mil_spec::ValueType::Tensor(mil_spec::TensorType::f16(&[1, cout, 1, s])),
+    )
+}
+
+/// Probe: does the one-hot scatter matrix computation (cast of the int32
+/// `pos` input plus elementwise ops) convert for the ANE?
+#[test]
+#[ignore = "diagnostic: needs coremlc; prints a matrix"]
+fn ane_scatter_probe() {
+    if mil_compile::coremlc_path().is_none() {
+        return;
+    }
+    let root = Root::new("anescat");
+    let (max_kv, s) = (64i64, 5i64);
+    for variant in ["full", "no-cast", "no-sub-bcast"] {
+        let mut b = mil_spec::Block::new();
+        let jv: Vec<f32> = (0..max_kv).map(|j| j as f32).collect();
+        let iv: Vec<f32> = (0..s).map(|i| i as f32).collect();
+        let iota_j = b.op(
+            "const",
+            vec![],
+            vec![(
+                "iota_j",
+                mil_spec::ValueType::Tensor(mil_spec::TensorType::f16(&[1, 1, max_kv, 1])),
+            )],
+            vec![("val".into(), mil_spec::Value::f16s(&[1, 1, max_kv, 1], &jv))],
+        )[0]
+        .clone();
+        let iota_i = b.op(
+            "const",
+            vec![],
+            vec![(
+                "iota_i",
+                mil_spec::ValueType::Tensor(mil_spec::TensorType::f16(&[1, 1, 1, s])),
+            )],
+            vec![("val".into(), mil_spec::Value::f16s(&[1, 1, 1, s], &iv))],
+        )[0]
+        .clone();
+        let (posf, in_dtype) = match variant {
+            "no-cast" => ("pos".to_string(), mil_spec::DType::Fp16),
+            _ => {
+                let c = b.cast("pos", "fp16", &[1], "pos_f16", false);
+                (c, mil_spec::DType::Int32)
+            }
+        };
+        let posf = b.reshape(&posf, &[1, 1, 1, 1], "pos_f4");
+        let d1 = b.sub(&iota_j, &posf, &[1, 1, max_kv, 1], "d1");
+        let d2 = if variant == "no-sub-bcast" {
+            d1.clone()
+        } else {
+            b.sub(&d1, &iota_i, &[1, 1, max_kv, s], "d2")
+        };
+        let ab = b.abs(
+            &d2,
+            &[1, 1, max_kv, if variant == "no-sub-bcast" { 1 } else { s }],
+            "ab",
+        );
+        b.outputs = vec![ab.clone()];
+        let oshape = [1, 1, max_kv, if variant == "no-sub-bcast" { 1 } else { s }];
+        let feat = |n: &str, sh: &[i64], dt| mil_spec::Feature {
+            name: n.into(),
+            shape: sh.to_vec(),
+            dtype: dt,
+            is_state: false,
+        };
+        let fin = vec![mil_spec::NVT {
+            name: "pos".into(),
+            ty: mil_spec::ValueType::Tensor(mil_spec::TensorType {
+                dtype: in_dtype,
+                shape: vec![1],
+            }),
+        }];
+        let spec = mil_spec::encode_model(
+            &[feat("pos", &[1], in_dtype)],
+            &[feat(&ab, &oshape, mil_spec::DType::Fp16)],
+            &[],
+            &b,
+            &fin,
+            &mil_spec::ModelMeta::new(10, "CoreML9"),
+        );
+        let pkg = root.0.join("p.mlpackage");
+        mil_spec::write_mlpackage(&pkg, &spec, None).unwrap();
+        let v = load4(&pkg, &root.0.join("c"));
+        println!("ANESCAT {variant:<14} {v}");
+        let _ = std::fs::remove_dir_all(&pkg);
+        let _ = std::fs::remove_dir_all(root.0.join("c"));
+    }
 }

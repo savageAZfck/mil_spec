@@ -854,7 +854,10 @@ fn predict_logits(_compiled: &Path) -> Vec<f32> {
 #[cfg(target_os = "macos")]
 fn predict_seq(compiled: &Path, s: i64) -> Vec<f32> {
     use mil_infer::{ComputeUnits, Input, Model};
-    let m = Model::load(compiled, ComputeUnits::All).unwrap();
+    // Flexible packages can't plan on `all` (the GPU/scheduler path
+    // rejects dynamic dims — measured: enum=cpu+ane only, range=cpu
+    // only). CpuOnly is the deterministic choice here.
+    let m = Model::load(compiled, ComputeUnits::CpuOnly).unwrap();
     let state = m.new_state().expect("stateful model");
     // input feature list: name → shape (defaults = first enum entry)
     let spec = std::fs::read(

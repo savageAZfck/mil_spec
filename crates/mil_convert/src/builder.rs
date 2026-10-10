@@ -81,6 +81,20 @@ pub struct Options {
     /// `EnumeratedShapes`; `lo` is the default shape. Mutually exclusive
     /// with `seq_lens.len() > 1`; `hi` must be finite and `<= max_kv`.
     pub seq_range: Option<(i64, i64)>,
+    /// Layers per shard (`--shard N`). `0` (default) → one monolithic
+    /// package. `>0` → the converter emits a `.milshards` bundle: one
+    /// stateful package per N-layer group (each with its own packed KV
+    /// state over its local rows) plus `head_shards` vocab-sliced head
+    /// packages (final norm + a slice of the vocab projection). This is
+    /// the layout Bad Apple's production converter measured: the ANE
+    /// execution-plan builder fails (error -14) above roughly 3,200
+    /// ops / ~51 MB of weights per program, which every >0.5 B model
+    /// blows past — sharding is the only way onto the Neural Engine
+    /// for real models. Sharded bundles are fixed-seq only for now.
+    pub shard_layers: usize,
+    /// Number of vocab-sliced head packages (`--head-shards M`,
+    /// default 4). Only used when `shard_layers > 0 && lm_head`.
+    pub head_shards: usize,
     /// Weight-const names the caller wants marked updatable
     /// (`--updatable l5_wq,l5_wk,...`).
     ///
@@ -109,6 +123,8 @@ impl Default for Options {
             quant_policy: None,
             seq_lens: Vec::new(),
             seq_range: None,
+            shard_layers: 0,
+            head_shards: 4,
             updatable: Vec::new(),
         }
     }
@@ -279,6 +295,63 @@ impl<'a> WeightEmitter<'a> {
                 Ok(b.konst_q8(name, &self.file, q_off, s_off, &[out_f, in_f, 1, 1]))
             }
         }
+    }
+
+    /// Emit rows `[lo, hi)` of a named HF weight as a conv-packed
+    /// `(hi-lo, in, 1, 1)` const — the vocab-slice emitter for sharded
+    /// LM heads. `Precision::Native` falls back to fp16 for a slice
+    /// (block codes can't be sub-rowed without dequantizing anyway).
+    pub fn conv_weight_rows(
+        &mut self,
+        b: &mut Block,
+        hf_name: &str,
+        name: &str,
+        lo: i64,
+        hi: i64,
+    ) -> std::io::Result<String> {
+        use crate::plan::Precision;
+        let (shape, bytes) = self.src.tensor_f16(hf_name)?;
+        if shape.len() != 2 || lo < 0 || hi > shape[0] || hi <= lo {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{hf_name}: bad row slice [{lo},{hi}) of {shape:?}"),
+            ));
+        }
+        let in_f = shape[1];
+        let row_bytes = (in_f * 2) as usize;
+        let slice = &bytes[lo as usize * row_bytes..hi as usize * row_bytes];
+        let rows = hi - lo;
+        match self.plan.precision(hf_name) {
+            Precision::Int8 => {
+                let (q, scales) = quantize_int8(slice, rows, in_f);
+                let q_off = self.w.append(DType::Int8, &q)?;
+                let s_off = self.w.append(DType::Fp16, &scales)?;
+                Ok(b.konst_q8(name, &self.file, q_off, s_off, &[rows, in_f, 1, 1]))
+            }
+            _ => {
+                let off = self.w.append(DType::Fp16, slice)?;
+                Ok(b.konst_blob(name, &self.file, off, DType::Fp16, &[rows, in_f, 1, 1]))
+            }
+        }
+    }
+
+    /// Emit the token-embedding table as a raw fp16 `(vocab, d)` blob —
+    /// the gather table for `--embed` builds.
+    pub fn embed_weight(
+        &mut self,
+        b: &mut Block,
+        hf_name: &str,
+        name: &str,
+    ) -> std::io::Result<String> {
+        let (shape, bytes) = self.src.tensor_f16(hf_name)?;
+        if shape.len() != 2 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{hf_name}: expected 2D embed table, got {shape:?}"),
+            ));
+        }
+        let off = self.w.append(DType::Fp16, &bytes)?;
+        Ok(b.konst_blob(name, &self.file, off, DType::Fp16, &shape))
     }
 
     /// Emit an optional conv bias `(cout,)` — `Ok(None)` when the
@@ -805,9 +878,31 @@ fn slice_update(
 /// Graph I/O:
 /// - inputs: `x` `(1, d, S, 1)` hidden states, `cos`/`sin` `(1,1,S,hd)`
 ///   rope tables, `mask` `(1,1,S,max_kv)` additive fp16, `pos` `int32[1]`
+///   (`--embed` swaps `x` for `ids` `(1,S)` int32 and opens the graph
+///   with the embedding gather)
 /// - state: `kv` `(layers*2, kvh, max_kv, dh)` packed
 /// - output: `logits` `(1, vocab, S, 1)` or `h` `(1, d, S, 1)` if no lm_head
 pub fn build(cfg: &ModelConfig, opts: &Options, em: &mut WeightEmitter) -> std::io::Result<Built> {
+    build_range(cfg, opts, em, 0, cfg.num_layers, true)
+}
+
+/// Layers `[ls, le)` of the decoder as one program — the layer-shard
+/// emitter for `--shard` bundles. The packed KV state is local to the
+/// range: `kv` has `(le-ls)*2` rows and layer `l` writes rows
+/// `2*(l-ls)`/`2*(l-ls)+1`, so every shard keeps the `kv` state name
+/// and the same input contract (`x`/`cos`/`sin`/`mask`/`pos` — `ids`
+/// instead of `x` only on shard 0 of an `--embed` build). `emit_tail`
+/// adds the final norm + lm_head output (`build` passes `true`; shard
+/// drivers pass `false` — a sharded model's final norm lives in the
+/// head packages so the last layer shard ends at raw hidden states).
+pub fn build_range(
+    cfg: &ModelConfig,
+    opts: &Options,
+    em: &mut WeightEmitter,
+    ls: usize,
+    le: usize,
+    emit_tail: bool,
+) -> std::io::Result<Built> {
     let mut b = Block::new();
     let d = cfg.hidden_size;
     // Flexible-seq builds declare their types at seq_lens[0] (the
@@ -829,16 +924,27 @@ pub fn build(cfg: &ModelConfig, opts: &Options, em: &mut WeightEmitter) -> std::
     let g = qh / kvh;
     let inter = cfg.intermediate_size;
     let max_kv = opts.max_kv;
-    let kv_shape = vec![cfg.num_layers as i64 * 2, kvh, max_kv, hd];
+    let nl = le - ls;
+    let kv_shape = vec![nl as i64 * 2, kvh, max_kv, hd];
     let act = vec![1, d, s, 1]; // conv layout: (1, C, S, 1)
 
     // ---- input features ----
+    let embed = opts.embed && ls == 0;
     let inputs = vec![
-        Feature {
-            name: "x".into(),
-            shape: act.clone(),
-            dtype: DType::Fp16,
-            is_state: false,
+        if embed {
+            Feature {
+                name: "ids".into(),
+                shape: vec![1, s],
+                dtype: DType::Int32,
+                is_state: false,
+            }
+        } else {
+            Feature {
+                name: "x".into(),
+                shape: act.clone(),
+                dtype: DType::Fp16,
+                is_state: false,
+            }
         },
         Feature {
             name: "cos".into(),
@@ -884,7 +990,17 @@ pub fn build(cfg: &ModelConfig, opts: &Options, em: &mut WeightEmitter) -> std::
     // The state value flows through every layer's slice_updates —
     // a serial chain kv_0 → kv_1 → ... → kv_L written back once.
     let mut kv = b.read_state("kv", &kv_shape, "kv_0");
-    let mut x = "x".to_string();
+    let mut x = if embed {
+        // ids (1,S) → gather rows of the fp16 table (vocab,d) →
+        // (1,S,d) → (1,d,S,1) conv layout. The table stays fp16 even
+        // under --int8 — it's an index lookup, not a matmul operand.
+        let et = em.embed_weight(&mut b, "model.embed_tokens.weight", "embed_w")?;
+        let g = b.gather(&et, "ids", 0, 0, &[1, s, d], "embed_g");
+        let g4 = b.reshape(&g, &[1, s, d, 1], "embed_g4");
+        b.transpose(&g4, &[0, 2, 1, 3], &[1, d, s, 1], "embed_x")
+    } else {
+        "x".to_string()
+    };
 
     // Flexible seq: the reshape/slice targets that bake `s` as a const
     // value in the fixed build become concat-computed tensors driven by
@@ -955,7 +1071,8 @@ pub fn build(cfg: &ModelConfig, opts: &Options, em: &mut WeightEmitter) -> std::
         None
     };
 
-    for l in 0..cfg.num_layers {
+    for l in ls..le {
+        let lr = l - ls; // local KV-state row base
         let pfx = format!("l{l}");
         // ---- attention input norm ----
         let nw = em.norm_weight(
@@ -1103,14 +1220,14 @@ pub fn build(cfg: &ModelConfig, opts: &Options, em: &mut WeightEmitter) -> std::
             flex,
         );
 
-        // ---- packed-KV slice_updates: row 2l = K, row 2l+1 = V ----
+        // ---- packed-KV slice_updates: row 2*lr = K, row 2*lr+1 = V ----
         // updates land as (1, kvh, S, dh) — same layout the state stores.
         kv = slice_update(
             &mut b,
             &kv,
             &kr,
-            (l * 2) as i32,
-            (l * 2 + 1) as i32,
+            (lr * 2) as i32,
+            (lr * 2 + 1) as i32,
             "pos",
             fx.as_ref().map(|f| f.seq.as_str()),
             kvh,
@@ -1123,8 +1240,8 @@ pub fn build(cfg: &ModelConfig, opts: &Options, em: &mut WeightEmitter) -> std::
             &mut b,
             &kv,
             &v4,
-            (l * 2 + 1) as i32,
-            (l * 2 + 2) as i32,
+            (lr * 2 + 1) as i32,
+            (lr * 2 + 2) as i32,
             "pos",
             fx.as_ref().map(|f| f.seq.as_str()),
             kvh,
@@ -1137,15 +1254,15 @@ pub fn build(cfg: &ModelConfig, opts: &Options, em: &mut WeightEmitter) -> std::
         // ---- read this layer's K/V rows post-write ----
         let k_full = b.slice(
             &kv,
-            &[(l * 2) as i32, 0, 0, 0],
-            &[(l * 2 + 1) as i32, kvh as i32, max_kv as i32, hd as i32],
+            &[(lr * 2) as i32, 0, 0, 0],
+            &[(lr * 2 + 1) as i32, kvh as i32, max_kv as i32, hd as i32],
             &[1, kvh, max_kv, hd],
             &format!("{pfx}_kfull"),
         );
         let v_full = b.slice(
             &kv,
-            &[(l * 2 + 1) as i32, 0, 0, 0],
-            &[(l * 2 + 2) as i32, kvh as i32, max_kv as i32, hd as i32],
+            &[(lr * 2 + 1) as i32, 0, 0, 0],
+            &[(lr * 2 + 2) as i32, kvh as i32, max_kv as i32, hd as i32],
             &[1, kvh, max_kv, hd],
             &format!("{pfx}_vfull"),
         );
@@ -1291,22 +1408,28 @@ pub fn build(cfg: &ModelConfig, opts: &Options, em: &mut WeightEmitter) -> std::
     // write the accumulated state once
     b.write_state("kv", &kv);
 
-    // ---- final norm + head ----
-    let fw = em.norm_weight(&mut b, "model.norm.weight", "final_w", &[1, d, 1, 1])?;
-    let xf = rms_norm_axis(&mut b, &x, &fw, d, cfg.rms_norm_eps, &[1], &act, "final");
-
-    let (out_name, out_shape) = if opts.lm_head {
-        // tied models reuse the embedding table as the head
-        let head_w = if cfg.tie_word_embeddings {
-            "model.embed_tokens.weight"
-        } else {
-            "lm_head.weight"
-        };
-        let wl = em.conv_weight(&mut b, head_w, "lm_w")?;
-        let logits = b.conv1x1_s(&xf, &wl, None, cfg.vocab_size, s, "logits");
-        (logits, vec![1, cfg.vocab_size, s, 1])
+    let (out_name, out_shape) = if !emit_tail {
+        // layer shard: output is raw hidden states — the final norm
+        // lives in the head packages.
+        (x.clone(), act.clone())
     } else {
-        (xf, act.clone())
+        // ---- final norm + head ----
+        let fw = em.norm_weight(&mut b, "model.norm.weight", "final_w", &[1, d, 1, 1])?;
+        let xf = rms_norm_axis(&mut b, &x, &fw, d, cfg.rms_norm_eps, &[1], &act, "final");
+
+        if opts.lm_head {
+            // tied models reuse the embedding table as the head
+            let head_w = if cfg.tie_word_embeddings {
+                "model.embed_tokens.weight"
+            } else {
+                "lm_head.weight"
+            };
+            let wl = em.conv_weight(&mut b, head_w, "lm_w")?;
+            let logits = b.conv1x1_s(&xf, &wl, None, cfg.vocab_size, s, "logits");
+            (logits, vec![1, cfg.vocab_size, s, 1])
+        } else {
+            (xf, act.clone())
+        }
     };
     b.outputs = vec![out_name.clone()];
 
@@ -1323,10 +1446,13 @@ pub fn build(cfg: &ModelConfig, opts: &Options, em: &mut WeightEmitter) -> std::
             ty: f16(&f.shape),
         })
         .collect();
-    // pos/seq are int32 — fix the dtype the f16() helper set wrong
+    // pos/seq/ids are int32 — fix the dtype the f16() helper set wrong
     for n in fn_inputs.iter_mut() {
         if n.name == "pos" || n.name == "seq" {
             n.ty = tt(DType::Int32, &[1]);
+        }
+        if n.name == "ids" {
+            n.ty = tt(DType::Int32, &[1, s]);
         }
     }
     fn_inputs.push(NVT {
@@ -1348,6 +1474,9 @@ pub fn build(cfg: &ModelConfig, opts: &Options, em: &mut WeightEmitter) -> std::
     let flex_map = if flex {
         for name in ["x", "cos", "sin", "mask"] {
             syms.insert(name.to_string(), vec![None, None, Some("s".into()), None]);
+        }
+        if embed {
+            syms.insert("ids".to_string(), vec![None, Some("s".into())]);
         }
         // Producer lookup: value name -> op that emits it.
         let mut producer: std::collections::BTreeMap<&str, &mil_spec::Op> =
@@ -1599,6 +1728,62 @@ pub fn build(cfg: &ModelConfig, opts: &Options, em: &mut WeightEmitter) -> std::
         fn_inputs,
         flex: flex_map,
         syms,
+    })
+}
+
+/// One vocab-sliced head package for a `--shard` bundle: final RMSNorm
+/// + rows `[lo, hi)` of the vocab projection → `logits`
+/// `(1, hi-lo, S, 1)`. Input is raw hidden states `x` `(1, d, S, 1)` —
+/// no KV state, no rope/mask/pos. Bad Apple's production converter
+/// measured the same layout (`head_vXX-YY.mlpackage`): a single
+/// `vocab × d` projection is both the largest weight in the model and
+/// the kind of op the ANE planner handles worst at scale, so the head
+/// is split across `opts.head_shards` small packages and the driver
+/// concatenates the logits slices.
+pub fn build_head(
+    cfg: &ModelConfig,
+    opts: &Options,
+    em: &mut WeightEmitter,
+    lo: i64,
+    hi: i64,
+) -> std::io::Result<Built> {
+    let mut b = Block::new();
+    let d = cfg.hidden_size;
+    let s = opts.seq;
+    let act = vec![1, d, s, 1];
+    let fw = em.norm_weight(&mut b, "model.norm.weight", "final_w", &[1, d, 1, 1])?;
+    let xf = rms_norm_axis(&mut b, "x", &fw, d, cfg.rms_norm_eps, &[1], &act, "final");
+    let head_w = if cfg.tie_word_embeddings {
+        "model.embed_tokens.weight"
+    } else {
+        "lm_head.weight"
+    };
+    let wl = em.conv_weight_rows(&mut b, head_w, "lm_w", lo, hi)?;
+    let logits = b.conv1x1_s(&xf, &wl, None, hi - lo, s, "logits");
+    b.outputs = vec![logits.clone()];
+    let inputs = vec![Feature {
+        name: "x".into(),
+        shape: act.clone(),
+        dtype: DType::Fp16,
+        is_state: false,
+    }];
+    let outputs = vec![Feature {
+        name: logits,
+        shape: vec![1, hi - lo, s, 1],
+        dtype: DType::Fp16,
+        is_state: false,
+    }];
+    Ok(Built {
+        block: b,
+        inputs,
+        outputs,
+        states: Vec::new(),
+        fn_inputs: vec![NVT {
+            name: "x".into(),
+            ty: f16(&act),
+        }],
+        flex: None,
+        syms: std::collections::BTreeMap::new(),
     })
 }
 

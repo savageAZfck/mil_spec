@@ -1,6 +1,6 @@
 [package]
 name = "mil_lint"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.80"
 description = "Static ANE-placement analysis for MIL graphs: predicts per-op execution unit (ANE/GPU/CPU) before compile."

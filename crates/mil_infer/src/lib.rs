@@ -24,6 +24,10 @@ use std::fmt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+/// `.milshards` bundle loading and chained prediction.
+pub mod shard;
+pub use shard::{ShardManifest, ShardedModel};
+
 /// Which hardware units the model is allowed to use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComputeUnits {
@@ -35,6 +39,96 @@ pub enum ComputeUnits {
     CpuAndGpu = 2,
     /// CPU + ANE, no GPU. The number that matters for the drafter.
     CpuAndNeuralEngine = 3,
+}
+
+impl ComputeUnits {
+    /// The `MLComputeUnits` raw value Core ML expects
+    /// (`MLModelConfiguration.computeUnits`): `cpuOnly = 0`,
+    /// `cpuAndGPU = 1`, `all = 2`, `cpuAndNeuralEngine = 3`. This is
+    /// deliberately an explicit `match`, not the enum discriminant — the
+    /// discriminants here were once passed through verbatim and every
+    /// setting but `CpuAndNeuralEngine` selected the wrong hardware.
+    pub fn ml_raw_value(self) -> i64 {
+        match self {
+            ComputeUnits::CpuOnly => 0,
+            ComputeUnits::CpuAndGpu => 1,
+            ComputeUnits::All => 2,
+            ComputeUnits::CpuAndNeuralEngine => 3,
+        }
+    }
+}
+
+/// A compute device Core ML can place an operation on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Device {
+    /// `MLCPUComputeDevice`.
+    Cpu,
+    /// `MLGPUComputeDevice`.
+    Gpu,
+    /// `MLNeuralEngineComputeDevice`.
+    NeuralEngine,
+}
+
+impl Device {
+    /// Short label (`cpu` / `gpu` / `ane`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Device::Cpu => "cpu",
+            Device::Gpu => "gpu",
+            Device::NeuralEngine => "ane",
+        }
+    }
+}
+
+/// Where Core ML's compute plan (`MLComputePlan`, macOS 14.4+) places
+/// one ML Program operation.
+#[derive(Clone, Debug)]
+pub struct OpPlacement {
+    /// Function the op lives in (`main`).
+    pub function: String,
+    /// MIL op type (`conv`, `softmax`, ...).
+    pub op_type: String,
+    /// First output's name (empty if the op has none).
+    pub output: String,
+    /// The device Core ML would run it on. `None` for ops with no
+    /// device usage (compile-time consts).
+    pub preferred: Option<Device>,
+    /// Every device that supports the op.
+    pub supported: Vec<Device>,
+    /// `MLComputePlanCost.weight` — the op's share of estimated cost
+    /// (weights sum to ~1 over the program). `None` when unavailable.
+    pub cost: Option<f64>,
+}
+
+/// Per-device totals over a plan: op count and summed cost weight.
+pub fn summarize_plan(ops: &[OpPlacement]) -> std::collections::BTreeMap<Device, (usize, f64)> {
+    let mut m = std::collections::BTreeMap::new();
+    for o in ops {
+        if let Some(d) = o.preferred {
+            let e = m.entry(d).or_insert((0usize, 0f64));
+            e.0 += 1;
+            e.1 += o.cost.unwrap_or(0.0);
+        }
+    }
+    m
+}
+
+/// Ask Core ML where it would place every operation of a compiled
+/// ML Program (`.mlmodelc`) under `units` — `MLComputePlan`, the same
+/// data Xcode's performance report shows. Requires macOS 14.4+.
+///
+/// This is *Core ML's plan*, not a trace of an actual run, but it is the
+/// authoritative statement of which device each op is scheduled on.
+pub fn compute_plan(compiled: &Path, units: ComputeUnits) -> Result<Vec<OpPlacement>> {
+    #[cfg(target_os = "macos")]
+    {
+        imp::compute_plan(compiled, units)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (compiled, units);
+        err("plan", "compute_plan requires macOS")
+    }
 }
 
 /// An inference error.
@@ -402,6 +496,233 @@ mod imp {
         }
     }
 
+    // ---------------- MLComputePlan ----------------
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn object_getClass(obj: Id) -> Id;
+        fn class_getName(cls: Id) -> *const c_char;
+    }
+
+    unsafe fn msg0_f64(r: Id, s: Sel) -> f64 {
+        let f: unsafe extern "C" fn(Id, Sel) -> f64 =
+            std::mem::transmute(objc_msgSend as *const () as usize);
+        f(r, s)
+    }
+
+    /// `NSString` → Rust `String` (empty for nil).
+    fn ns_to_string(ns: Id) -> String {
+        utf8(ns).unwrap_or_default()
+    }
+
+    fn class_name_of(obj: Id) -> String {
+        if obj.is_null() {
+            return String::new();
+        }
+        let c = unsafe { class_getName(object_getClass(obj)) };
+        if c.is_null() {
+            String::new()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(c) }
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+
+    fn device_of(obj: Id) -> Option<Device> {
+        let n = class_name_of(obj);
+        if n.contains("NeuralEngine") {
+            Some(Device::NeuralEngine)
+        } else if n.contains("GPU") {
+            Some(Device::Gpu)
+        } else if n.contains("CPU") {
+            Some(Device::Cpu)
+        } else {
+            None
+        }
+    }
+
+    /// Completion-handler block: `void (^)(MLComputePlan*, NSError*)`.
+    /// A global block (no captures); results go through `PLAN_SLOT`,
+    /// and `PLAN_CALL` serializes callers so there is one in-flight
+    /// request per process.
+    #[repr(C)]
+    struct PlanBlock {
+        isa: *const c_void,
+        flags: i32,
+        reserved: i32,
+        invoke: unsafe extern "C" fn(*const PlanBlock, Id, Id),
+        descriptor: *const StateBlockDesc,
+    }
+    unsafe impl Sync for PlanBlock {}
+
+    struct PlanResult {
+        plan: usize,
+        error: Option<String>,
+    }
+    static PLAN_SLOT: std::sync::Mutex<Option<PlanResult>> = std::sync::Mutex::new(None);
+    static PLAN_READY: std::sync::Condvar = std::sync::Condvar::new();
+    static PLAN_CALL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    static PLAN_BLOCK_DESC: StateBlockDesc = StateBlockDesc {
+        reserved: 0,
+        size: std::mem::size_of::<PlanBlock>() as u64,
+    };
+
+    static PLAN_BLOCK: PlanBlock = PlanBlock {
+        isa: unsafe { &_NSConcreteGlobalBlock } as *const c_void as *const c_void,
+        flags: BLOCK_IS_GLOBAL,
+        reserved: 0,
+        invoke: plan_done,
+        descriptor: &PLAN_BLOCK_DESC,
+    };
+
+    unsafe extern "C" fn plan_done(_blk: *const PlanBlock, plan: Id, error: Id) {
+        let pool = objc_autoreleasePoolPush();
+        let res = if plan.is_null() {
+            PlanResult {
+                plan: 0,
+                error: Some(err_desc(error)),
+            }
+        } else {
+            // outlive the handler's autorelease pool
+            msg0(plan, sel("retain"));
+            PlanResult {
+                plan: plan as usize,
+                error: None,
+            }
+        };
+        objc_autoreleasePoolPop(pool);
+        *PLAN_SLOT.lock().unwrap() = Some(res);
+        PLAN_READY.notify_all();
+    }
+
+    unsafe fn nsarray_each(arr: Id, mut f: impl FnMut(Id)) {
+        if arr.is_null() {
+            return;
+        }
+        let n = msg0_usize(arr, sel("count"));
+        for i in 0..n {
+            f(msg1_usize(arr, sel("objectAtIndex:"), i));
+        }
+    }
+
+    /// Walk `ops` (an `NSArray<MLModelStructureProgramOperation*>`),
+    /// recursing into nested blocks.
+    unsafe fn walk_ops(plan: Id, func: &str, ops: Id, out: &mut Vec<OpPlacement>) {
+        nsarray_each(ops, |op| {
+            let op_type = ns_to_string(msg0(op, sel("operatorName")));
+            let outs = msg0(op, sel("outputs"));
+            let mut output = String::new();
+            if !outs.is_null() && msg0_usize(outs, sel("count")) > 0 {
+                let nv = msg1_usize(outs, sel("objectAtIndex:"), 0);
+                output = ns_to_string(msg0(nv, sel("name")));
+            }
+            let usage = msg1(plan, sel("computeDeviceUsageForMLProgramOperation:"), op);
+            let (preferred, supported) = if usage.is_null() {
+                (None, Vec::new())
+            } else {
+                let mut sup = Vec::new();
+                nsarray_each(msg0(usage, sel("supportedComputeDevices")), |d| {
+                    if let Some(dev) = device_of(d) {
+                        sup.push(dev);
+                    }
+                });
+                (device_of(msg0(usage, sel("preferredComputeDevice"))), sup)
+            };
+            let cost_obj = msg1(plan, sel("estimatedCostOfMLProgramOperation:"), op);
+            let cost = if cost_obj.is_null() {
+                None
+            } else {
+                Some(msg0_f64(cost_obj, sel("weight")))
+            };
+            out.push(OpPlacement {
+                function: func.to_string(),
+                op_type,
+                output,
+                preferred,
+                supported,
+                cost,
+            });
+            nsarray_each(msg0(op, sel("blocks")), |blk| {
+                walk_ops(plan, func, msg0(blk, sel("operations")), out);
+            });
+        });
+    }
+
+    pub fn compute_plan(compiled: &Path, units: ComputeUnits) -> Result<Vec<OpPlacement>> {
+        let pool = unsafe { objc_autoreleasePoolPush() };
+        let r = compute_plan_inner(compiled, units);
+        unsafe { objc_autoreleasePoolPop(pool) };
+        r
+    }
+
+    fn compute_plan_inner(compiled: &Path, units: ComputeUnits) -> Result<Vec<OpPlacement>> {
+        ensure_coreml()?;
+        let plan_cls = unsafe { objc_getClass(c"MLComputePlan".as_ptr()) };
+        if plan_cls.is_null() {
+            return err("plan", "MLComputePlan unavailable (needs macOS 14.4+)");
+        }
+        let url = file_url(compiled.to_str().ok_or_else(|| InferError {
+            stage: "plan",
+            message: "path not utf8".into(),
+        })?)?;
+        let cfg = unsafe { msg0(cls("MLModelConfiguration")?, sel("new")) };
+        unsafe { msg1_i64(cfg, sel("setComputeUnits:"), units.ml_raw_value()) };
+
+        let _one_at_a_time = PLAN_CALL.lock().unwrap();
+        *PLAN_SLOT.lock().unwrap() = None;
+        unsafe {
+            msg3(
+                plan_cls,
+                sel("loadContentsOfURL:configuration:completionHandler:"),
+                url,
+                cfg,
+                &PLAN_BLOCK as *const PlanBlock as Id,
+            );
+        }
+        let res = {
+            let mut slot = PLAN_SLOT.lock().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(300);
+            loop {
+                if let Some(r) = slot.take() {
+                    break r;
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return err("plan", "timed out waiting for MLComputePlan");
+                }
+                slot = PLAN_READY.wait_timeout(slot, left).unwrap().0;
+            }
+        };
+        if let Some(e) = res.error {
+            return err("plan", e);
+        }
+        let plan = res.plan as Id;
+        let mut out = Vec::new();
+        unsafe {
+            let st = msg0(plan, sel("modelStructure"));
+            let prog = msg0(st, sel("program"));
+            if prog.is_null() {
+                msg0(plan, sel("release"));
+                return err("plan", "not an ML Program (no program structure)");
+            }
+            let funcs = msg0(prog, sel("functions"));
+            let keys = msg0(funcs, sel("allKeys"));
+            nsarray_each(keys, |k| {
+                let f = msg1(funcs, sel("objectForKey:"), k);
+                let block = msg0(f, sel("block"));
+                walk_ops(
+                    plan,
+                    &ns_to_string(k),
+                    msg0(block, sel("operations")),
+                    &mut out,
+                );
+            });
+            msg0(plan, sel("release"));
+        }
+        Ok(out)
+    }
     /// A loaded `.mlmodelc`.
     pub struct Model {
         model: Id,
@@ -434,7 +755,7 @@ mod imp {
             // configuration with the requested compute units
             let cfg = unsafe { msg0(cls("MLModelConfiguration")?, sel("new")) };
             unsafe {
-                msg1_i64(cfg, sel("setComputeUnits:"), units as i64);
+                msg1_i64(cfg, sel("setComputeUnits:"), units.ml_raw_value());
             }
 
             let mut e: Id = std::ptr::null_mut();
@@ -757,6 +1078,16 @@ mod tests {
     use super::*;
     use half::f16;
     use mil_spec::{Block, TensorType, ValueType};
+
+    /// `MLComputeUnits` in `<CoreML/MLModelConfiguration.h>`:
+    /// cpuOnly = 0, cpuAndGPU = 1, all = 2, cpuAndNeuralEngine = 3.
+    #[test]
+    fn compute_units_map_to_ml_compute_units() {
+        assert_eq!(ComputeUnits::CpuOnly.ml_raw_value(), 0);
+        assert_eq!(ComputeUnits::CpuAndGpu.ml_raw_value(), 1);
+        assert_eq!(ComputeUnits::All.ml_raw_value(), 2);
+        assert_eq!(ComputeUnits::CpuAndNeuralEngine.ml_raw_value(), 3);
+    }
 
     /// `ml_dtype_size` covers every `MLMultiArrayDataType` in the SDK
     /// enum and returns `None` for anything else — zeroing must never

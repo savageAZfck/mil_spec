@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "mil_convert"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "half",
  "mil_compile",
@@ -105,18 +105,19 @@ dependencies = [
 
 [[package]]
 name = "mil_infer"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "half",
  "mil_compile",
  "mil_machines",
  "mil_spec",
  "mil_verify",
+ "serde_json",
 ]
 
 [[package]]
 name = "mil_lint"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "mil_spec",
 ]
@@ -157,7 +158,7 @@ dependencies = [
 
 [[package]]
 name = "mil_verify"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "half",
  "mil_compile",
@@ -170,7 +171,7 @@ dependencies = [
 
 [[package]]
 name = "milc"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "half",
  "mil_compile",

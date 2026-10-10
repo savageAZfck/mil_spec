@@ -239,6 +239,17 @@ pub fn classify_op(
         return (Unit::Gpu, "rank>4");
     }
     let f32 = dtype == Some(mil_spec::DType::Fp32);
+    // Integer / bool arithmetic is never ANE work (the ANE is fp16).
+    // `MLComputePlan` puts the index math around `slice_update`
+    // (`concat`/`add` on int32) on the CPU. Consts are metadata and
+    // `cast` is how data enters the fp16 domain, so both are exempt.
+    if matches!(
+        dtype,
+        Some(mil_spec::DType::Int32 | mil_spec::DType::Int64 | mil_spec::DType::Bool)
+    ) && !matches!(ty, "const" | "cast")
+    {
+        return (Unit::Cpu, "integer op");
+    }
 
     match ty {
         // --- Always-ANE core ---
@@ -309,9 +320,10 @@ pub fn classify_op(
 
         "concat" | "stack" | "tile" | "pad" => (Unit::Ane, "layout op"),
 
-        // slice_update is the KV-cache write path — the packed-state
-        // pattern writes through it; it lives where the state lives.
-        "slice_update" | "slice_update_dynamic" => (Unit::Ane, "state write"),
+        // slice_update is the KV-cache write path. `MLComputePlan` schedules
+        // it on the CPU (measured on SmolLM2 packages: every slice_update
+        // is a CPU op), which also splits the ANE program around it.
+        "slice_update" | "slice_update_dynamic" => (Unit::Cpu, "slice_update (CPU-scheduled)"),
 
         // Matmul — ANE runs it; big vocab-side matmuls are the border.
         "matmul" | "batched_matmul" | "linear" | "einsum" | "scaled_dot_product_attention" => {

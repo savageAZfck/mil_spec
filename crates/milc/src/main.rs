@@ -32,6 +32,7 @@ fn main() -> ExitCode {
         "diff" => cmd_diff(&args[1..]),
         "compile" => cmd_compile(&args[1..]),
         "run" => cmd_run(&args[1..]),
+        "plan" => cmd_plan(&args[1..]),
         "verify" => ExitCode::from(mil_verify::run_battery() as u8),
         "check" => cmd_check(&args[1..]),
         "fuse-lora" => cmd_fuse_lora(&args[1..]),
@@ -61,7 +62,8 @@ fn usage() {
         "milc — the mil_spec toolchain\n\
          \n\
          usage:\n\
-         \x20 milc convert <model_dir|model.gguf> -o <pkg.mlpackage> [--seq N] [--seq-lens a,b,c | --seq-range LO..HI] [--max-kv N] [--fp16] [--lora <adapter>]\n\
+         \x20 milc convert <model_dir|model.gguf> -o <pkg.mlpackage> [--seq N] [--seq-lens a,b,c | --seq-range LO..HI] [--max-kv N] [--fp16] [--lora <adapter>] [--embed] [--shard N] [--head-shards M]\n\
+         \x20   --shard N → <pkg> is a .milshards bundle dir: N-layer stateful shards + vocab-sliced heads + manifest.json (the layout the ANE plan builder accepts — monolithic >~3.2k ops fails -14)\n\
          \x20                    [--plan] [--quant-policy uniform|placement|error] [--plan-file <json>]\n\
          \x20 milc gguf    <file.gguf> [--json] [--tokenizer <out.json>]   # header, metadata, tensor table\n\
          \x20 milc onnx    <model.onnx|model.json> -o <pkg.mlpackage> [--dim name=N]... [--inline-max BYTES] [--classical]\n\
@@ -69,7 +71,8 @@ fn usage() {
          \x20 milc inspect <pkg.mlpackage|file.mlmodel>\n\
          \x20 milc diff    <a.mlmodel|pkg> <b.mlmodel|pkg>\n\
          \x20 milc compile <pkg.mlpackage> [-o <out_dir>]\n\
-         \x20 milc run     <model.mlmodelc> [--units ane|gpu|all|cpu] [--steps N]\n\
+         \x20 milc run     <model.mlmodelc|bundle.milshards> [--units ane|gpu|all|cpu] [--steps N]\n\
+         \x20 milc plan    <pkg|model.mlmodelc> [--units all|ane|gpu|cpu] [--json]   # Core ML compute plan: per-op device + cost\n\
          \x20 milc verify\n\
          \x20 milc check   <pkg.mlpackage>\n\
          \x20 milc fuse-lora <pkg> --lora <adapter> -o <pkg>        # fuse adapter into package weights\n\
@@ -202,6 +205,17 @@ fn cmd_convert(args: &[String]) -> ExitCode {
                 opts.embed = true;
                 i += 1;
             }
+            "--shard" => {
+                // Layers per package — emits a .milshards bundle of
+                // small packages the ANE plan builder accepts (the
+                // monolithic program dies at ~3.2k ops, error -14).
+                opts.shard_layers = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                i += 2;
+            }
+            "--head-shards" => {
+                opts.head_shards = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(4);
+                i += 2;
+            }
             "--spec" => {
                 opts.spec_version = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(10);
                 i += 2;
@@ -313,6 +327,15 @@ fn cmd_convert(args: &[String]) -> ExitCode {
         Ok(r) => {
             println!("wrote {}", r.package.display());
             println!("{} ops, {} weight bytes", r.op_count, r.weight_bytes);
+            if opts.shard_layers == 0 && r.op_count > 3000 {
+                eprintln!(
+                    "note: {} ops is past the ANE plan-builder limit (~3.2k ops / ~51 MB \
+                     per program — the model will fail to load with error -14 on cpu+ane \
+                     and all). Re-convert with --shard N (e.g. --shard 8) to emit a \
+                     .milshards bundle that runs on the Neural Engine.",
+                    r.op_count
+                );
+            }
             if opts.seq_range.is_some() {
                 eprintln!(
                     "note: --seq-range gives continuous sequence lengths, but Apple documents EnumeratedShapes \
@@ -693,7 +716,7 @@ fn cmd_compile(args: &[String]) -> ExitCode {
 /// neural engine — the latency number the lint report predicts.
 #[cfg(target_os = "macos")]
 fn cmd_run(args: &[String]) -> ExitCode {
-    use mil_infer::{ComputeUnits, Input, Model};
+    use mil_infer::{ComputeUnits, Model};
 
     let mut path: Option<PathBuf> = None;
     let mut units = ComputeUnits::All;
@@ -730,6 +753,9 @@ fn cmd_run(args: &[String]) -> ExitCode {
         eprintln!("milc run: needs <pkg.mlpackage>");
         return ExitCode::from(2);
     };
+    if path.join("manifest.json").exists() {
+        return run_sharded(&path, units, steps);
+    }
     let spec_path = path.join("Data/com.apple.CoreML/model.mlmodel");
     let spec = match std::fs::read(&spec_path) {
         Ok(s) => s,
@@ -783,65 +809,10 @@ fn cmd_run(args: &[String]) -> ExitCode {
     };
 
     // dtype enum → element size / generation
-    let dtype_of = |code: u64| -> mil_spec::DType {
-        match code {
-            16 => mil_spec::DType::Fp16,
-            5 => mil_spec::DType::Int32,
-            8 => mil_spec::DType::Int64,
-            _ => mil_spec::DType::Fp32,
-        }
-    };
     let mut lat = Vec::with_capacity(steps);
     for step in 0..steps {
         let mut bufs: Vec<Vec<u8>> = Vec::new();
-        let mut inputs: Vec<Input> = Vec::new();
-        for f in &summary.inputs {
-            let n: i64 = f.shape.iter().product();
-            let n = n.max(1) as usize;
-            let dt = dtype_of(f.dtype);
-            let buf = match dt {
-                mil_spec::DType::Int32 | mil_spec::DType::Int64 => {
-                    // scalar-ish int inputs: feed the step index (pos-style)
-                    let mut v = Vec::with_capacity(n * 4);
-                    for _ in 0..n {
-                        v.extend_from_slice(&(step as i32).to_le_bytes());
-                    }
-                    v
-                }
-                _ => {
-                    let mut v = Vec::with_capacity(n * 2);
-                    if f.name.contains("mask") {
-                        // causal: 0 for seen slots, -1e4 for future
-                        let seen = (step + 1).min(n);
-                        for j in 0..n {
-                            let x = if j < seen { 0.0 } else { -1e4 };
-                            v.extend_from_slice(&half::f16::from_f32(x).to_le_bytes());
-                        }
-                    } else if f.name.contains("cos") {
-                        for _ in 0..n {
-                            v.extend_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
-                        }
-                    } else if f.name.contains("sin") {
-                        v.resize(n * 2, 0);
-                    } else {
-                        for j in 0..n {
-                            let x = 0.001 * ((j + step) % 17) as f32;
-                            v.extend_from_slice(&half::f16::from_f32(x).to_le_bytes());
-                        }
-                    }
-                    v
-                }
-            };
-            bufs.push(buf);
-        }
-        for (f, b) in summary.inputs.iter().zip(bufs.iter()) {
-            inputs.push(Input {
-                name: &f.name,
-                shape: &f.shape,
-                data: b,
-                dtype: dtype_of(f.dtype),
-            });
-        }
+        let inputs = synth_inputs(&summary.inputs, step, &mut bufs);
         let p = match &state {
             Some(s) => model.predict_with_state(Some(s), &inputs),
             None => model.predict(&inputs),
@@ -874,9 +845,364 @@ fn cmd_run(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// dtype enum → element dtype for feed synthesis.
+#[cfg(target_os = "macos")]
+fn dtype_of(code: u64) -> mil_spec::DType {
+    match code {
+        16 => mil_spec::DType::Fp16,
+        5 => mil_spec::DType::Int32,
+        8 => mil_spec::DType::Int64,
+        _ => mil_spec::DType::Fp32,
+    }
+}
+
+/// Synthesize plausible feeds from a spec's input features: causal
+/// mask (0 seen / -1e4 future), cos=1, sin=0, pos/seq=step, small
+/// ramp for everything else. Buffers land in `bufs` so the returned
+/// `Input`s borrow them.
+#[cfg(target_os = "macos")]
+fn synth_inputs<'a>(
+    feats: &'a [mil_verify::FeatureInfo],
+    step: usize,
+    bufs: &'a mut Vec<Vec<u8>>,
+) -> Vec<mil_infer::Input<'a>> {
+    use mil_infer::Input;
+    for f in feats {
+        let n: i64 = f.shape.iter().product();
+        let n = n.max(1) as usize;
+        let dt = dtype_of(f.dtype);
+        let buf = match dt {
+            mil_spec::DType::Int32 | mil_spec::DType::Int64 => {
+                // scalar-ish int inputs: feed the step index (pos-style)
+                let mut v = Vec::with_capacity(n * 4);
+                for _ in 0..n {
+                    v.extend_from_slice(&(step as i32).to_le_bytes());
+                }
+                v
+            }
+            _ => {
+                let mut v = Vec::with_capacity(n * 2);
+                if f.name.contains("mask") {
+                    // causal: 0 for seen slots, -1e4 for future
+                    let seen = (step + 1).min(n);
+                    for j in 0..n {
+                        let x = if j < seen { 0.0 } else { -1e4 };
+                        v.extend_from_slice(&half::f16::from_f32(x).to_le_bytes());
+                    }
+                } else if f.name.contains("cos") {
+                    for _ in 0..n {
+                        v.extend_from_slice(&half::f16::from_f32(1.0).to_le_bytes());
+                    }
+                } else if f.name.contains("sin") {
+                    v.resize(n * 2, 0);
+                } else {
+                    for j in 0..n {
+                        let x = 0.001 * ((j + step) % 17) as f32;
+                        v.extend_from_slice(&half::f16::from_f32(x).to_le_bytes());
+                    }
+                }
+                v
+            }
+        };
+        bufs.push(buf);
+    }
+    feats
+        .iter()
+        .zip(bufs.iter())
+        .map(|(f, b)| Input {
+            name: &f.name,
+            shape: &f.shape,
+            data: b,
+            dtype: dtype_of(f.dtype),
+        })
+        .collect()
+}
+
+/// `milc run <bundle.milshards>` — compile + load every member package
+/// and time chained predictions, all on the requested units.
+#[cfg(target_os = "macos")]
+fn run_sharded(dir: &Path, units: mil_infer::ComputeUnits, steps: usize) -> ExitCode {
+    use mil_infer::ShardedModel;
+    let manifest = match mil_infer::ShardManifest::load(dir) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("milc run: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Feed shapes come from the first layer shard's spec — every layer
+    // shard shares the input contract.
+    let first = match manifest.layer_shards.first() {
+        Some((f, _, _)) => dir.join(f),
+        None => {
+            eprintln!("milc run: bundle has no layer shards");
+            return ExitCode::FAILURE;
+        }
+    };
+    let spec = match std::fs::read(first.join("Data/com.apple.CoreML/model.mlmodel")) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("milc run: {}: {e}", first.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let summary = match mil_verify::summarize(&spec) {
+        Some(s) => s,
+        None => {
+            eprintln!("milc run: could not decode shard spec");
+            return ExitCode::FAILURE;
+        }
+    };
+    let comp_dir = dir.with_extension("compiled");
+    let sm = match ShardedModel::load(dir, units, &comp_dir) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("milc run: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut lat = Vec::with_capacity(steps);
+    for step in 0..steps {
+        let mut bufs: Vec<Vec<u8>> = Vec::new();
+        let inputs = synth_inputs(&summary.inputs, step, &mut bufs);
+        match sm.predict(&inputs) {
+            Ok(p) => lat.push(p.latency),
+            Err(e) => {
+                eprintln!("milc run: step {step}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    lat.sort();
+    let total: std::time::Duration = lat.iter().sum();
+    let med = lat[lat.len() / 2];
+    let unit_name = match units {
+        mil_infer::ComputeUnits::All => "all",
+        mil_infer::ComputeUnits::CpuOnly => "cpu",
+        mil_infer::ComputeUnits::CpuAndGpu => "cpu+gpu",
+        mil_infer::ComputeUnits::CpuAndNeuralEngine => "cpu+ane",
+    };
+    println!(
+        "{} steps on {unit_name}: median {:.2?}  min {:.2?}  max {:.2?}  total {:.2?}  ({} layer + {} head shards)",
+        lat.len(),
+        med,
+        lat[0],
+        lat[lat.len() - 1],
+        total,
+        sm.manifest.layer_shards.len(),
+        sm.manifest.head_shards.len(),
+    );
+    ExitCode::SUCCESS
+}
+
 #[cfg(not(target_os = "macos"))]
 fn cmd_run(_args: &[String]) -> ExitCode {
     eprintln!("milc run requires macOS");
+    ExitCode::FAILURE
+}
+
+/// `milc plan <pkg|mlmodelc> [--units all|ane|gpu|cpu] [--json]` —
+/// where Core ML's compute plan (`MLComputePlan`) puts every op of an
+/// ML Program, with a per-device summary of op count and estimated cost.
+#[cfg(target_os = "macos")]
+fn cmd_plan(args: &[String]) -> ExitCode {
+    use mil_infer::{summarize_plan, ComputeUnits, Device};
+    let mut path: Option<PathBuf> = None;
+    let mut units = ComputeUnits::All;
+    let mut json = false;
+    let mut vs_lint = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--units" => {
+                units = match args.get(i + 1).map(|s| s.as_str()) {
+                    Some("ane") => ComputeUnits::CpuAndNeuralEngine,
+                    Some("gpu") => ComputeUnits::CpuAndGpu,
+                    Some("cpu") => ComputeUnits::CpuOnly,
+                    Some("all") => ComputeUnits::All,
+                    other => {
+                        eprintln!("milc plan: --units all|ane|gpu|cpu, got {other:?}");
+                        return ExitCode::from(2);
+                    }
+                };
+                i += 2;
+            }
+            "--vs-lint" => {
+                vs_lint = true;
+                i += 1;
+            }
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            other if !other.starts_with('-') => {
+                if path.is_none() {
+                    path = Some(PathBuf::from(other));
+                }
+                i += 1;
+            }
+            other => {
+                eprintln!("milc plan: unknown flag {other}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(path) = path else {
+        eprintln!("milc plan: needs <pkg.mlpackage|model.mlmodelc>");
+        return ExitCode::from(2);
+    };
+    // .mlpackage → compile into a scratch dir that is removed afterwards
+    let scratch = std::env::temp_dir().join(format!("milc_plan_{}", std::process::id()));
+    let compiled = if path.extension().and_then(|e| e.to_str()) == Some("mlmodelc") {
+        path.clone()
+    } else {
+        match mil_compile::compile(&path, &scratch) {
+            Ok(m) => m.path,
+            Err(e) => {
+                eprintln!("milc plan: compile: {e}");
+                let _ = std::fs::remove_dir_all(&scratch);
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    let res = mil_infer::compute_plan(&compiled, units);
+    let _ = std::fs::remove_dir_all(&scratch);
+    let ops = match res {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("milc plan: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if vs_lint {
+        let spec = match std::fs::read(path.join("Data/com.apple.CoreML/model.mlmodel")) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("milc plan --vs-lint: needs an .mlpackage ({e})");
+                return ExitCode::FAILURE;
+            }
+        };
+        let Some(report) = mil_verify::lint_spec(&spec) else {
+            eprintln!("milc plan --vs-lint: spec decode failed");
+            return ExitCode::FAILURE;
+        };
+        let predicted: std::collections::HashMap<&str, mil_lint::Unit> = report
+            .verdicts
+            .iter()
+            .map(|v| (v.name.as_str(), v.unit))
+            .collect();
+        let dev_of = |u: mil_lint::Unit| match u {
+            mil_lint::Unit::Ane => Device::NeuralEngine,
+            mil_lint::Unit::Gpu | mil_lint::Unit::Unknown => Device::Gpu,
+            mil_lint::Unit::Cpu => Device::Cpu,
+        };
+        let (mut agree, mut total) = (0usize, 0usize);
+        let mut miss: std::collections::BTreeMap<(String, &str, &str), usize> =
+            std::collections::BTreeMap::new();
+        for o in &ops {
+            let (Some(actual), Some(&pu)) = (o.preferred, predicted.get(o.output.as_str())) else {
+                continue;
+            };
+            total += 1;
+            let pd = dev_of(pu);
+            if pd == actual {
+                agree += 1;
+            } else {
+                *miss
+                    .entry((o.op_type.clone(), pd.label(), actual.label()))
+                    .or_insert(0) += 1;
+            }
+        }
+        println!(
+            "lint vs plan under {units:?}: {agree}/{total} ops agree ({:.1}%)",
+            100.0 * agree as f64 / total.max(1) as f64
+        );
+        for ((op, p, a), n) in &miss {
+            println!("  {n:>5}x {op:<28} lint {p:<4} plan {a}");
+        }
+        return ExitCode::SUCCESS;
+    }
+    let sum = summarize_plan(&ops);
+    let placed: usize = sum.values().map(|v| v.0).sum();
+    let total_cost: f64 = sum.values().map(|v| v.1).sum();
+    let label = |d: Option<Device>| d.map(|d| d.label()).unwrap_or("-");
+    if json {
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        println!("{{\"units\":\"{units:?}\",\"ops\":[");
+        for (k, o) in ops.iter().enumerate() {
+            let sup: Vec<String> = o
+                .supported
+                .iter()
+                .map(|d| format!("\"{}\"", d.label()))
+                .collect();
+            println!(
+                "{{\"function\":\"{}\",\"op\":\"{}\",\"output\":\"{}\",\"preferred\":{},\"supported\":[{}],\"cost\":{}}}{}",
+                esc(&o.function),
+                esc(&o.op_type),
+                esc(&o.output),
+                o.preferred
+                    .map(|d| format!("\"{}\"", d.label()))
+                    .unwrap_or_else(|| "null".into()),
+                sup.join(","),
+                o.cost
+                    .map(|c| format!("{c:e}"))
+                    .unwrap_or_else(|| "null".into()),
+                if k + 1 < ops.len() { "," } else { "" }
+            );
+        }
+        println!("],\"summary\":{{");
+        let parts: Vec<String> = sum
+            .iter()
+            .map(|(d, (n, c))| {
+                format!(
+                    "\"{}\":{{\"ops\":{n},\"op_pct\":{:.2},\"cost_pct\":{:.2}}}",
+                    d.label(),
+                    100.0 * *n as f64 / placed.max(1) as f64,
+                    100.0 * c / total_cost.max(f64::MIN_POSITIVE)
+                )
+            })
+            .collect();
+        println!("{}}}}}", parts.join(","));
+        return ExitCode::SUCCESS;
+    }
+    println!(
+        "{:<5} {:<28} {:<6} {:<10} {}",
+        "dev", "op", "cost%", "supported", "output"
+    );
+    for o in &ops {
+        if o.preferred.is_none() {
+            continue;
+        }
+        let sup: Vec<&str> = o.supported.iter().map(|d| d.label()).collect();
+        println!(
+            "{:<5} {:<28} {:<6.2} {:<10} {}",
+            label(o.preferred),
+            o.op_type,
+            100.0 * o.cost.unwrap_or(0.0) / total_cost.max(f64::MIN_POSITIVE),
+            sup.join("+"),
+            o.output
+        );
+    }
+    println!(
+        "\nplan under {units:?}: {} ops placed ({} const/no-device ops skipped)",
+        placed,
+        ops.len() - placed
+    );
+    for (d, (n, c)) in &sum {
+        println!(
+            "  {:<4} {:>6} ops ({:>5.1}%)   est. cost {:>5.1}%",
+            d.label(),
+            n,
+            100.0 * *n as f64 / placed.max(1) as f64,
+            100.0 * c / total_cost.max(f64::MIN_POSITIVE)
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cmd_plan(_args: &[String]) -> ExitCode {
+    eprintln!("milc plan requires macOS");
     ExitCode::FAILURE
 }
 

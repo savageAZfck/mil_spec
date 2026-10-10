@@ -1,6 +1,6 @@
 [package]
 name = "milc"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.80"
 description = "CLI for the mil_spec toolchain: convert (safetensors/GGUF, LoRA, quant planner, enumerated + range shapes), onnx (ONNX + classical ML), lint, inspect, diff, compile, verify, package surgery (fuse-lora/requant/graft/reshape), attest. No Python."
@@ -14,11 +14,11 @@ mil_spec = { path = "../..", version = "0.4.1" }
 mil_passes = { path = "../mil_passes", version = "0.2.0" }
 mil_lint = { path = "../mil_lint", version = "0.2.0" }
 mil_compile = { path = "../mil_compile", version = "0.2.0" }
-mil_verify = { path = "../mil_verify", version = "0.4.0" }
-mil_infer = { path = "../mil_infer", version = "0.2.0" }
+mil_verify = { path = "../mil_verify", version = "0.5.0" }
+mil_infer = { path = "../mil_infer", version = "0.3.0" }
 mil_machines = { path = "../mil_machines", version = "0.2.0" }
 half = "2"
-mil_convert = { path = "../mil_convert", version = "0.4.0" }
+mil_convert = { path = "../mil_convert", version = "0.5.0" }
 mil_onnx = { path = "../mil_onnx", version = "0.2.0" }
 
 [[bin]]

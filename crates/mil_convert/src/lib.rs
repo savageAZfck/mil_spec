@@ -399,6 +399,9 @@ fn convert_impl(
 
     // ---- build ----
     std::fs::create_dir_all(out_pkg.parent().unwrap_or(Path::new(".")))?;
+    if opts.shard_layers > 0 {
+        return convert_sharded(cfg, src, out_pkg, opts, source_files, plan);
+    }
     let tmp_w = out_pkg.with_extension("weight.bin.tmp");
     let mut writer = BlobWriter::create(&tmp_w)?;
     let mut em = builder::WeightEmitter {
@@ -408,25 +411,55 @@ fn convert_impl(
         src,
         plan,
     };
-    let mut built = builder::build(cfg, opts, &mut em)?;
+    let built = builder::build(cfg, opts, &mut em)?;
     writer.finish()?;
+    let (op_count, weight_bytes) = seal_package(
+        cfg,
+        opts,
+        source_files,
+        built,
+        &tmp_w,
+        out_pkg,
+        &format!(
+            "{} converted by mil_convert ({} layers, d={}, seq={})",
+            cfg.model_type, cfg.num_layers, cfg.hidden_size, opts.seq
+        ),
+    )?;
 
-    // ---- optimize + emit ----
+    Ok(ConvertReport {
+        op_count,
+        weight_bytes,
+        package: out_pkg.to_path_buf(),
+        ane_pct: 0.0, // filled by callers that link mil_lint
+        tokenizer_json: None,
+        tokenizer_error: None,
+    })
+}
+
+/// Optimize + provenance + spec encode + package write for one built
+/// graph. Streams `weight.bin` from `tmp_w` into `pkg_dir` and removes
+/// the tmp file. Returns `(op_count, weight_bytes)`.
+fn seal_package(
+    cfg: &ModelConfig,
+    opts: &Options,
+    source_files: &[std::path::PathBuf],
+    mut built: builder::Built,
+    tmp_w: &Path,
+    pkg_dir: &Path,
+    desc: &str,
+) -> Result<(usize, u64)> {
     let _ = mil_passes::optimize(&mut built.block);
     // Provenance: hash the streamed weight.bin (same bytes the package
     // gets), fingerprint every source file, and embed it all in the
     // spec's userDefined metadata. Hashing the tmp file keeps this a
     // sequential read — no second full pass over the model in RAM.
-    let weight_hash = mil_spec::sha256::sha256_file(&tmp_w)
+    let weight_hash = mil_spec::sha256::sha256_file(tmp_w)
         .map_err(|e| ConvertError::Config(format!("provenance: {e}")))?;
     let prov = attest::provenance_map(cfg, opts, source_files, &weight_hash)
         .map_err(|e| ConvertError::Config(format!("provenance: {e}")))?;
     let mut meta = ModelMeta::new(opts.spec_version, &opts.opset)
         .creator("mil_convert")
-        .description(&format!(
-            "{} converted by mil_convert ({} layers, d={}, seq={})",
-            cfg.model_type, cfg.num_layers, cfg.hidden_size, opts.seq
-        ));
+        .description(desc);
     for (k, v) in prov {
         meta = meta.user_meta(&k, &v);
     }
@@ -444,17 +477,149 @@ fn convert_impl(
         )
     })
     .map_err(ConvertError::Config)?;
-    write_mlpackage_stream(out_pkg, &spec, Some(&tmp_w))?;
-    let weight_bytes = std::fs::metadata(tmp_w.clone())
-        .map(|m| m.len())
-        .unwrap_or(0);
-    let _ = std::fs::remove_file(&tmp_w);
+    write_mlpackage_stream(pkg_dir, &spec, Some(tmp_w))?;
+    let weight_bytes = std::fs::metadata(tmp_w).map(|m| m.len()).unwrap_or(0);
+    let _ = std::fs::remove_file(tmp_w);
+    Ok((built.block.ops.len(), weight_bytes))
+}
+
+/// Convert into a `.milshards` bundle (`Options::shard_layers > 0`):
+/// `out_dir/layer_AA-BB.mlpackage` per layer group, `head_vLO-HI.mlpackage`
+/// per vocab slice, and `manifest.json` tying them together. Every
+/// member package carries full provenance, so `milc attest` works on
+/// each. `out_dir` is created (and must not already contain shard
+/// packages — stale members would corrupt the bundle).
+fn convert_sharded(
+    cfg: &ModelConfig,
+    src: &dyn WeightSource,
+    out_dir: &Path,
+    opts: &Options,
+    source_files: &[std::path::PathBuf],
+    plan: &plan::Plan,
+) -> Result<ConvertReport> {
+    if opts.seq_lens.len() > 1 || opts.seq_range.is_some() {
+        return Err(ConvertError::Config(
+            "--shard with --seq-lens/--seq-range is not supported yet — fixed --seq only".into(),
+        ));
+    }
+    std::fs::create_dir_all(out_dir)?;
+    let mut op_count = 0usize;
+    let mut weight_bytes = 0u64;
+    let mut layer_members = Vec::new();
+    let mut head_members = Vec::new();
+
+    let lps = opts.shard_layers.max(1);
+    let mut ls = 0usize;
+    while ls < cfg.num_layers {
+        let le = (ls + lps).min(cfg.num_layers);
+        let stem = format!("layer_{ls:02}-{le:02}");
+        let pkg = out_dir.join(format!("{stem}.mlpackage"));
+        let tmp_w = out_dir.join(format!("{stem}.weight.bin.tmp"));
+        let mut writer = BlobWriter::create(&tmp_w)?;
+        let mut em = builder::WeightEmitter {
+            w: &mut writer,
+            quant: opts.quant,
+            file: "@model_path/weights/weight.bin".into(),
+            src,
+            plan,
+        };
+        let built = builder::build_range(cfg, opts, &mut em, ls, le, false)?;
+        writer.finish()?;
+        let (ops, wb) = seal_package(
+            cfg,
+            opts,
+            source_files,
+            built,
+            &tmp_w,
+            &pkg,
+            &format!(
+                "{} layer shard {ls}..{le} by mil_convert (d={}, seq={})",
+                cfg.model_type, cfg.hidden_size, opts.seq
+            ),
+        )?;
+        op_count += ops;
+        weight_bytes += wb;
+        layer_members.push(serde_json::json!({
+            "file": format!("{stem}.mlpackage"),
+            "layers": [ls, le],
+        }));
+        ls = le;
+    }
+
+    if opts.lm_head {
+        let n = (opts.head_shards.max(1) as i64).min(cfg.vocab_size);
+        for i in 0..n {
+            let lo = cfg.vocab_size * i / n;
+            let hi = cfg.vocab_size * (i + 1) / n;
+            let stem = format!("head_v{lo}-{hi}");
+            let pkg = out_dir.join(format!("{stem}.mlpackage"));
+            let tmp_w = out_dir.join(format!("{stem}.weight.bin.tmp"));
+            let mut writer = BlobWriter::create(&tmp_w)?;
+            let mut em = builder::WeightEmitter {
+                w: &mut writer,
+                quant: opts.quant,
+                file: "@model_path/weights/weight.bin".into(),
+                src,
+                plan,
+            };
+            let built = builder::build_head(cfg, opts, &mut em, lo, hi)?;
+            writer.finish()?;
+            let (ops, wb) = seal_package(
+                cfg,
+                opts,
+                source_files,
+                built,
+                &tmp_w,
+                &pkg,
+                &format!(
+                    "{} head shard v{lo}..{hi} by mil_convert (d={}, seq={})",
+                    cfg.model_type, cfg.hidden_size, opts.seq
+                ),
+            )?;
+            op_count += ops;
+            weight_bytes += wb;
+            head_members.push(serde_json::json!({
+                "file": format!("{stem}.mlpackage"),
+                "rows": [lo, hi],
+            }));
+        }
+    }
+
+    let manifest = serde_json::json!({
+        "kind": "milshards",
+        "version": 1,
+        "model_type": cfg.model_type,
+        "hidden_size": cfg.hidden_size,
+        "num_layers": cfg.num_layers,
+        "num_heads": cfg.num_heads,
+        "num_kv_heads": cfg.num_kv_heads,
+        "head_dim": cfg.head_dim,
+        "intermediate_size": cfg.intermediate_size,
+        "vocab_size": cfg.vocab_size,
+        "rms_norm_eps": cfg.rms_norm_eps,
+        "rope_theta": cfg.rope_theta,
+        "tie_word_embeddings": cfg.tie_word_embeddings,
+        "qk_norm": cfg.qk_norm,
+        "seq": opts.seq,
+        "max_kv": opts.max_kv,
+        "quant": match opts.quant {
+            builder::Quant::Fp16 => "fp16",
+            builder::Quant::Int8 => "int8",
+        },
+        "embed": opts.embed,
+        "layer_shards": layer_members,
+        "head_shards": head_members,
+    });
+    std::fs::write(
+        out_dir.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )?;
 
     Ok(ConvertReport {
-        op_count: built.block.ops.len(),
+        op_count,
         weight_bytes,
-        package: out_pkg.to_path_buf(),
-        ane_pct: 0.0, // filled by callers that link mil_lint
+        package: out_dir.to_path_buf(),
+        ane_pct: 0.0,
         tokenizer_json: None,
         tokenizer_error: None,
     })
