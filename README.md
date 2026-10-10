@@ -84,7 +84,7 @@ See `examples/compile_ir.rs` for a stateful KV-cache program.
 
 | Crate | Job |
 |---|---|
-| **`mil_convert`** | safetensors → `.mlpackage`. Streams HF checkpoints into fat single-graph decoders: packed-KV state (`slice_update` at runtime `pos`), GQA attention, per-channel int8 or fp16 conv weights. Config-driven — Qwen2/Qwen3/Llama-class today. |
+| **`mil_convert`** | safetensors *and* GGUF → `.mlpackage`. Streams HF checkpoints or llama.cpp files (all ggml quant types, split shards, Q/K un-permute, embedded tokenizer export to `tokenizer.json`) into fat single-graph decoders: packed-KV state (`slice_update` at runtime `pos`), GQA attention, per-channel int8 or fp16 conv weights. Config-driven — Qwen2/Qwen3/Llama-class today. |
 | **`mil_passes`** | Optimizer over `Block`: const dedup (the helpers emit ~5 identical consts per conv — this is the big spec shrinker), constant folding, no-op elimination, dead code, fixpoint. Deterministic, reports every change. |
 | **`mil_lint`** | The differentiator — static **ANE-placement analysis**. Predicts per-op execution unit (ANE/GPU/CPU) with a stated rule *before* you compile, flags CPU islands and fp32 regions, and estimates dispatch count — the number that decides whether a graph lives or dies on the ANE. coremltools can't do this at all. |
 | **`mil_compile`** | `.mlpackage` → `.mlmodelc`. Two backends: in-process `MLModel compileModelAtURL:` via the Objective-C runtime (no `xcrun`, no subprocess), and an `xcrun coremlc` driver with structured errors and `.mlmodelc` discovery. |
@@ -94,6 +94,8 @@ See `examples/compile_ir.rs` for a stateful KV-cache program.
 ```bash
 cargo build --release -p milc
 milc convert Qwen3-0.6B -o drafter.mlpackage --seq 1 --max-kv 2048
+milc convert model.gguf -o drafter.mlpackage   # GGUF auto-detected by magic
+milc gguf model.gguf --tokenizer tok.json     # inspect + tokenizer export
 milc lint drafter.mlpackage     # per-op ANE/GPU/CPU + dispatch estimate
 milc compile drafter.mlpackage  # via CoreML.framework, in-process
 milc verify                     # conformance battery

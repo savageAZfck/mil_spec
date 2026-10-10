@@ -137,10 +137,12 @@ pub enum DType {
     Bool,
     Fp16,
     Fp32,
+    Int4,
     Int8,
     Int32,
     Int64,
     Str,
+    Uint4,
 }
 
 impl DType {
@@ -150,9 +152,11 @@ impl DType {
             DType::Str => 2,
             DType::Fp16 => 10,
             DType::Fp32 => 11,
+            DType::Int4 => 25,
             DType::Int8 => 21,
             DType::Int32 => 23,
             DType::Int64 => 24,
+            DType::Uint4 => 35,
         }
     }
     // ArrayFeatureType::ArrayDataType enum
@@ -169,8 +173,10 @@ impl DType {
         match self {
             DType::Fp16 => 1,
             DType::Fp32 => 2,
+            DType::Int4 => 8,
             DType::Int8 => 4,
             DType::Int32 => 14,
+            DType::Uint4 => 11,
             _ => 1,
         }
     }
@@ -332,6 +338,16 @@ impl Value {
     /// `fp16` scalar const.
     pub fn f16_scalar(v: f32) -> Self {
         Self::f16s(&[], &[v])
+    }
+    /// `fp32` scalar const.
+    pub fn f32_scalar(v: f32) -> Self {
+        Value::Imm(
+            ValueType::Tensor(TensorType {
+                dtype: DType::Fp32,
+                shape: vec![],
+            }),
+            Immediate::Floats(vec![v]),
+        )
     }
     /// `str` scalar const (rank-0 string tensor).
     pub fn string(s: &str) -> Self {
@@ -631,6 +647,18 @@ impl Block {
         .clone()
     }
 
+    /// `const` with an `fp32` scalar value.
+    pub fn konst_f32(&mut self, name: &str, v: f32) -> String {
+        let vt = self.tt(DType::Fp32, &[]);
+        self.op(
+            "const",
+            vec![],
+            vec![(name, vt)],
+            vec![("val".into(), Value::f32_scalar(v))],
+        )[0]
+        .clone()
+    }
+
     /// `const` with a `bool` scalar value.
     pub fn konst_bool(&mut self, name: &str, v: bool) -> String {
         let vt = self.tt(DType::Bool, &[]);
@@ -714,6 +742,41 @@ impl Block {
         )
     }
 
+    /// 4-bit palettized weight with a 16-entry fp16 LUT per output channel:
+    /// `name = constexpr_lut_to_dense(indices=uint4, lut=fp16)`.
+    /// ANE-supported sub-byte route — `constexpr_blockwise_shift_scale` on
+    /// int4 fails plan-build -14. Indices are packed two nibbles per byte;
+    /// the LUT blob holds `shape[0] * 16` fp16 values — for channel c,
+    /// entry i is the dequantized weight for index i.
+    pub fn konst_q4(
+        &mut self,
+        name: &str,
+        file: &str,
+        data_off: u64,
+        lut_off: u64,
+        shape: &[i64],
+    ) -> String {
+        let mut lut_shape: Vec<i64> = vec![shape[0]];
+        lut_shape.extend(std::iter::repeat(1).take(shape.len() - 1));
+        lut_shape.push(16);
+        lut_shape.push(1);
+        let q = self.konst_blob(&format!("{name}_q4"), file, data_off, DType::Uint4, shape);
+        let s = self.konst_blob(
+            &format!("{name}_lut"),
+            file,
+            lut_off,
+            DType::Fp16,
+            &lut_shape,
+        );
+        let vt = self.tt(DType::Fp16, shape);
+        self.o1(
+            "constexpr_lut_to_dense",
+            vec![("indices".into(), bind(&q).1), ("lut".into(), bind(&s).1)],
+            name,
+            vt,
+        )
+    }
+
     /// `mul` elementwise (fp16 output).
     pub fn mul(&mut self, a: &str, b: &str, shape: &[i64], name: &str) -> String {
         let vt = self.tt(DType::Fp16, shape);
@@ -789,6 +852,51 @@ impl Block {
             inputs.push(("bias".into(), bind(bi).1));
         }
         let vt = self.tt(DType::Fp16, &[1, cout, 1, 1]);
+        self.o1("conv", inputs, name, vt)
+    }
+
+    /// `conv1x1` over a sequence: x is `(1, cin, s, 1)` → out `(1, cout, s, 1)`.
+    pub fn conv1x1_s(
+        &mut self,
+        x: &str,
+        w: &str,
+        bias: Option<&str>,
+        cout: i64,
+        s: i64,
+        name: &str,
+    ) -> String {
+        let strides = self.fresh("stride");
+        let strides = self.konst_i32(&strides, &[1, 1]);
+        let pad_type = self.fresh("padtype");
+        let pad_type = {
+            let vt = self.tt(DType::Str, &[]);
+            self.op(
+                "const",
+                vec![],
+                vec![(&pad_type, vt)],
+                vec![("val".into(), Value::Str("valid".into()))],
+            )[0]
+            .clone()
+        };
+        let pads = self.fresh("pad");
+        let pads = self.konst_i32(&pads, &[0, 0, 0, 0]);
+        let dil = self.fresh("dil");
+        let dil = self.konst_i32(&dil, &[1, 1]);
+        let grp = self.fresh("grp");
+        let grp = self.konst_scalar_i32(&grp, 1);
+        let mut inputs = vec![
+            ("x".into(), bind(x).1),
+            ("weight".into(), bind(w).1),
+            ("strides".into(), bind(&strides).1),
+            ("pad_type".into(), bind(&pad_type).1),
+            ("pad".into(), bind(&pads).1),
+            ("dilations".into(), bind(&dil).1),
+            ("groups".into(), bind(&grp).1),
+        ];
+        if let Some(bi) = bias {
+            inputs.push(("bias".into(), bind(bi).1));
+        }
+        let vt = self.tt(DType::Fp16, &[1, cout, s, 1]);
         self.o1("conv", inputs, name, vt)
     }
 
@@ -988,33 +1096,76 @@ impl Block {
         )
     }
 
-    /// RMSNorm (safe-norm peephole):
-    /// `x_scaled = x / sqrt(d); var = mean(x_scaled^2, axis=-3 keepdims);`
-    /// `out = x_scaled * rsqrt(var + eps/d) * w`
+    /// RMSNorm (fp16-safe):
+    /// `m = max(|x|) (floored); xs = x/m;`
+    /// `out = xs * rsqrt(mean(xs^2, axis=-3 keepdims) + eps/m^2) * w`
+    ///     `= x * rsqrt(mean(x^2) + eps) * w`
     ///
     /// `w` is a bound const name of shape `(d,1,1)`; `x` is `(1,d,1,1)` or
-    /// `(n,d,1,1)`. The prescaling keeps `x^2` inside fp16 range — plain
-    /// `mean(x^2)` overflows on large activations.
+    /// `(n,d,1,1)`. The dynamic max-abs prescale keeps `xs^2 <= 1` — plain
+    /// `mean(x^2)` overflows fp16 on large activations, and a fixed
+    /// downscale underflows `x^2` to zero on small ones (embedding-scale
+    /// inputs), which is worse: `rsqrt(0)` gives inf. `eps/m^2` is formed
+    /// as `(sqrt(eps)/m)^2` since eps itself is an fp16 denormal.
     pub fn rms_norm(
         &mut self,
         x: &str,
         w: &str,
-        d: i64,
+        _d: i64,
         eps: f32,
         shape4: &[i64],
         pfx: &str,
     ) -> String {
-        let k = (d as f32).sqrt();
-        let inv_k = self.konst_f16(&format!("{pfx}_invk"), 1.0 / k);
-        let xs = self.mul(x, &inv_k, shape4, &format!("{pfx}_xs"));
-        let sq = self.mul(&xs, &xs, shape4, &format!("{pfx}_sq"));
-        // mean over channel axis (dim=1 for 4D conv layout; dim=-3 general)
+        const M_FLOOR: f32 = 3.90625e-3; // 2^-8
+        let absx = {
+            let vt = self.tt(DType::Fp16, shape4);
+            self.o1(
+                "abs",
+                vec![("x".into(), bind(x).1)],
+                &format!("{pfx}_abs"),
+                vt,
+            )
+        };
+        // mean/max over channel axis (dim=1 for 4D conv layout; dim=-3 general)
         let axes = self.fresh("axes");
         let axes = self.konst_i32(&axes, &[1]);
         let kd = self.fresh("kd");
         let kd = self.konst_bool(&kd, true);
         let mut mshape = shape4.to_vec();
         mshape[1] = 1;
+        let m = {
+            let vt = self.tt(DType::Fp16, &mshape);
+            self.o1(
+                "reduce_max",
+                vec![
+                    ("x".into(), bind(&absx).1),
+                    ("axes".into(), bind(&axes).1),
+                    ("keep_dims".into(), bind(&kd).1),
+                ],
+                &format!("{pfx}_m"),
+                vt,
+            )
+        };
+        let fl = self.konst_f16(&format!("{pfx}_fl"), M_FLOOR);
+        let mc = {
+            let vt = self.tt(DType::Fp16, &mshape);
+            self.o1(
+                "maximum",
+                vec![("x".into(), bind(&m).1), ("y".into(), bind(&fl).1)],
+                &format!("{pfx}_mc"),
+                vt,
+            )
+        };
+        let xs = {
+            let vt = self.tt(DType::Fp16, shape4);
+            self.o1(
+                "real_div",
+                vec![("x".into(), bind(x).1), ("y".into(), bind(&mc).1)],
+                &format!("{pfx}_xs"),
+                vt,
+            )
+        };
+        let sq = self.mul(&xs, &xs, shape4, &format!("{pfx}_sq"));
         let mean = {
             let vt = self.tt(DType::Fp16, &mshape);
             self.o1(
@@ -1028,8 +1179,18 @@ impl Block {
                 vt,
             )
         };
-        let eps2 = self.konst_f16(&format!("{pfx}_eps"), eps / (k * k));
-        let vp = self.add(&mean, &eps2, &mshape, &format!("{pfx}_var"));
+        let esq = self.konst_f16(&format!("{pfx}_esq"), eps.sqrt());
+        let t = {
+            let vt = self.tt(DType::Fp16, &mshape);
+            self.o1(
+                "real_div",
+                vec![("x".into(), bind(&esq).1), ("y".into(), bind(&mc).1)],
+                &format!("{pfx}_t"),
+                vt,
+            )
+        };
+        let e2 = self.mul(&t, &t, &mshape, &format!("{pfx}_e2"));
+        let vp = self.add(&mean, &e2, &mshape, &format!("{pfx}_var"));
         let eps_c = self.konst_f16(&format!("{pfx}_rse"), 0.0);
         let r = {
             let vt = self.tt(DType::Fp16, &mshape);

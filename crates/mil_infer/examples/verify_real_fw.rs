@@ -26,11 +26,7 @@ fn main() {
     .collect();
     let ac = Automaton::build(&pats);
 
-    let model = Model::load(
-        artifact,
-        ComputeUnits::CpuAndNeuralEngine,
-    )
-    .unwrap();
+    let model = Model::load(artifact, ComputeUnits::CpuAndNeuralEngine).unwrap();
     let state = model.new_state().unwrap();
 
     let stream = "ok SK-LIVE-12345 -----BEGIN RSA and ssh-rsa AAAA safe".to_lowercase();

@@ -1,6 +1,6 @@
 [package]
 name = "mil_verify"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Spec inspection, deterministic protobuf diff, and a conformance battery for MIL graphs — with planted controls."
@@ -14,8 +14,8 @@ mil_spec = { path = "../..", version = "0.3.0" }
 mil_compile = { path = "../mil_compile", version = "0.1.0" }
 mil_passes = { path = "../mil_passes", version = "0.1.0" }
 mil_lint = { path = "../mil_lint", version = "0.1.0" }
+mil_convert = { path = "../mil_convert", version = "0.2.0" }
+half = "2"
 
 [dev-dependencies]
-mil_convert = { path = "../mil_convert", version = "0.1.0" }
-mil_infer = { path = "../mil_infer", version = "0.1.0" }
-half = "2"
+mil_infer = { path = "../mil_infer", version = "0.1.1" }

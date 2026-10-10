@@ -25,6 +25,7 @@ fn main() -> ExitCode {
     }
     match args[0].as_str() {
         "convert" => cmd_convert(&args[1..]),
+        "gguf" => cmd_gguf(&args[1..]),
         "lint" => cmd_lint(&args[1..]),
         "inspect" => cmd_inspect(&args[1..]),
         "diff" => cmd_diff(&args[1..]),
@@ -54,7 +55,8 @@ fn usage() {
         "milc — the mil_spec toolchain\n\
          \n\
          usage:\n\
-         \x20 milc convert <model_dir> -o <pkg.mlpackage> [--seq N] [--max-kv N] [--fp16]\n\
+         \x20 milc convert <model_dir|model.gguf> -o <pkg.mlpackage> [--seq N] [--max-kv N] [--fp16]\n\
+         \x20 milc gguf    <file.gguf> [--json] [--tokenizer <out.json>]   # header, metadata, tensor table\n\
          \x20 milc lint    <pkg.mlpackage|file.mlmodel>\n\
          \x20 milc inspect <pkg.mlpackage|file.mlmodel>\n\
          \x20 milc diff    <a.mlmodel|pkg> <b.mlmodel|pkg>\n\
@@ -131,11 +133,24 @@ fn cmd_convert(args: &[String]) -> ExitCode {
     let (model_dir, out) = match (model_dir, out) {
         (Some(m), Some(o)) => (m, o),
         _ => {
-            eprintln!("milc convert: needs <model_dir> and -o <pkg>");
+            eprintln!("milc convert: needs <model_dir|model.gguf> and -o <pkg>");
             return ExitCode::from(2);
         }
     };
-    match mil_convert::convert(&model_dir, &out, &opts) {
+    // GGUF input auto-detects by magic bytes (file, not directory)
+    let is_gguf = model_dir.is_file()
+        && std::fs::File::open(&model_dir)
+            .and_then(|mut f| {
+                let mut m = [0u8; 4];
+                std::io::Read::read_exact(&mut f, &mut m).map(|_| m == *b"GGUF")
+            })
+            .unwrap_or(false);
+    let res = if is_gguf {
+        mil_convert::convert_gguf(&model_dir, &out, &opts)
+    } else {
+        mil_convert::convert(&model_dir, &out, &opts)
+    };
+    match res {
         Ok(r) => {
             println!("wrote {}", r.package.display());
             println!("{} ops, {} weight bytes", r.op_count, r.weight_bytes);
@@ -146,6 +161,191 @@ fn cmd_convert(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `milc gguf <file> [--json] [--tokenizer <out.json>]` — header,
+/// metadata, tensor table, optional tokenizer export.
+fn cmd_gguf(args: &[String]) -> ExitCode {
+    let mut path: Option<PathBuf> = None;
+    let mut json = false;
+    let mut tok_out: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            "--tokenizer" => {
+                tok_out = args.get(i + 1).map(PathBuf::from);
+                i += 2;
+            }
+            other if !other.starts_with('-') => {
+                if path.is_none() {
+                    path = Some(PathBuf::from(other));
+                }
+                i += 1;
+            }
+            other => {
+                eprintln!("milc gguf: unknown flag {other}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(path) = path else {
+        eprintln!("milc gguf: needs <file.gguf>");
+        return ExitCode::from(2);
+    };
+    let g = match mil_convert::Gguf::open(&path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(out) = tok_out {
+        match mil_convert::gguf::tokenizer::to_tokenizer_json(&g) {
+            Ok(j) => {
+                if let Err(e) = std::fs::write(&out, j) {
+                    eprintln!("{}: {e}", out.display());
+                    return ExitCode::FAILURE;
+                }
+                println!("wrote {}", out.display());
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    if json {
+        print_gguf_json(&g);
+    } else {
+        print_gguf(&g);
+    }
+    ExitCode::SUCCESS
+}
+
+fn fmt_value(v: &mil_convert::gguf::Value) -> String {
+    use mil_convert::gguf::Value;
+    match v {
+        Value::Arr(_, vals) => {
+            let head: Vec<String> = vals.iter().take(4).map(fmt_value).collect();
+            format!(
+                "array[{}]{}",
+                vals.len(),
+                if vals.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " ({}{})",
+                        head.join(", "),
+                        if vals.len() > 4 { ", …" } else { "" }
+                    )
+                }
+            )
+        }
+        Value::Str(s) => {
+            if s.chars().count() > 72 {
+                format!("\"{}…\"", s.chars().take(72).collect::<String>())
+            } else {
+                format!("\"{s}\"")
+            }
+        }
+        other => format!("{other:?}"),
+    }
+}
+
+fn print_gguf(g: &mil_convert::Gguf) {
+    println!("version:   {}", g.version);
+    println!("alignment: {}", g.alignment);
+    if let Some(a) = &g.arch {
+        println!("arch:      {a}");
+    }
+    println!("shards:    {}", g.paths().len());
+    println!("metadata ({}):", g.metadata().len());
+    for (k, v) in g.metadata() {
+        println!("  {k:<48} {}", fmt_value(v));
+    }
+    let tensors: Vec<_> = g.tensors().collect();
+    println!("tensors ({}):", tensors.len());
+    println!(
+        "  {:<52} {:<10} {:<20} {:>12}",
+        "name", "type", "shape", "bytes"
+    );
+    for t in tensors {
+        let shape = t
+            .hf_shape()
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join("×");
+        let name = match mil_convert::gguf::names::ggml_to_hf(&t.name) {
+            Some(hf) => format!("{} ({})", t.name, hf),
+            None => t.name.clone(),
+        };
+        println!(
+            "  {:<52} {:<10} {:<20} {:>12}",
+            name, t.gguf_type, shape, t.nbytes
+        );
+    }
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn print_gguf_json(g: &mil_convert::Gguf) {
+    let mut s = String::from("{\n");
+    s.push_str(&format!("  \"version\": {},\n", g.version));
+    s.push_str(&format!("  \"alignment\": {},\n", g.alignment));
+    if let Some(a) = &g.arch {
+        s.push_str(&format!("  \"architecture\": \"{}\",\n", json_escape(a)));
+    }
+    s.push_str("  \"metadata\": {");
+    let mut first = true;
+    for (k, v) in g.metadata() {
+        if !first {
+            s.push(',');
+        }
+        first = false;
+        s.push_str(&format!(
+            "\n    \"{}\": \"{}\"",
+            json_escape(k),
+            json_escape(&fmt_value(v))
+        ));
+    }
+    s.push_str("\n  },\n  \"tensors\": [");
+    let mut first = true;
+    for t in g.tensors() {
+        if !first {
+            s.push(',');
+        }
+        first = false;
+        s.push_str(&format!(
+            "\n    {{\"name\": \"{}\", \"type\": \"{}\", \"shape\": [{}], \"bytes\": {}}}",
+            json_escape(&t.name),
+            t.gguf_type,
+            t.hf_shape()
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            t.nbytes
+        ));
+    }
+    s.push_str("\n  ]\n}\n");
+    print!("{s}");
 }
 
 fn cmd_lint(args: &[String]) -> ExitCode {

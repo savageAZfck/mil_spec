@@ -128,6 +128,7 @@ mod imp {
     use super::*;
     use std::ffi::CString;
     use std::os::raw::{c_char, c_void};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     type Id = *mut c_void;
     type Sel = *mut c_void;
@@ -193,10 +194,134 @@ mod imp {
             std::mem::transmute(objc_msgSend as *const () as usize);
         f(r, s)
     }
+    unsafe fn msg1_usize(r: Id, s: Sel, a: usize) -> Id {
+        let f: unsafe extern "C" fn(Id, Sel, usize) -> Id =
+            std::mem::transmute(objc_msgSend as *const () as usize);
+        f(r, s, a)
+    }
     unsafe fn msg0_ptr(r: Id, s: Sel) -> *mut u8 {
         let f: unsafe extern "C" fn(Id, Sel) -> *mut u8 =
             std::mem::transmute(objc_msgSend as *const () as usize);
         f(r, s)
+    }
+
+    /// Minimal Objective-C block literal — a `_NSConcreteGlobalBlock`
+    /// (no captures, static storage, invoked synchronously by
+    /// `-[MLState getMultiArrayForStateNamed:handler:]`).
+    #[repr(C)]
+    struct StateBlock {
+        isa: *const c_void,
+        flags: i32,
+        reserved: i32,
+        invoke: unsafe extern "C" fn(*const StateBlock, Id),
+        descriptor: *const StateBlockDesc,
+    }
+    #[repr(C)]
+    struct StateBlockDesc {
+        reserved: u64,
+        size: u64,
+    }
+    // Both are read-only statics — the pointers point at other statics.
+    unsafe impl Sync for StateBlock {}
+    unsafe impl Sync for StateBlockDesc {}
+
+    extern "C" {
+        /// libSystem's global-block class (always linked).
+        static _NSConcreteGlobalBlock: c_void;
+    }
+
+    static STATE_BLOCK_DESC: StateBlockDesc = StateBlockDesc {
+        reserved: 0,
+        size: std::mem::size_of::<StateBlock>() as u64,
+    };
+
+    /// `BLOCK_IS_GLOBAL` — see `<Block_private.h>`.
+    const BLOCK_IS_GLOBAL: i32 = 1 << 28;
+
+    static ZERO_STATE_BLOCK: StateBlock = StateBlock {
+        isa: unsafe { &_NSConcreteGlobalBlock } as *const c_void as *const c_void,
+        flags: BLOCK_IS_GLOBAL,
+        reserved: 0,
+        invoke: zero_multiarray,
+        descriptor: &STATE_BLOCK_DESC,
+    };
+
+    /// `MLMultiArrayDataType` code → element size in bytes.
+    /// Values from `<CoreML/MLMultiArray.h>` (0x10000|bits floats,
+    /// 0x20000|bits ints). Unknown codes return `None` — callers must
+    /// never guess an element size.
+    pub(crate) fn ml_dtype_size(code: i64) -> Option<usize> {
+        match code {
+            65552 => Some(2),  // Float16 = 0x10000 | 16
+            65568 => Some(4),  // Float32/Float = 0x10000 | 32
+            65600 => Some(8),  // Double/Float64 = 0x10000 | 64
+            131104 => Some(4), // Int32 = 0x20000 | 32
+            131080 => Some(1), // Int8 = 0x20000 | 8
+            _ => None,
+        }
+    }
+
+    /// State buffers skipped by `zero_state` due to unrecognised
+    /// dtype/layout — recorded so the skip is visible, never guessed.
+    static ZERO_STATE_SKIPPED: AtomicUsize = AtomicUsize::new(0);
+
+    /// `array` is an NSArray<NSNumber>; element `i` as i64.
+    unsafe fn nsnum_at(arr: Id, i: usize) -> Option<i64> {
+        let n = unsafe { msg1_usize(arr, sel("objectAtIndex:"), i) };
+        if n.is_null() {
+            None
+        } else {
+            Some(unsafe { msg0_i64(n, sel("integerValue")) })
+        }
+    }
+
+    /// Block body: memset the handed MLMultiArray's data to zero.
+    /// Byte extent = (Σ (shapeᵢ−1)·strideᵢ + 1)·esz — the span the view
+    /// actually addresses, which equals `count·esz` only for contiguous
+    /// arrays. Unknown dtype, missing shape/strides, or a negative
+    /// stride → skip and record; never guess an element size.
+    unsafe extern "C" fn zero_multiarray(_blk: *const StateBlock, array: Id) {
+        if array.is_null() {
+            return;
+        }
+        let ptr = unsafe { msg0_ptr(array, sel("dataPointer")) };
+        if ptr.is_null() {
+            return;
+        }
+        let dt = unsafe { msg0_i64(array, sel("dataType")) };
+        let Some(esz) = ml_dtype_size(dt) else {
+            ZERO_STATE_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let shape = unsafe { msg0(array, sel("shape")) };
+        let strides = unsafe { msg0(array, sel("strides")) };
+        if shape.is_null() || strides.is_null() {
+            ZERO_STATE_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let nd = unsafe { msg0_usize(shape, sel("count")) };
+        // span in elements covered by the view, starting at dataPointer
+        let mut span: i64 = 1;
+        let mut ok = true;
+        for i in 0..nd {
+            let (Some(d), Some(st)) = (unsafe { nsnum_at(shape, i) }, unsafe {
+                nsnum_at(strides, i)
+            }) else {
+                ok = false;
+                break;
+            };
+            if d < 0 || st < 0 {
+                ok = false;
+                break;
+            }
+            span = span.saturating_add(d.saturating_sub(1).saturating_mul(st));
+        }
+        if !ok || span < 0 {
+            ZERO_STATE_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let bytes = (span as usize).saturating_mul(esz);
+        unsafe { std::ptr::write_bytes(ptr, 0, bytes) };
     }
 
     fn ns_string(s: &str) -> Result<Id> {
@@ -332,7 +457,10 @@ mod imp {
         }
 
         /// Fresh `MLState` — one per sequence if you don't want cross-call
-        /// KV bleed.
+        /// KV bleed. Buffers are zeroed: CoreML does not guarantee
+        /// initialized state, and uninitialized garbage (observed to
+        /// contain Inf) poisons masked attention — `prob(0) * Inf = NaN`
+        /// leaks through the v-matmul into live positions.
         pub fn new_state(&self) -> Result<State> {
             let responds: bool = unsafe {
                 let f: unsafe extern "C" fn(Id, Sel, Sel) -> bool =
@@ -347,10 +475,48 @@ mod imp {
             }
             let s = unsafe { msg0(self.model, sel("newState")) };
             if s.is_null() {
-                err("predict", "newState returned nil")
-            } else {
-                unsafe { msg0(s, sel("retain")) };
-                Ok(State { state: s })
+                return err("predict", "newState returned nil");
+            }
+            unsafe { msg0(s, sel("retain")) };
+            self.zero_state(s);
+            Ok(State { state: s })
+        }
+
+        /// memset every declared state buffer to zero.
+        fn zero_state(&self, state: Id) {
+            let before = ZERO_STATE_SKIPPED.load(Ordering::Relaxed);
+            let desc = unsafe { msg0(self.model, sel("modelDescription")) };
+            if desc.is_null() {
+                return;
+            }
+            let dict = unsafe { msg0(desc, sel("stateDescriptionsByName")) };
+            if dict.is_null() {
+                return;
+            }
+            let keys = unsafe { msg0(dict, sel("allKeys")) };
+            if keys.is_null() {
+                return;
+            }
+            let n = unsafe { msg0_usize(keys, sel("count")) };
+            for i in 0..n {
+                let name = unsafe { msg1_usize(keys, sel("objectAtIndex:"), i) };
+                if name.is_null() {
+                    continue;
+                }
+                unsafe {
+                    msg2(
+                        state,
+                        sel("getMultiArrayForStateNamed:handler:"),
+                        name,
+                        &ZERO_STATE_BLOCK as *const StateBlock as Id,
+                    )
+                };
+            }
+            let skipped = ZERO_STATE_SKIPPED.load(Ordering::Relaxed) - before;
+            if skipped > 0 {
+                eprintln!(
+                    "mil_infer: {skipped} state buffer(s) left unzeroed — unrecognised dtype/layout"
+                );
             }
         }
 
@@ -505,13 +671,12 @@ mod imp {
                     let num = unsafe { msg1_i64(shp, sel("objectAtIndex:"), d as i64) };
                     shape.push(unsafe { msg0_i64(num, sel("longLongValue")) });
                 }
-                // element size from the array's own dataType
+                // element size from the array's own dataType — same
+                // exact-code table as zero_multiarray; an unknown dtype
+                // is skipped, never guessed (a wrong size over-reads).
                 let dt = unsafe { msg0_i64(ma, sel("dataType")) };
-                let el = match dt {
-                    65552 => 2,          // fp16
-                    65568 | 131104 => 4, // fp32 / int32
-                    131136 | 65601 => 8, // int64 / fp64
-                    _ => 2,
+                let Some(el) = ml_dtype_size(dt) else {
+                    continue;
                 };
                 let ptr = unsafe { msg0_ptr(ma, sel("dataPointer")) };
                 let bytes = n_el * el;
@@ -566,6 +731,24 @@ mod tests {
     use super::*;
     use half::f16;
     use mil_spec::{Block, TensorType, ValueType};
+
+    /// `ml_dtype_size` covers every `MLMultiArrayDataType` in the SDK
+    /// enum and returns `None` for anything else — zeroing must never
+    /// guess an element size (a wrong guess overruns the buffer).
+    #[test]
+    fn dtype_size_map_matches_sdk() {
+        assert_eq!(imp::ml_dtype_size(65552), Some(2)); // Float16
+        assert_eq!(imp::ml_dtype_size(65568), Some(4)); // Float32/Float
+        assert_eq!(imp::ml_dtype_size(65600), Some(8)); // Double/Float64
+        assert_eq!(imp::ml_dtype_size(131104), Some(4)); // Int32
+        assert_eq!(imp::ml_dtype_size(131080), Some(1)); // Int8
+                                                         // codes the previous table got wrong / made up
+        assert_eq!(imp::ml_dtype_size(65584), None);
+        assert_eq!(imp::ml_dtype_size(131072), None);
+        assert_eq!(imp::ml_dtype_size(65792), None);
+        assert_eq!(imp::ml_dtype_size(131136), None); // no Int64 in the enum
+        assert_eq!(imp::ml_dtype_size(0), None);
+    }
 
     /// End-to-end: build y = x + x in mil_spec, package, compile through
     /// mil_compile (coremlc or the FFI path), load via FFI, predict —
@@ -645,5 +828,114 @@ mod tests {
         assert!((v[1] - 4.0).abs() < 1e-3);
         assert!((v[2] + 7.0).abs() < 1e-3);
         assert!((v[3] - 0.5).abs() < 1e-3);
+    }
+
+    /// `Block::rms_norm` must survive fp16 on the real runtime: large
+    /// activations (xs² would overflow fp16 unscaled), an all-zero row
+    /// (must be exactly 0, matching HF), and an embedding-scale row
+    /// (~0.01 RMS — the fixed `1/sqrt(d)` prescale pushed x² into fp16
+    /// subnormals and produced inf/NaN on Qwen-class embeddings).
+    #[test]
+    fn rms_norm_fp16_edge_rows() {
+        if std::process::Command::new("xcrun")
+            .args(["-f", "coremlc"])
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            return; // no coremlc on this machine
+        }
+        let dir = std::env::temp_dir().join("mil_infer_rmsnorm_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let d: i64 = 8;
+        let n: i64 = 3;
+        let eps = 1e-6f32;
+        let wvals = [1.0f32, 0.5, 2.0, 1.5, 1.0, 0.25, 1.0, 0.75];
+
+        let mut b = Block::new();
+        let w = b.op(
+            "const",
+            vec![],
+            vec![("w", ValueType::Tensor(TensorType::f16(&[d, 1, 1])))],
+            vec![("val".into(), mil_spec::Value::f16s(&[d, 1, 1], &wvals))],
+        )[0]
+        .clone();
+        let y = b.rms_norm("x", &w, d, eps, &[n, d, 1, 1], "n");
+        b.outputs = vec![y];
+
+        let inputs = [mil_spec::Feature {
+            name: "x".into(),
+            shape: vec![n, d, 1, 1],
+            dtype: mil_spec::DType::Fp16,
+            is_state: false,
+        }];
+        let outputs = [mil_spec::Feature {
+            name: "n_out".into(),
+            shape: vec![n, d, 1, 1],
+            dtype: mil_spec::DType::Fp16,
+            is_state: false,
+        }];
+        let fn_inputs = [mil_spec::NVT {
+            name: "x".into(),
+            ty: ValueType::Tensor(TensorType::f16(&[n, d, 1, 1])),
+        }];
+        let spec = mil_spec::encode_model(
+            &inputs,
+            &outputs,
+            &[],
+            &b,
+            &fn_inputs,
+            &mil_spec::ModelMeta::new(10, "CoreML9"),
+        );
+        let pkg = dir.join("n.mlpackage");
+        mil_spec::write_mlpackage(&pkg, &spec, None).unwrap();
+        let compiled = mil_compile::compile(&pkg, &dir.join("n.compiled")).unwrap();
+
+        // row 0: large (x/√8)² ≈ 5e5 overflows fp16 under a fixed
+        // prescale. row 1: zeros → exactly 0. row 2: ~0.01 RMS —
+        // (x/√8)² ≈ 1e-5, fp16 subnormal territory.
+        let rows = [
+            [
+                2000.0f32, -2000.0, 2000.0, -2000.0, 1000.0, -1000.0, 500.0, -500.0,
+            ],
+            [0.0; 8],
+            [0.012, -0.012, 0.008, -0.008, 0.004, -0.004, 0.002, -0.002],
+        ];
+        let mut xb = Vec::new();
+        for row in &rows {
+            for &v in row {
+                xb.extend_from_slice(&f16::from_f32(v).to_le_bytes());
+            }
+        }
+        let model = Model::load(&compiled.path, ComputeUnits::All).unwrap();
+        let p = model
+            .predict(&[Input {
+                name: "x",
+                shape: &[n, d, 1, 1],
+                data: &xb,
+                dtype: mil_spec::DType::Fp16,
+            }])
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let out = p.outputs[0].values();
+        for (r, row) in rows.iter().enumerate() {
+            let ms: f64 = row.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / d as f64;
+            let inv = 1.0f64 / (ms + eps as f64).sqrt();
+            for (c, &v) in row.iter().enumerate() {
+                let want = (v as f64 * inv * wvals[c] as f64) as f32;
+                let got = out[r * d as usize + c];
+                if r == 1 {
+                    assert_eq!(got, 0.0, "all-zero row must produce 0 (c={c})");
+                } else {
+                    assert!(got.is_finite(), "row {r} c {c}: {got} (want {want})");
+                    assert!(
+                        (got - want).abs() <= 0.02 + 0.03 * want.abs(),
+                        "row {r} c {c}: got {got}, want {want} (fp16 tol)"
+                    );
+                }
+            }
+        }
     }
 }

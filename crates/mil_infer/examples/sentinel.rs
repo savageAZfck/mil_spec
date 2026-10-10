@@ -47,7 +47,8 @@ mod imp {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let pkg = dir.join("sentinel.mlpackage");
-        mil_machines::write_sentinel_package(&pkg, ALPHA, EPS, THRESH).map_err(|e| e.to_string())?;
+        mil_machines::write_sentinel_package(&pkg, ALPHA, EPS, THRESH)
+            .map_err(|e| e.to_string())?;
         let compiled =
             mil_compile::compile(&pkg, &dir.join("compiled")).map_err(|e| e.to_string())?;
         println!(

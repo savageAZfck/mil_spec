@@ -36,13 +36,41 @@
 
 pub mod builder;
 pub mod config;
+pub mod gguf;
 pub mod safetensors;
 
 pub use builder::{Options, Quant};
 pub use config::ModelConfig;
+pub use gguf::Gguf;
 
 use mil_spec::{encode_model, write_mlpackage_stream, BlobWriter, ModelMeta};
 use std::path::Path;
+
+/// Any tensor store the builder can pull weights from — safetensors
+/// shards or a GGUF file. Lookups are by HF canonical name
+/// (`model.layers.0.self_attn.q_proj.weight`); `tensor_f16` returns the
+/// tensor's logical shape and its contents as f16 little-endian bytes.
+pub trait WeightSource {
+    /// Whether `name` exists.
+    fn has(&self, name: &str) -> bool;
+    /// `(shape, f16 LE bytes)` for `name`.
+    fn tensor_f16(&self, name: &str) -> std::io::Result<(Vec<i64>, Vec<u8>)>;
+}
+
+impl WeightSource for Vec<safetensors::Safetensors> {
+    fn has(&self, name: &str) -> bool {
+        safetensors::find(self, name).is_some()
+    }
+    fn tensor_f16(&self, name: &str) -> std::io::Result<(Vec<i64>, Vec<u8>)> {
+        let st = safetensors::find(self, name).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("missing weight {name}"),
+            )
+        })?;
+        st.tensor_f16(name)
+    }
+}
 
 /// What a conversion produced.
 #[derive(Clone, Debug)]
@@ -56,6 +84,12 @@ pub struct ConvertReport {
     /// `mil_lint` ANE fraction (0–100) if `mil_lint` is linked — always
     /// reported so conversion failures show placement, not just shape.
     pub ane_pct: f64,
+    /// `tokenizer.json` written next to the package (GGUF sources
+    /// only), when the embedded tokenizer is a supported kind.
+    pub tokenizer_json: Option<std::path::PathBuf>,
+    /// Why no tokenizer.json was written — the named error from
+    /// [`gguf::tokenizer`], if any.
+    pub tokenizer_error: Option<String>,
 }
 
 /// Conversion error.
@@ -112,6 +146,61 @@ pub fn convert(model_dir: &Path, out_pkg: &Path, opts: &Options) -> Result<Conve
 
     // ---- weight shards ----
     let shards = safetensors::open_dir(model_dir)?;
+    convert_impl(&cfg, &shards, out_pkg, opts)
+}
+
+/// Convert a GGUF file (single or split) into a `.mlpackage`.
+///
+/// Weights dequantize through [`gguf::dequant`] — bit-exact with ggml's
+/// `to_float` — then flow through the same builder path as safetensors.
+pub fn convert_gguf(path: &Path, out_pkg: &Path, opts: &Options) -> Result<ConvertReport> {
+    let g = Gguf::open(path).map_err(|e| ConvertError::Config(format!("{e}")))?;
+    let cfg = gguf::config::model_config(&g).map_err(ConvertError::Config)?;
+    if !cfg.supported() {
+        return Err(ConvertError::Unsupported(format!(
+            "arch {} — the builder handles qwen2/qwen3/llama/mistral",
+            cfg.model_type
+        )));
+    }
+    if cfg.num_kv_heads == 0 || cfg.num_heads % cfg.num_kv_heads != 0 {
+        return Err(ConvertError::Config(format!(
+            "num_heads {} not divisible by num_kv_heads {}",
+            cfg.num_heads, cfg.num_kv_heads
+        )));
+    }
+    let mut report = convert_impl(&cfg, &g, out_pkg, opts)?;
+
+    // Export the embedded tokenizer next to the package. An
+    // unsupported tokenizer kind must not fail the weight conversion —
+    // it lands in the report instead.
+    let dir = out_pkg.parent().unwrap_or(Path::new("."));
+    match gguf::tokenizer::to_tokenizer_json(&g)
+        .and_then(|j| {
+            let p = dir.join("tokenizer.json");
+            std::fs::write(&p, j)
+                .map(|_| p)
+                .map_err(gguf::GgufError::Io)
+        })
+        .and_then(|p| {
+            gguf::tokenizer::to_tokenizer_config_json(&g).and_then(|c| {
+                std::fs::write(dir.join("tokenizer_config.json"), c)
+                    .map(|_| p)
+                    .map_err(gguf::GgufError::Io)
+            })
+        }) {
+        Ok(p) => report.tokenizer_json = Some(p),
+        Err(e) => report.tokenizer_error = Some(format!("{e}")),
+    }
+    Ok(report)
+}
+
+/// Shared build path once config + weights exist.
+fn convert_impl(
+    cfg: &ModelConfig,
+    src: &dyn WeightSource,
+    out_pkg: &Path,
+    opts: &Options,
+) -> Result<ConvertReport> {
     for l in 0..cfg.num_layers {
         for suffix in [
             "input_layernorm.weight",
@@ -125,30 +214,43 @@ pub fn convert(model_dir: &Path, out_pkg: &Path, opts: &Options) -> Result<Conve
             "mlp.down_proj.weight",
         ] {
             let name = format!("model.layers.{l}.{suffix}");
-            if safetensors::find(&shards, &name).is_none() {
+            if !src.has(&name) {
                 return Err(ConvertError::Config(format!(
-                    "missing tensor {name} in shards"
+                    "missing tensor {name} in weights"
                 )));
             }
         }
         if cfg.qk_norm {
             for suffix in ["self_attn.q_norm.weight", "self_attn.k_norm.weight"] {
                 let name = format!("model.layers.{l}.{suffix}");
-                if safetensors::find(&shards, &name).is_none() {
+                if !src.has(&name) {
                     return Err(ConvertError::Config(format!(
-                        "q/k-norm arch needs tensor {name} — not in shards"
+                        "q/k-norm arch needs tensor {name} — not in weights"
+                    )));
+                }
+            }
+        }
+        if cfg.model_type == "qwen2" {
+            // Qwen2 attention projections carry biases — without them the
+            // converted graph silently diverges from the checkpoint.
+            for suffix in [
+                "self_attn.q_proj.bias",
+                "self_attn.k_proj.bias",
+                "self_attn.v_proj.bias",
+            ] {
+                let name = format!("model.layers.{l}.{suffix}");
+                if !src.has(&name) {
+                    return Err(ConvertError::Config(format!(
+                        "qwen2 needs bias tensor {name} — not in weights"
                     )));
                 }
             }
         }
     }
-    if safetensors::find(&shards, "model.norm.weight").is_none() {
+    if !src.has("model.norm.weight") {
         return Err(ConvertError::Config("missing model.norm.weight".into()));
     }
-    if opts.lm_head
-        && !cfg.tie_word_embeddings
-        && safetensors::find(&shards, "lm_head.weight").is_none()
-    {
+    if opts.lm_head && !cfg.tie_word_embeddings && !src.has("lm_head.weight") {
         return Err(ConvertError::Config("missing lm_head.weight".into()));
     }
 
@@ -160,9 +262,9 @@ pub fn convert(model_dir: &Path, out_pkg: &Path, opts: &Options) -> Result<Conve
         w: &mut writer,
         quant: opts.quant,
         file: "@model_path/weights/weight.bin".into(),
-        shards: &shards,
+        src,
     };
-    let mut built = builder::build(&cfg, opts, &mut em)?;
+    let mut built = builder::build(cfg, opts, &mut em)?;
     writer.finish()?;
 
     // ---- optimize + emit ----
@@ -192,6 +294,8 @@ pub fn convert(model_dir: &Path, out_pkg: &Path, opts: &Options) -> Result<Conve
         weight_bytes,
         package: out_pkg.to_path_buf(),
         ane_pct: 0.0, // filled by callers that link mil_lint
+        tokenizer_json: None,
+        tokenizer_error: None,
     })
 }
 

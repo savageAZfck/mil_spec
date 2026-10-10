@@ -26,7 +26,7 @@
 //! of its weights in RAM.
 
 use crate::config::ModelConfig;
-use crate::safetensors::{find, Safetensors};
+use crate::WeightSource;
 use mil_spec::{bind, bind_many, Block, DType, Feature, TensorType, ValueType, NVT};
 
 /// Weight quantization for the emitted graph.
@@ -104,8 +104,8 @@ pub struct WeightEmitter<'a> {
     pub quant: Quant,
     /// blob file name inside the package
     pub file: String,
-    /// open safetensors readers
-    pub shards: &'a [Safetensors],
+    /// weight store — safetensors shards or a GGUF file
+    pub src: &'a dyn WeightSource,
 }
 
 impl<'a> WeightEmitter<'a> {
@@ -117,13 +117,7 @@ impl<'a> WeightEmitter<'a> {
         hf_name: &str,
         name: &str,
     ) -> std::io::Result<String> {
-        let st = find(self.shards, hf_name).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("missing weight {hf_name}"),
-            )
-        })?;
-        let (shape, bytes) = st.tensor_f16(hf_name)?;
+        let (shape, bytes) = self.src.tensor_f16(hf_name)?;
         if shape.len() != 2 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -145,6 +139,35 @@ impl<'a> WeightEmitter<'a> {
         }
     }
 
+    /// Emit an optional conv bias `(cout,)` — `Ok(None)` when the
+    /// checkpoint carries no bias tensor for this projection.
+    pub fn bias_weight(
+        &mut self,
+        b: &mut Block,
+        hf_name: &str,
+        name: &str,
+        cout: i64,
+    ) -> std::io::Result<Option<String>> {
+        if !self.src.has(hf_name) {
+            return Ok(None);
+        }
+        let (_, bytes) = self.src.tensor_f16(hf_name)?;
+        if bytes.len() != (cout * 2) as usize {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{hf_name}: expected {cout} bias elems"),
+            ));
+        }
+        let off = self.w.append(DType::Fp16, &bytes)?;
+        Ok(Some(b.konst_blob(
+            name,
+            &self.file,
+            off,
+            DType::Fp16,
+            &[cout],
+        )))
+    }
+
     /// Emit a 1D norm weight as fp16 blob `(1, d, 1, 1)` for channel-dim
     /// broadcast, or `(1,1,1,hd)` for last-dim broadcast (head norms).
     pub fn norm_weight(
@@ -154,13 +177,7 @@ impl<'a> WeightEmitter<'a> {
         name: &str,
         shape: &[i64],
     ) -> std::io::Result<String> {
-        let st = find(self.shards, hf_name).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("missing weight {hf_name}"),
-            )
-        })?;
-        let (_, bytes) = st.tensor_f16(hf_name)?;
+        let (_, bytes) = self.src.tensor_f16(hf_name)?;
         let off = self.w.append(DType::Fp16, &bytes)?;
         Ok(b.konst_blob(name, &self.file, off, DType::Fp16, shape))
     }
@@ -195,21 +212,71 @@ pub fn quantize_int8(w: &[u8], out_f: i64, in_f: i64) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// A generalized RMSNorm: `x / sqrt(mean(x^2, axes) + eps) * w` over an
-/// arbitrary axis, with the helper's prescale trick (scale x by 1/sqrt(d)
-/// first so x² stays inside fp16 range on large activations).
+/// arbitrary axis — fp16-safe via a dynamic max-abs prescale. With
+/// `m = max(|x|)` (floored) and `xs = x/m` every element sits in
+/// `[-1, 1]`, so `xs²` can never overflow, and when `xs²` underflows the
+/// `eps/m²` term necessarily dominates the variance anyway, so
+/// flush-to-zero can't change the result:
+///
+/// `out = xs·rsqrt(mean(xs²) + eps/m²)·w = x·rsqrt(mean(x²)+eps)·w`
+///
+/// `eps/m²` is computed as `(√eps/m)²` — eps ~1e-6 is an fp16 denormal,
+/// but `√eps/m` stays in normal range for every m that matters (when it
+/// does flush, `mean(xs²)` ≈ 1 dominates and eps is negligible anyway).
+/// Division is used rather than reciprocal-multiply because `1/m` itself
+/// is a fp16 denormal for `m > 16384`. An all-zero row yields exactly 0,
+/// matching HF.
+#[allow(clippy::too_many_arguments)]
 fn rms_norm_axis(
     b: &mut Block,
     x: &str,
     w: &str,
-    d: i64,
+    _d: i64,
     eps: f32,
     axes: &[i32],
     shape: &[i64],
     pfx: &str,
 ) -> String {
-    let k = (d as f32).sqrt();
-    let inv_k = b.konst_f16(&format!("{pfx}_invk"), 1.0 / k);
-    let xs = b.mul(x, &inv_k, shape, &format!("{pfx}_xs"));
+    // 2^-8: 1/floor = 256 fits fp16, and eps/floor² ≈ 0.065 (eps=1e-6)
+    // stays a normal fp16 value so an all-zero row still gets r finite.
+    const M_FLOOR: f32 = 3.90625e-3;
+    let absx = b.o1(
+        "abs",
+        vec![("x".into(), bind(x).1)],
+        &format!("{pfx}_abs"),
+        f16(shape),
+    );
+    let ax = b.fresh("axes");
+    let ax = b.konst_i32(&ax, axes);
+    let kd = b.fresh("kd");
+    let kd = b.konst_bool(&kd, true);
+    let mut mshape = shape.to_vec();
+    for &a in axes {
+        mshape[a as usize] = 1;
+    }
+    let m = b.o1(
+        "reduce_max",
+        vec![
+            ("x".into(), bind(&absx).1),
+            ("axes".into(), bind(&ax).1),
+            ("keep_dims".into(), bind(&kd).1),
+        ],
+        &format!("{pfx}_m"),
+        f16(&mshape),
+    );
+    let fl = b.konst_f16(&format!("{pfx}_fl"), M_FLOOR);
+    let mc = b.o1(
+        "maximum",
+        vec![("x".into(), bind(&m).1), ("y".into(), bind(&fl).1)],
+        &format!("{pfx}_mc"),
+        f16(&mshape),
+    );
+    let xs = b.o1(
+        "real_div",
+        vec![("x".into(), bind(x).1), ("y".into(), bind(&mc).1)],
+        &format!("{pfx}_xs"),
+        f16(shape),
+    );
     let sq = b.mul(&xs, &xs, shape, &format!("{pfx}_sq"));
     let ax = b.fresh("axes");
     let ax = b.konst_i32(&ax, axes);
@@ -229,8 +296,16 @@ fn rms_norm_axis(
         &format!("{pfx}_mean"),
         f16(&mshape),
     );
-    let eps2 = b.konst_f16(&format!("{pfx}_eps"), eps / (k * k));
-    let var = b.add(&mean, &eps2, &mshape, &format!("{pfx}_var"));
+    // eps/mc² as (√eps/mc)² — eps alone is an fp16 denormal.
+    let esq = b.konst_f16(&format!("{pfx}_esq"), eps.sqrt());
+    let t = b.o1(
+        "real_div",
+        vec![("x".into(), bind(&esq).1), ("y".into(), bind(&mc).1)],
+        &format!("{pfx}_t"),
+        f16(&mshape),
+    );
+    let e2 = b.mul(&t, &t, &mshape, &format!("{pfx}_e2"));
+    let var = b.add(&mean, &e2, &mshape, &format!("{pfx}_var"));
     let eps_c = b.konst_f16(&format!("{pfx}_rse"), 0.0);
     let r = b.o1(
         "rsqrt",
@@ -243,6 +318,16 @@ fn rms_norm_axis(
     );
     let xn = b.mul(&xs, &r, shape, &format!("{pfx}_xn"));
     b.mul(&xn, w, shape, &format!("{pfx}_out"))
+}
+
+/// `(1, h*hd, S, 1)` conv layout → `(1, h, S, hd)` per-head layout:
+/// transpose the sequence to the front, split the channel into
+/// (head, dim), then move heads back — element (a,p,c) = channel
+/// a*hd+c of position p.
+fn seq_to_heads(b: &mut Block, x: &str, h: i64, s: i64, hd: i64, pfx: &str) -> String {
+    let t1 = b.transpose(x, &[0, 2, 1, 3], &[1, s, h * hd, 1], &format!("{pfx}_t1"));
+    let r = b.reshape(&t1, &[1, s, h, hd], &format!("{pfx}_r"));
+    b.transpose(&r, &[0, 2, 1, 3], &[1, h, s, hd], &format!("{pfx}_t2"))
 }
 
 /// `sigmoid` (raw op, not a helper).
@@ -258,6 +343,7 @@ fn neg(b: &mut Block, x: &str, shape: &[i64], name: &str) -> String {
 
 /// RoPE on `(1, h, S, hd)`: `x*cos + rotate_half(x)*sin`.
 /// `rotate_half([x1|x2]) = [-x2|x1]` (non-interleaved, Llama-style).
+#[allow(clippy::too_many_arguments)]
 fn rope(
     b: &mut Block,
     x: &str,
@@ -295,6 +381,7 @@ fn rope(
 /// Build the packed-KV slice_update for one row of the state.
 /// `row`/`row_end` select the state's row range; `pos` is the runtime
 /// position input name; `update` is `(1, kvh, S, dh)`.
+#[allow(clippy::too_many_arguments)]
 fn slice_update(
     b: &mut Block,
     state_val: &str,
@@ -413,7 +500,7 @@ pub fn build(cfg: &ModelConfig, opts: &Options, em: &mut WeightEmitter) -> std::
     let act = vec![1, d, s, 1]; // conv layout: (1, C, S, 1)
 
     // ---- input features ----
-    let mut inputs = vec![
+    let inputs = vec![
         Feature {
             name: "x".into(),
             shape: act.clone(),
@@ -468,7 +555,7 @@ pub fn build(cfg: &ModelConfig, opts: &Options, em: &mut WeightEmitter) -> std::
         )?;
         let h = rms_norm_axis(&mut b, &x, &nw, d, cfg.rms_norm_eps, &[1], &act, &pfx);
 
-        // ---- q/k/v projections (conv-packed) ----
+        // ---- q/k/v projections (conv-packed; qwen2 carries biases) ----
         let wq = em.conv_weight(
             &mut b,
             &format!("model.layers.{l}.self_attn.q_proj.weight"),
@@ -484,14 +571,39 @@ pub fn build(cfg: &ModelConfig, opts: &Options, em: &mut WeightEmitter) -> std::
             &format!("model.layers.{l}.self_attn.v_proj.weight"),
             &format!("{pfx}_wv"),
         )?;
-        let q = b.conv1x1(&h, &wq, None, qh * hd, &format!("{pfx}_q"));
-        let k = b.conv1x1(&h, &wk, None, kvh * hd, &format!("{pfx}_k"));
-        let v = b.conv1x1(&h, &wv, None, kvh * hd, &format!("{pfx}_v"));
+        // Optional biases — emitted when the checkpoint has them
+        // (qwen2 q/k/v; llama/qwen3 have none). Shape (cout,) per the
+        // conv op's bias signature.
+        let bq = em.bias_weight(
+            &mut b,
+            &format!("model.layers.{l}.self_attn.q_proj.bias"),
+            &format!("{pfx}_bq"),
+            qh * hd,
+        )?;
+        let bk = em.bias_weight(
+            &mut b,
+            &format!("model.layers.{l}.self_attn.k_proj.bias"),
+            &format!("{pfx}_bk"),
+            kvh * hd,
+        )?;
+        let bv = em.bias_weight(
+            &mut b,
+            &format!("model.layers.{l}.self_attn.v_proj.bias"),
+            &format!("{pfx}_bv"),
+            kvh * hd,
+        )?;
+        let q = b.conv1x1_s(&h, &wq, bq.as_deref(), qh * hd, s, &format!("{pfx}_q"));
+        let k = b.conv1x1_s(&h, &wk, bk.as_deref(), kvh * hd, s, &format!("{pfx}_k"));
+        let v = b.conv1x1_s(&h, &wv, bv.as_deref(), kvh * hd, s, &format!("{pfx}_v"));
 
         // ---- to per-head layout (1, heads, S, hd) ----
-        let q4 = b.reshape(&q, &[1, qh, s, hd], &format!("{pfx}_q4"));
-        let k4 = b.reshape(&k, &[1, kvh, s, hd], &format!("{pfx}_k4"));
-        let v4 = b.reshape(&v, &[1, kvh, s, hd], &format!("{pfx}_v4"));
+        // conv out is (1, h*hd, S, 1); a bare reshape to (1,h,S,hd)
+        // would interleave position into the channel index (only
+        // correct at S==1). Transpose→reshape→transpose instead so
+        // element (a,p,c) really is channel a*hd+c of position p.
+        let q4 = seq_to_heads(&mut b, &q, qh, s, hd, &format!("{pfx}_q4"));
+        let k4 = seq_to_heads(&mut b, &k, kvh, s, hd, &format!("{pfx}_k4"));
+        let v4 = seq_to_heads(&mut b, &v, kvh, s, hd, &format!("{pfx}_v4"));
 
         // ---- optional per-head q/k rms norms (Qwen3) ----
         let (q_n, k_n) = if cfg.qk_norm {
@@ -595,9 +707,22 @@ pub fn build(cfg: &ModelConfig, opts: &Options, em: &mut WeightEmitter) -> std::
             );
             let inv = b.konst_f16(&format!("{pfx}_scale"), 1.0 / (hd as f32).sqrt());
             let scaled = b.mul(&sc, &inv, &[1, kvh, g * s, max_kv], &format!("{pfx}_scl"));
+            // The GQA fold packs rows as (g_idx, p): mask row for score row j
+            // is mask[j % s], i.e. the (1,1,s,mk) mask tiled g times.
+            let mask = if g > 1 && s > 1 {
+                let reps = b.konst_i32(&format!("{pfx}_mrep"), &[1, 1, g as i32, 1]);
+                b.o1(
+                    "tile",
+                    vec![("x".into(), bind("mask").1), ("reps".into(), bind(&reps).1)],
+                    &format!("{pfx}_maskt"),
+                    f16(&[1, 1, g * s, max_kv]),
+                )
+            } else {
+                "mask".to_string()
+            };
             b.add(
                 &scaled,
-                "mask",
+                &mask,
                 &[1, kvh, g * s, max_kv],
                 &format!("{pfx}_msk"),
             )
@@ -633,7 +758,13 @@ pub fn build(cfg: &ModelConfig, opts: &Options, em: &mut WeightEmitter) -> std::
             &format!("model.layers.{l}.self_attn.o_proj.weight"),
             &format!("{pfx}_wo"),
         )?;
-        let o = b.conv1x1(&ac4, &wo, None, d, &format!("{pfx}_o"));
+        let bo = em.bias_weight(
+            &mut b,
+            &format!("model.layers.{l}.self_attn.o_proj.bias"),
+            &format!("{pfx}_bo"),
+            d,
+        )?;
+        let o = b.conv1x1_s(&ac4, &wo, bo.as_deref(), d, s, &format!("{pfx}_o"));
         x = b.add(&x, &o, &act, &format!("{pfx}_ra"));
 
         // ---- MLP ----
@@ -668,12 +799,12 @@ pub fn build(cfg: &ModelConfig, opts: &Options, em: &mut WeightEmitter) -> std::
             &format!("model.layers.{l}.mlp.down_proj.weight"),
             &format!("{pfx}_wd"),
         )?;
-        let gate = b.conv1x1(&h2, &wg, None, inter, &format!("{pfx}_gate"));
-        let up = b.conv1x1(&h2, &wu, None, inter, &format!("{pfx}_up"));
+        let gate = b.conv1x1_s(&h2, &wg, None, inter, s, &format!("{pfx}_gate"));
+        let up = b.conv1x1_s(&h2, &wu, None, inter, s, &format!("{pfx}_up"));
         let sg = sigmoid(&mut b, &gate, &[1, inter, s, 1], &format!("{pfx}_sg"));
         let silu = b.mul(&gate, &sg, &[1, inter, s, 1], &format!("{pfx}_silu"));
         let act_mlp = b.mul(&silu, &up, &[1, inter, s, 1], &format!("{pfx}_swiglu"));
-        let down = b.conv1x1(&act_mlp, &wd, None, d, &format!("{pfx}_down"));
+        let down = b.conv1x1_s(&act_mlp, &wd, None, d, s, &format!("{pfx}_down"));
         x = b.add(&x, &down, &act, &format!("{pfx}_rm"));
     }
 
@@ -692,7 +823,7 @@ pub fn build(cfg: &ModelConfig, opts: &Options, em: &mut WeightEmitter) -> std::
             "lm_head.weight"
         };
         let wl = em.conv_weight(&mut b, head_w, "lm_w")?;
-        let logits = b.conv1x1(&xf, &wl, None, cfg.vocab_size, "logits");
+        let logits = b.conv1x1_s(&xf, &wl, None, cfg.vocab_size, s, "logits");
         (logits, vec![1, cfg.vocab_size, s, 1])
     } else {
         (xf, act.clone())
@@ -705,14 +836,6 @@ pub fn build(cfg: &ModelConfig, opts: &Options, em: &mut WeightEmitter) -> std::
         dtype: DType::Fp16,
         is_state: false,
     }];
-    inputs.push(Feature {
-        name: "".into(),
-        shape: vec![],
-        dtype: DType::Fp16,
-        is_state: false,
-    });
-    inputs.pop(); // keep inputs clean — no-op placeholder for clarity
-
     let mut fn_inputs: Vec<NVT> = inputs
         .iter()
         .map(|f| NVT {
@@ -738,4 +861,163 @@ pub fn build(cfg: &ModelConfig, opts: &Options, em: &mut WeightEmitter) -> std::
         states,
         fn_inputs,
     })
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use mil_spec::{ModelMeta, Value};
+
+    /// `x (1,d,s,1)` → `rms_norm_axis(x, w)` with const `w (1,d,1,1)` —
+    /// the exact op chain the builder emits inside a layer.
+    fn norm_pkg(d: i64, s: i64, wvals: &[f32], eps: f32) -> Block {
+        let mut b = Block::new();
+        let w = b.op(
+            "const",
+            vec![],
+            vec![("w", ValueType::Tensor(TensorType::f16(&[1, d, 1, 1])))],
+            vec![("val".into(), Value::f16s(&[1, d, 1, 1], wvals))],
+        )[0]
+        .clone();
+        let out = rms_norm_axis(&mut b, "x", &w, d, eps, &[1], &[1, d, s, 1], "n");
+        b.outputs = vec![out];
+        b
+    }
+
+    fn compile_and_run(b: &Block, x: &[f32], d: i64, s: i64) -> Vec<f32> {
+        if std::process::Command::new("xcrun")
+            .args(["-f", "coremlc"])
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            panic!("coremlc not available — cannot run the compiled norm probe");
+        }
+        let dir = std::env::temp_dir().join(format!("rmsnorm_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let inputs = [Feature {
+            name: "x".into(),
+            shape: vec![1, d, s, 1],
+            dtype: DType::Fp16,
+            is_state: false,
+        }];
+        let outputs = [Feature {
+            name: b.outputs[0].clone(),
+            shape: vec![1, d, s, 1],
+            dtype: DType::Fp16,
+            is_state: false,
+        }];
+        let fin = [NVT {
+            name: "x".into(),
+            ty: ValueType::Tensor(TensorType::f16(&[1, d, s, 1])),
+        }];
+        let spec = mil_spec::encode_model(
+            &inputs,
+            &outputs,
+            &[],
+            b,
+            &fin,
+            &ModelMeta::new(10, "CoreML9"),
+        );
+        let pkg = dir.join("n.mlpackage");
+        mil_spec::write_mlpackage(&pkg, &spec, None).unwrap();
+        let comp = mil_compile::compile(&pkg, &dir.join("n.compiled")).unwrap();
+        let data: Vec<u8> = x
+            .iter()
+            .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+            .collect();
+        let m = mil_infer::Model::load(&comp.path, mil_infer::ComputeUnits::All).unwrap();
+        let pr = m
+            .predict(&[mil_infer::Input {
+                name: "x",
+                shape: &[1, d, s, 1],
+                data: &data,
+                dtype: DType::Fp16,
+            }])
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        pr.outputs[0].values()
+    }
+
+    /// Op-sequence proof: the emitted norm must prescale by a dynamic
+    /// max-abs (abs → reduce_max → maximum → real_div), not by a fixed
+    /// const. A fixed `x * 1/sqrt(d)` prescale (the old impl) emits only
+    /// mul/reduce_mean/add/rsqrt/mul/mul and fails this check outright.
+    #[test]
+    fn rms_norm_emits_maxabs_prescale() {
+        let b = norm_pkg(8, 3, &[1.0; 8], 1e-6);
+        let ops: Vec<&str> = b.ops.iter().map(|o| o.ty.as_str()).collect();
+        for need in [
+            "abs",
+            "reduce_max",
+            "maximum",
+            "real_div",
+            "reduce_mean",
+            "rsqrt",
+        ] {
+            assert!(ops.contains(&need), "norm chain missing {need}: {ops:?}");
+        }
+        // fp16 only — an fp32 norm falls off the ANE.
+        assert!(
+            !ops.iter().any(|o| *o == "cast" || *o == "reduce_sum"),
+            "norm chain must stay fp16 (no cast): {ops:?}"
+        );
+    }
+
+    /// Numeric proof on the fp16 execution path (ANE under
+    /// `ComputeUnits::All`). Three rows through one call:
+    /// - p0: large activations (±2000) — `(x/√d)²` overflows fp16 in
+    ///   the old impl → rsqrt(inf) = 0 → all-zero output. Correct
+    ///   output is O(1).
+    /// - p1: all-zero row — must produce exactly 0 (HF semantics).
+    /// - p2: embedding-scale row (~0.01 RMS, the Qwen3 case) —
+    ///   `(x/√d)² ~ 1e-5` underflows fp16 subnormals in the old impl.
+    #[test]
+    fn rms_norm_fp16_edge_rows() {
+        let d: i64 = 8;
+        let s: i64 = 3;
+        let eps = 1e-6f32;
+        let wvals = [1.0f32, 0.5, 2.0, 1.5, 1.0, 0.25, 1.0, 0.75];
+        let rows = [
+            // p0: large — (x/√8)² hits ~5e5, way past fp16 max 65504.
+            [
+                2000.0, -2000.0, 2000.0, -2000.0, 1000.0, -1000.0, 500.0, -500.0,
+            ],
+            // p1: all-zero row → exactly 0.
+            [0.0; 8],
+            // p2: embedding-scale — mean(x²) ≈ 7.6e-5.
+            [0.012, -0.012, 0.008, -0.008, 0.004, -0.004, 0.002, -0.002],
+        ];
+        let b = norm_pkg(d, s, &wvals, eps);
+        // x (1, d, s, 1): element (c, p) at index c*s + p.
+        let mut x = vec![0f32; (d * s) as usize];
+        for (p, row) in rows.iter().enumerate() {
+            for (c, &v) in row.iter().enumerate() {
+                x[c * s as usize + p] = v;
+            }
+        }
+        let out = compile_and_run(&b, &x, d, s);
+        assert_eq!(out.len(), (d * s) as usize);
+        for (p, row) in rows.iter().enumerate() {
+            let ms: f64 = row.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / d as f64;
+            let inv = 1.0f64 / (ms + eps as f64).sqrt();
+            for (c, &v) in row.iter().enumerate() {
+                let want = (v as f64 * inv * wvals[c] as f64) as f32;
+                let got = out[c * s as usize + p];
+                if p == 1 {
+                    assert_eq!(got, 0.0, "all-zero row must produce 0 (c={c})");
+                } else {
+                    assert!(
+                        got.is_finite(),
+                        "pos {p} c {c}: non-finite output {got} (want {want})"
+                    );
+                    assert!(
+                        (got - want).abs() <= 0.02 + 0.03 * want.abs(),
+                        "pos {p} c {c}: got {got}, want {want} (fp16 tol)"
+                    );
+                }
+            }
+        }
+    }
 }

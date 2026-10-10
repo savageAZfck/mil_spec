@@ -262,9 +262,9 @@ pub fn classify_op(
         }
 
         // Elementwise fp16 — the ANE's bread and butter.
-        "add" | "sub" | "mul" | "div" | "pow" | "maximum" | "minimum" | "floor" | "ceil"
-        | "round" | "sqrt" | "rsqrt" | "exp" | "log" | "sin" | "cos" | "tan" | "abs" | "sign"
-        | "neg" | "inverse" | "clip" | "threshold" | "scale" => {
+        "add" | "sub" | "mul" | "div" | "real_div" | "pow" | "maximum" | "minimum" | "floor"
+        | "ceil" | "round" | "sqrt" | "rsqrt" | "exp" | "log" | "sin" | "cos" | "tan" | "abs"
+        | "sign" | "neg" | "inverse" | "clip" | "threshold" | "scale" => {
             if f32 {
                 (Unit::Gpu, "elementwise fp32")
             } else {

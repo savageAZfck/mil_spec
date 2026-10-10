@@ -30,6 +30,9 @@
 
 #![forbid(unsafe_code)]
 
+/// Independent pure-Rust HF forward used to anchor converter tests.
+pub mod reference;
+
 use mil_spec::{Binding, Block, Op};
 use std::collections::HashMap;
 use std::fmt;
