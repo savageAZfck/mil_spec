@@ -72,6 +72,7 @@ fn usage() {
          \x20 milc inspect <pkg.mlpackage|file.mlmodel>\n\
          \x20 milc diff    <a.mlmodel|pkg> <b.mlmodel|pkg>\n\
          \x20 milc compile <pkg.mlpackage> [-o <out_dir>]\n\
+         \x20 milc compile <model.mil> --target ane [-o <dir>] [--arch h16g] [--pos N]   # lower + ANECCompile → Mach-O, no CoreML\n\
          \x20 milc run     <model.mlmodelc|bundle.milshards> [--units ane|gpu|all|cpu] [--steps N]\n\
          \x20 milc plan    <pkg|model.mlmodelc> [--units all|ane|gpu|cpu] [--json]   # Core ML compute plan: per-op device + cost\n\
          \x20 milc verify\n\
@@ -814,11 +815,26 @@ fn cmd_diff(args: &[String]) -> ExitCode {
 fn cmd_compile(args: &[String]) -> ExitCode {
     let mut pkg: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
+    let mut target = "coreml".to_string();
+    let mut arch = "h16g".to_string();
+    let mut pos = 0i64;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "-o" | "--out" => {
                 out = args.get(i + 1).map(PathBuf::from);
+                i += 2;
+            }
+            "--target" => {
+                target = args.get(i + 1).cloned().unwrap_or_default();
+                i += 2;
+            }
+            "--arch" => {
+                arch = args.get(i + 1).cloned().unwrap_or_default();
+                i += 2;
+            }
+            "--pos" => {
+                pos = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0);
                 i += 2;
             }
             other if !other.starts_with('-') => {
@@ -838,6 +854,87 @@ fn cmd_compile(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
     let out = out.unwrap_or_else(|| pkg.with_extension("compiled"));
+    // `--target ane`: .mil text → ane_lower → ANECCompile → Mach-O.
+    // No CoreML anywhere in the path.
+    if target == "ane" {
+        let text = match std::fs::read_to_string(&pkg) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("milc compile --target ane: {}: {e}", pkg.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        let lowered = match mil_spec::ane_lower::lower_for_ane(&text, pos) {
+            Ok((l, rep)) => {
+                eprintln!(
+                    "ane_lower: states={} updates={} reads={} dropped={}",
+                    rep.states_split, rep.updates_localized, rep.reads_localized,
+                    rep.ops_dropped
+                );
+                l
+            }
+            // Stateless graphs are already eligible — compile as-is.
+            Err(e) if e.contains("no state") => text,
+            Err(e) => {
+                eprintln!("milc compile --target ane: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let ane = match mil_infer::Anec::open() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("milc compile --target ane: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        // The compiler resolves @model_path against the mil's dir —
+        // write the lowered text beside a copy of any weights/ dir.
+        let work = out.join("mil");
+        let _ = std::fs::create_dir_all(&work);
+        let lmil = work.join("model.mil");
+        if let Err(e) = std::fs::write(&lmil, &lowered) {
+            eprintln!("milc compile --target ane: {}: {e}", lmil.display());
+            return ExitCode::FAILURE;
+        }
+        if let Some(w) = pkg.parent().map(|p| p.join("weights")) {
+            if w.is_dir() && !work.join("weights").exists() {
+                let _ = std::fs::create_dir_all(work.join("weights"));
+                if let Ok(rd) = std::fs::read_dir(&w) {
+                    for f in rd.flatten() {
+                        let _ = std::fs::copy(
+                            f.path(),
+                            work.join("weights").join(f.file_name()),
+                        );
+                    }
+                }
+            }
+        }
+        return match ane.compile(&lmil, &out, &arch) {
+            Ok(v) if v.rc == 0 => {
+                if let Some(a) = &v.artifact {
+                    println!("{} via anec ({})", a.display(), arch);
+                }
+                if let Some(d) = v.dram_usage {
+                    println!("ModelMaxDramUsage = {d}");
+                }
+                for e in &v.errors {
+                    eprintln!("warn: {e}");
+                }
+                ExitCode::SUCCESS
+            }
+            Ok(v) => {
+                eprintln!("anec rc={} status={:#x}", v.rc, v.status);
+                for e in &v.errors {
+                    eprintln!("error: {e}");
+                }
+                ExitCode::FAILURE
+            }
+            Err(e) => {
+                eprintln!("milc compile --target ane: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match mil_compile::compile(&pkg, &out) {
         Ok(m) => {
             println!("{} via {}", m.path.display(), m.backend);
