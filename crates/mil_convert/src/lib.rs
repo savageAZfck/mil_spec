@@ -34,6 +34,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod attest;
 pub mod builder;
 pub mod config;
 pub mod gguf;
@@ -41,6 +42,7 @@ pub mod lora;
 pub mod npz;
 pub mod plan;
 pub mod safetensors;
+pub mod surgery;
 
 pub use builder::{Options, Quant};
 pub use config::ModelConfig;
@@ -214,7 +216,14 @@ pub fn convert(model_dir: &Path, out_pkg: &Path, opts: &Options) -> Result<Conve
 
     // ---- weight shards ----
     let shards = safetensors::open_dir(model_dir)?;
-    convert_impl(&cfg, &shards, out_pkg, opts)
+    // Provenance fingerprints cover every source weight file (sorted —
+    // open_dir already sorts, keep the same order).
+    let mut source_files: Vec<std::path::PathBuf> = std::fs::read_dir(model_dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("safetensors"))
+        .collect();
+    source_files.sort();
+    convert_impl(&cfg, &shards, out_pkg, opts, &source_files)
 }
 
 /// Convert a GGUF file (single or split) into a `.mlpackage`.
@@ -236,7 +245,8 @@ pub fn convert_gguf(path: &Path, out_pkg: &Path, opts: &Options) -> Result<Conve
             cfg.num_heads, cfg.num_kv_heads
         )));
     }
-    let mut report = convert_impl(&cfg, &g, out_pkg, opts)?;
+    let source_files: Vec<std::path::PathBuf> = g.paths().iter().map(|p| p.to_path_buf()).collect();
+    let mut report = convert_impl(&cfg, &g, out_pkg, opts, &source_files)?;
 
     // Export the embedded tokenizer next to the package. An
     // unsupported tokenizer kind must not fail the weight conversion —
@@ -288,11 +298,16 @@ pub fn compute_plan(path: &Path, policy: plan::QuantPolicy) -> Result<plan::Plan
 }
 
 /// Shared build path once config + weights exist.
+///
+/// `source_files` are the weight files provenance fingerprints —
+/// safetensors shards for `convert`, the gguf (parts) for
+/// `convert_gguf`. They are hashed, never parsed here.
 fn convert_impl(
     cfg: &ModelConfig,
     src: &dyn WeightSource,
     out_pkg: &Path,
     opts: &Options,
+    source_files: &[std::path::PathBuf],
 ) -> Result<ConvertReport> {
     // Optional LoRA bake-in. Validate every adapter target against the
     // checkpoint before `weight.bin` is opened, then wrap the source so
@@ -397,12 +412,23 @@ fn convert_impl(
 
     // ---- optimize + emit ----
     let _ = mil_passes::optimize(&mut built.block);
-    let meta = ModelMeta::new(opts.spec_version, &opts.opset)
+    // Provenance: hash the streamed weight.bin (same bytes the package
+    // gets), fingerprint every source file, and embed it all in the
+    // spec's userDefined metadata. Hashing the tmp file keeps this a
+    // sequential read — no second full pass over the model in RAM.
+    let weight_hash = mil_spec::sha256::sha256_file(&tmp_w)
+        .map_err(|e| ConvertError::Config(format!("provenance: {e}")))?;
+    let prov = attest::provenance_map(cfg, opts, source_files, &weight_hash)
+        .map_err(|e| ConvertError::Config(format!("provenance: {e}")))?;
+    let mut meta = ModelMeta::new(opts.spec_version, &opts.opset)
         .creator("mil_convert")
         .description(&format!(
             "{} converted by mil_convert ({} layers, d={}, seq={})",
             cfg.model_type, cfg.num_layers, cfg.hidden_size, opts.seq
         ));
+    for (k, v) in prov {
+        meta = meta.user_meta(&k, &v);
+    }
     let empty_flex = std::collections::BTreeMap::new();
     let spec = encode_model_flex(
         &built.inputs,

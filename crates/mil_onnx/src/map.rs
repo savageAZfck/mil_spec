@@ -14,8 +14,7 @@ use crate::classical;
 use crate::model::{elem, Dim, ModelProto, NodeProto, TensorProto};
 use crate::{BuiltModel, OnnxError};
 use mil_spec::{
-    bind, bind_many, Block, DType, Feature, Immediate, NVT, TensorType, Value, ValueType,
-    WeightBin,
+    bind, bind_many, Block, DType, Feature, Immediate, TensorType, Value, ValueType, WeightBin, NVT,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -55,8 +54,16 @@ fn bcast(a: &[i64], b: &[i64]) -> Res<Vec<i64>> {
     let n = a.len().max(b.len());
     let mut out = vec![0i64; n];
     for i in 0..n {
-        let da = if i + a.len() >= n { a[i + a.len() - n] } else { 1 };
-        let db = if i + b.len() >= n { b[i + b.len() - n] } else { 1 };
+        let da = if i + a.len() >= n {
+            a[i + a.len() - n]
+        } else {
+            1
+        };
+        let db = if i + b.len() >= n {
+            b[i + b.len() - n]
+        } else {
+            1
+        };
         out[i] = if da == db {
             da
         } else if da == 1 {
@@ -195,12 +202,13 @@ impl<'a> Ctx<'a> {
 
     /// Shape/dtype of a resolved *MIL* value name.
     pub(crate) fn info(&self, produced: &str) -> Res<TInfo> {
-        self.env.get(produced).cloned().ok_or_else(|| {
-            OnnxError::MissingInput {
+        self.env
+            .get(produced)
+            .cloned()
+            .ok_or_else(|| OnnxError::MissingInput {
                 name: produced.into(),
                 node: "internal".into(),
-            }
-        })
+            })
     }
 
     /// Info for an ONNX-named value (resolving aliases/inits).
@@ -239,48 +247,77 @@ impl<'a> Ctx<'a> {
 
     // ---------- const emitters ----------
 
+    /// Register a produced name's static shape/dtype in env.
+    fn env_set(&mut self, name: &str, shape: &[i64], dtype: DType) {
+        self.env.insert(
+            name.to_string(),
+            TInfo {
+                shape: shape.to_vec(),
+                dtype,
+            },
+        );
+    }
+
     pub(crate) fn k_i32v(&mut self, vs: &[i32]) -> String {
         let n = self.b.fresh("ci32");
-        self.b.konst_i32(&n, vs)
+        let r = self.b.konst_i32(&n, vs);
+        self.env_set(&r, &[vs.len() as i64], DType::Int32);
+        r
     }
     pub(crate) fn k_i32s(&mut self, v: i32) -> String {
         let n = self.b.fresh("ci32s");
-        self.b.konst_scalar_i32(&n, v)
+        let r = self.b.konst_scalar_i32(&n, v);
+        self.env_set(&r, &[], DType::Int32);
+        r
     }
     pub(crate) fn k_f16(&mut self, v: f32) -> String {
         let n = self.b.fresh("cf16");
-        self.b.konst_f16(&n, v)
+        let r = self.b.konst_f16(&n, v);
+        self.env_set(&r, &[], DType::Fp16);
+        r
     }
     pub(crate) fn k_bool(&mut self, v: bool) -> String {
         let n = self.b.fresh("cbool");
-        self.b.konst_bool(&n, v)
+        let r = self.b.konst_bool(&n, v);
+        self.env_set(&r, &[], DType::Bool);
+        r
     }
     pub(crate) fn k_str(&mut self, v: &str) -> String {
         let n = self.b.fresh("cstr");
-        self.b.konst_str(&n, v)
+        let r = self.b.konst_str(&n, v);
+        // strings never enter the tensor env; record anyway for info()
+        self.env_set(&r, &[], DType::Str);
+        r
     }
     pub(crate) fn k_bools(&mut self, vs: &[bool]) -> String {
         let n = self.b.fresh("cbv");
+        let shape = vec![vs.len() as i64];
         let vt = ValueType::Tensor(TensorType {
             dtype: DType::Bool,
-            shape: vec![vs.len() as i64],
+            shape: shape.clone(),
         });
-        self.b
-            .op("const", vec![], vec![(&n, vt)], vec![(
-                "val".into(),
-                Value::bools(vs),
-            )])[0]
-            .clone()
+        let r = self.b.op(
+            "const",
+            vec![],
+            vec![(&n, vt)],
+            vec![("val".into(), Value::bools(vs))],
+        )[0]
+        .clone();
+        self.env_set(&r, &shape, DType::Bool);
+        r
     }
     pub(crate) fn k_f16t(&mut self, shape: &[i64], vs: &[f32]) -> String {
         let n = self.b.fresh("cf16t");
         let vt = ValueType::Tensor(TensorType::f16(shape));
-        self.b
-            .op("const", vec![], vec![(&n, vt)], vec![(
-                "val".into(),
-                Value::f16s(shape, vs),
-            )])[0]
-            .clone()
+        let r = self.b.op(
+            "const",
+            vec![],
+            vec![(&n, vt)],
+            vec![("val".into(), Value::f16s(shape, vs))],
+        )[0]
+        .clone();
+        self.env_set(&r, shape, DType::Fp16);
+        r
     }
     pub(crate) fn k_i32t(&mut self, shape: &[i64], vs: &[i32]) -> String {
         let n = self.b.fresh("ci32t");
@@ -288,8 +325,11 @@ impl<'a> Ctx<'a> {
             dtype: DType::Int32,
             shape: shape.to_vec(),
         });
-        self.b
-            .op("const", vec![], vec![(&n, vt)], vec![(
+        let r = self.b.op(
+            "const",
+            vec![],
+            vec![(&n, vt)],
+            vec![(
                 "val".into(),
                 Value::Imm(
                     ValueType::Tensor(TensorType {
@@ -298,8 +338,11 @@ impl<'a> Ctx<'a> {
                     }),
                     Immediate::Ints(vs.to_vec()),
                 ),
-            )])[0]
-            .clone()
+            )],
+        )[0]
+        .clone();
+        self.env_set(&r, shape, DType::Int32);
+        r
     }
 
     /// fp16 tensor const that goes to `weight.bin` at/above the inline
@@ -313,13 +356,15 @@ impl<'a> Ctx<'a> {
                 .collect();
             let off = self.wb.put(&n, DType::Fp16, shape, &raw);
             self.has_blob = true;
-            self.b.konst_blob(
+            let r = self.b.konst_blob(
                 &n,
                 "@model_path/weights/weight.bin",
                 off,
                 DType::Fp16,
                 shape,
-            )
+            );
+            self.env_set(&r, shape, DType::Fp16);
+            r
         } else {
             self.k_f16t(shape, vs)
         }
@@ -359,6 +404,7 @@ impl<'a> Ctx<'a> {
                         DType::Fp16,
                         &tp.dims,
                     )
+                    // env registered below via materialize's epilogue
                 } else {
                     let vt = ValueType::Tensor(TensorType::f16(&tp.dims));
                     self.b.op(
@@ -367,11 +413,17 @@ impl<'a> Ctx<'a> {
                         vec![(sn, vt)],
                         vec![("val".into(), Value::f16s(&tp.dims, &vs))],
                     )[0]
-                        .clone()
+                    .clone()
                 }
             }
-            elem::INT32 | elem::INT64 | elem::UINT8 | elem::INT8 | elem::UINT16
-            | elem::INT16 | elem::UINT32 | elem::UINT64 => {
+            elem::INT32
+            | elem::INT64
+            | elem::UINT8
+            | elem::INT8
+            | elem::UINT16
+            | elem::INT16
+            | elem::UINT32
+            | elem::UINT64 => {
                 let vs = tp.as_i64()?;
                 if vs.len() != tp.count() {
                     return Err(OnnxError::Malformed {
@@ -406,7 +458,7 @@ impl<'a> Ctx<'a> {
                         ),
                     )],
                 )[0]
-                    .clone()
+                .clone()
             }
             elem::BOOL => {
                 let vs: Vec<bool> = tp.as_i64()?.iter().map(|&v| v != 0).collect();
@@ -420,7 +472,7 @@ impl<'a> Ctx<'a> {
                     vec![(sn, vt)],
                     vec![("val".into(), Value::bools(&vs))],
                 )[0]
-                    .clone()
+                .clone()
             }
             t => {
                 return Err(OnnxError::Unsupported(format!(
@@ -460,10 +512,8 @@ impl<'a> Ctx<'a> {
         outs: Vec<(&str, DType, &[i64])>,
     ) -> Vec<String> {
         *self.hist.entry(ty.to_string()).or_insert(0) += 1;
-        let ov: Vec<(&str, ValueType)> = outs
-            .iter()
-            .map(|(n, d, s)| (*n, self.tt(*d, s)))
-            .collect();
+        let ov: Vec<(&str, ValueType)> =
+            outs.iter().map(|(n, d, s)| (*n, self.tt(*d, s))).collect();
         let names = self.b.op(ty, inputs, ov, vec![]);
         for (i, (n, d, s)) in outs.iter().enumerate() {
             self.env.insert(
@@ -566,9 +616,8 @@ impl<'a> Ctx<'a> {
 fn as_i32s(vs: &[i64]) -> Res<Vec<i32>> {
     vs.iter()
         .map(|&v| {
-            i32::try_from(v).map_err(|_| {
-                OnnxError::Unsupported(format!("attr int {v} exceeds int32"))
-            })
+            i32::try_from(v)
+                .map_err(|_| OnnxError::Unsupported(format!("attr int {v} exceeds int32")))
         })
         .collect()
 }
@@ -630,10 +679,7 @@ pub fn convert_graph(model: &ModelProto, opts: &ConvertOptions) -> Res<BuiltMode
         });
         fn_inputs.push(NVT {
             name: sn,
-            ty: ValueType::Tensor(TensorType {
-                dtype,
-                shape,
-            }),
+            ty: ValueType::Tensor(TensorType { dtype, shape }),
         });
     }
 
@@ -643,7 +689,11 @@ pub fn convert_graph(model: &ModelProto, opts: &ConvertOptions) -> Res<BuiltMode
             // re-tag bare errors with the node label
             OnnxError::Malformed { what, detail } => OnnxError::Malformed {
                 what,
-                detail: format!("node {} ({label}): {detail}", node.op_type, label = node.label(i)),
+                detail: format!(
+                    "node {} ({label}): {detail}",
+                    node.op_type,
+                    label = node.label(i)
+                ),
             },
             other => other,
         })?;
@@ -654,12 +704,12 @@ pub fn convert_graph(model: &ModelProto, opts: &ConvertOptions) -> Res<BuiltMode
     let mut block_outs = Vec::new();
     for vi in &g.outputs {
         let sn = cx.san(&vi.name);
-        let resolved = cx.resolve(&vi.name, "<graph output>").map_err(|_| {
-            OnnxError::MissingInput {
-                name: vi.name.clone(),
-                node: "graph output".into(),
-            }
-        })?;
+        let resolved =
+            cx.resolve(&vi.name, "<graph output>")
+                .map_err(|_| OnnxError::MissingInput {
+                    name: vi.name.clone(),
+                    node: "graph output".into(),
+                })?;
         let shape = match &vi.shape {
             Some(dims) => dims
                 .iter()
@@ -713,10 +763,9 @@ pub fn convert_graph(model: &ModelProto, opts: &ConvertOptions) -> Res<BuiltMode
 }
 
 fn static_shape(vi: &crate::model::ValueInfo, what: &str) -> Res<Vec<i64>> {
-    let dims = vi.shape.as_ref().ok_or_else(|| OnnxError::Unsupported(format!(
-        "{what} '{}' has no declared shape",
-        vi.name
-    )))?;
+    let dims = vi.shape.as_ref().ok_or_else(|| {
+        OnnxError::Unsupported(format!("{what} '{}' has no declared shape", vi.name))
+    })?;
     dims.iter()
         .map(|d| match d {
             Dim::Value(v) if *v >= 0 => Ok(*v),
@@ -740,8 +789,15 @@ fn static_shape(vi: &crate::model::ValueInfo, what: &str) -> Res<Vec<i64>> {
 fn feature_dtype(t: i32, name: &str) -> Res<DType> {
     match t {
         elem::FLOAT | elem::FLOAT16 | elem::DOUBLE => Ok(DType::Fp16),
-        elem::INT32 | elem::INT64 | elem::INT8 | elem::UINT8 | elem::INT16
-        | elem::UINT16 | elem::UINT32 | elem::UINT64 => Ok(DType::Int32),
+        elem::INT32
+        | elem::INT64
+        | elem::INT8
+        | elem::UINT8
+        | elem::INT16
+        | elem::UINT16
+        | elem::UINT32
+        | elem::UINT64 => Ok(DType::Int32),
+        elem::BOOL => Ok(DType::Bool),
         0 => Ok(DType::Fp16), // undeclared — assume float
         t => Err(OnnxError::Unsupported(format!(
             "feature '{name}': element type {t}"
@@ -844,7 +900,10 @@ fn map_node(cx: &mut Ctx, node: &NodeProto, idx: usize) -> Res<()> {
             let t = cx.info(&xs[0])?.clone();
             cx.e1(
                 "log",
-                vec![("x".into(), bind(&xs[0]).1), ("epsilon".into(), bind(&eps).1)],
+                vec![
+                    ("x".into(), bind(&xs[0]).1),
+                    ("epsilon".into(), bind(&eps).1),
+                ],
                 &out_sn,
                 t.dtype,
                 &t.shape,
@@ -863,7 +922,10 @@ fn map_node(cx: &mut Ctx, node: &NodeProto, idx: usize) -> Res<()> {
             let t = cx.info(&xs[0])?.clone();
             cx.e1(
                 "inverse",
-                vec![("x".into(), bind(&xs[0]).1), ("epsilon".into(), bind(&eps).1)],
+                vec![
+                    ("x".into(), bind(&xs[0]).1),
+                    ("epsilon".into(), bind(&eps).1),
+                ],
                 &out_sn,
                 t.dtype,
                 &t.shape,
@@ -966,7 +1028,10 @@ fn map_node(cx: &mut Ctx, node: &NodeProto, idx: usize) -> Res<()> {
             let t = cx.info(&xs[0])?.clone();
             cx.e1(
                 "prelu",
-                vec![("x".into(), bind(&xs[0]).1), ("alpha".into(), bind(&xs[1]).1)],
+                vec![
+                    ("x".into(), bind(&xs[0]).1),
+                    ("alpha".into(), bind(&xs[1]).1),
+                ],
                 &out_sn,
                 t.dtype,
                 &t.shape,
@@ -978,7 +1043,11 @@ fn map_node(cx: &mut Ctx, node: &NodeProto, idx: usize) -> Res<()> {
                 .attr_str("approximate")
                 .map(|s| s == "tanh")
                 .unwrap_or(false);
-            let m = cx.k_str(if approx { "TANH_APPROXIMATION" } else { "EXACT" });
+            let m = cx.k_str(if approx {
+                "TANH_APPROXIMATION"
+            } else {
+                "EXACT"
+            });
             let t = cx.info(&xs[0])?.clone();
             cx.e1(
                 "gelu",
@@ -1079,33 +1148,62 @@ fn map_node(cx: &mut Ctx, node: &NodeProto, idx: usize) -> Res<()> {
             );
         }
         // ---- softmax family ----
+        // Opset<13 Softmax/LogSoftmax coerce input to 2-D around `axis`
+        // ([prod(dims[:axis]), prod(dims[axis:])]) and normalize over
+        // axis 1; opset≥13 normalizes along `axis` directly.
         "Softmax" => {
             need(1)?;
             let t = cx.info(&xs[0])?.clone();
             let def = if cx.opset >= 13 { -1 } else { 1 };
             let ax = norm_axis(node.attr_i("axis", def), t.shape.len(), "Softmax")?;
-            let a = cx.k_i32s(ax as i32);
-            cx.e1(
-                "softmax",
-                vec![("x".into(), bind(&xs[0]).1), ("axis".into(), bind(&a).1)],
-                &out_sn,
-                t.dtype,
-                &t.shape,
-            );
+            if cx.opset < 13 {
+                let g0: i64 = t.shape[..ax as usize].iter().product();
+                let g1: i64 = t.shape[ax as usize..].iter().product();
+                let r1 = cx.b.fresh("sm_r1");
+                let flat = reshape_named(cx, &xs[0], &[g0, g1], &r1)?;
+                let a = cx.k_i32s(1);
+                let sm = cx.b.fresh("sm_2d");
+                let sm = cx.e1(
+                    "softmax",
+                    vec![("x".into(), bind(&flat).1), ("axis".into(), bind(&a).1)],
+                    &sm,
+                    t.dtype,
+                    &[g0, g1],
+                );
+                reshape_named(cx, &sm, &t.shape, &out_sn)?;
+            } else {
+                let a = cx.k_i32s(ax as i32);
+                cx.e1(
+                    "softmax",
+                    vec![("x".into(), bind(&xs[0]).1), ("axis".into(), bind(&a).1)],
+                    &out_sn,
+                    t.dtype,
+                    &t.shape,
+                );
+            }
         }
         "LogSoftmax" => {
             need(1)?;
             let t = cx.info(&xs[0])?.clone();
             let def = if cx.opset >= 13 { -1 } else { 1 };
             let ax = norm_axis(node.attr_i("axis", def), t.shape.len(), "LogSoftmax")?;
-            let lse_shape = reduce_shape(&t.shape, &[ax], true);
-            let a = cx.k_i32v(&[ax as i32]);
+            let (x2, s2, a2): (String, Vec<i64>, i64) = if cx.opset < 13 {
+                let g0: i64 = t.shape[..ax as usize].iter().product();
+                let g1: i64 = t.shape[ax as usize..].iter().product();
+                let r1 = cx.b.fresh("lsm_r1");
+                let flat = reshape_named(cx, &xs[0], &[g0, g1], &r1)?;
+                (flat, vec![g0, g1], 1)
+            } else {
+                (xs[0].clone(), t.shape.clone(), ax)
+            };
+            let lse_shape = reduce_shape(&s2, &[a2], true);
+            let a = cx.k_i32v(&[a2 as i32]);
             let kd = cx.k_bool(true);
             let lse_name = cx.b.fresh("lse");
             let lse = cx.e1(
                 "reduce_log_sum_exp",
                 vec![
-                    ("x".into(), bind(&xs[0]).1),
+                    ("x".into(), bind(&x2).1),
                     ("axes".into(), bind(&a).1),
                     ("keep_dims".into(), bind(&kd).1),
                 ],
@@ -1113,7 +1211,13 @@ fn map_node(cx: &mut Ctx, node: &NodeProto, idx: usize) -> Res<()> {
                 t.dtype,
                 &lse_shape,
             );
-            cx.binary("sub", &xs[0], &lse, &out_sn)?;
+            if cx.opset < 13 {
+                let sn = cx.b.fresh("lsm_sub");
+                let s = cx.binary("sub", &x2, &lse, &sn)?;
+                reshape_named(cx, &s, &t.shape, &out_sn)?;
+            } else {
+                cx.binary("sub", &xs[0], &lse, &out_sn)?;
+            }
         }
         "Hardmax" => {
             need(1)?;
@@ -1237,11 +1341,7 @@ fn map_node(cx: &mut Ctx, node: &NodeProto, idx: usize) -> Res<()> {
                         shape.push(t.shape[i]);
                     }
                     d if d > 0 => shape.push(d),
-                    d => {
-                        return Err(OnnxError::BadShape(format!(
-                            "Reshape '{label}': dim {d}"
-                        )))
-                    }
+                    d => return Err(OnnxError::BadShape(format!("Reshape '{label}': dim {d}"))),
                 }
             }
             let total = numel(&t.shape) as i64;
@@ -1293,9 +1393,12 @@ fn map_node(cx: &mut Ctx, node: &NodeProto, idx: usize) -> Res<()> {
                 let pp = norm_axis(p, rank, "Transpose")?;
                 out_shape[i] = t.shape[pp as usize];
             }
-            let p = cx.k_i32v(&as_i32s(&perm.iter().map(|&v| {
-                if v < 0 { v + rank as i64 } else { v }
-            }).collect::<Vec<_>>())?);
+            let p = cx.k_i32v(&as_i32s(
+                &perm
+                    .iter()
+                    .map(|&v| if v < 0 { v + rank as i64 } else { v })
+                    .collect::<Vec<_>>(),
+            )?);
             cx.e1(
                 "transpose",
                 vec![("x".into(), bind(&xs[0]).1), ("perm".into(), bind(&p).1)],
@@ -1370,11 +1473,9 @@ fn map_node(cx: &mut Ctx, node: &NodeProto, idx: usize) -> Res<()> {
                     &out_shape,
                 );
             } else {
-                let ax = axes.ok_or_else(|| {
-                    OnnxError::Malformed {
-                        what: "Unsqueeze".into(),
-                        detail: format!("node '{label}': missing axes"),
-                    }
+                let ax = axes.ok_or_else(|| OnnxError::Malformed {
+                    what: "Unsqueeze".into(),
+                    detail: format!("node '{label}': missing axes"),
                 })?;
                 let mut normed: Vec<usize> = ax
                     .iter()
@@ -1411,15 +1512,13 @@ fn map_node(cx: &mut Ctx, node: &NodeProto, idx: usize) -> Res<()> {
                         t.shape
                             .get(i + t.shape.len().saturating_sub(spec.len()))
                             .copied()
-                            .ok_or_else(|| OnnxError::BadShape(format!(
-                                "Expand '{label}': -1 at dim {i}"
-                            )))
+                            .ok_or_else(|| {
+                                OnnxError::BadShape(format!("Expand '{label}': -1 at dim {i}"))
+                            })
                     } else if d > 0 {
                         Ok(d)
                     } else {
-                        Err(OnnxError::BadShape(format!(
-                            "Expand '{label}': dim {d}"
-                        )))
+                        Err(OnnxError::BadShape(format!("Expand '{label}': dim {d}")))
                     }
                 })
                 .collect::<Res<Vec<_>>>()?;
@@ -1439,12 +1538,7 @@ fn map_node(cx: &mut Ctx, node: &NodeProto, idx: usize) -> Res<()> {
                     reps, t.shape
                 )));
             }
-            let out_shape: Vec<i64> = t
-                .shape
-                .iter()
-                .zip(&reps)
-                .map(|(&d, &r)| d * r)
-                .collect();
+            let out_shape: Vec<i64> = t.shape.iter().zip(&reps).map(|(&d, &r)| d * r).collect();
             let r = cx.k_i32v(&as_i32s(&reps)?);
             cx.e1(
                 "tile",
@@ -1750,7 +1844,10 @@ fn map_node(cx: &mut Ctx, node: &NodeProto, idx: usize) -> Res<()> {
                     ("axis".into(), bind(&a).1),
                     ("ascending".into(), bind(&asc).1),
                 ],
-                vec![(&vout, t.dtype, &out_shape), (&iout, DType::Int32, &out_shape)],
+                vec![
+                    (&vout, t.dtype, &out_shape),
+                    (&iout, DType::Int32, &out_shape),
+                ],
             );
             let _ = names;
         }
@@ -1807,7 +1904,10 @@ fn map_node(cx: &mut Ctx, node: &NodeProto, idx: usize) -> Res<()> {
             let b = cx.k_i32s(bs as i32);
             cx.e1(
                 "depth_to_space",
-                vec![("x".into(), bind(&xs[0]).1), ("block_size".into(), bind(&b).1)],
+                vec![
+                    ("x".into(), bind(&xs[0]).1),
+                    ("block_size".into(), bind(&b).1),
+                ],
                 &out_sn,
                 t.dtype,
                 &out_shape,
@@ -1833,7 +1933,10 @@ fn map_node(cx: &mut Ctx, node: &NodeProto, idx: usize) -> Res<()> {
             let b = cx.k_i32s(bs as i32);
             cx.e1(
                 "space_to_depth",
-                vec![("x".into(), bind(&xs[0]).1), ("block_size".into(), bind(&b).1)],
+                vec![
+                    ("x".into(), bind(&xs[0]).1),
+                    ("block_size".into(), bind(&b).1),
+                ],
                 &out_sn,
                 t.dtype,
                 &out_shape,
@@ -1924,10 +2027,12 @@ fn map_node(cx: &mut Ctx, node: &NodeProto, idx: usize) -> Res<()> {
         }
         "Einsum" => {
             need(1)?;
-            let eq = node.attr_str("equation").ok_or_else(|| OnnxError::Malformed {
-                what: "Einsum".into(),
-                detail: format!("node '{label}': missing equation"),
-            })?;
+            let eq = node
+                .attr_str("equation")
+                .ok_or_else(|| OnnxError::Malformed {
+                    what: "Einsum".into(),
+                    detail: format!("node '{label}': missing equation"),
+                })?;
             // shape inference for einsum is non-trivial — require value_info
             return Err(OnnxError::Unsupported(format!(
                 "Einsum '{label}' ({eq}): use value_info-free graphs — unmapped"
@@ -1980,10 +2085,7 @@ impl<'a> Ctx<'a> {
         let shape = bcast(&a.shape, &b.shape)?;
         self.e1(
             ty,
-            vec![
-                ("x".into(), bind(&xs[0]).1),
-                ("y".into(), bind(&xs[1]).1),
-            ],
+            vec![("x".into(), bind(&xs[0]).1), ("y".into(), bind(&xs[1]).1)],
             out,
             DType::Bool,
             &shape,
@@ -2242,7 +2344,11 @@ fn map_conv(cx: &mut Ctx, node: &NodeProto, xs: &[String], out: &str) -> Res<()>
         strides
     };
     let dils = node.attr_ints("dilations");
-    let dils: Vec<i64> = if dils.is_empty() { vec![1; spatial] } else { dils };
+    let dils: Vec<i64> = if dils.is_empty() {
+        vec![1; spatial]
+    } else {
+        dils
+    };
     let groups = node.attr_i("group", 1) as i32;
     let kshape: Vec<i64> = w.shape[2..].to_vec();
     let (pad_type, pads, out_spatial) = match auto.as_str() {
@@ -2250,23 +2356,22 @@ fn map_conv(cx: &mut Ctx, node: &NodeProto, xs: &[String], out: &str) -> Res<()>
             "valid".to_string(),
             vec![0i64; spatial * 2],
             (0..spatial)
-                .map(|i| {
-                    conv_out_dim(
-                        t.shape[2 + i],
-                        0,
-                        0,
-                        kshape[i],
-                        dils[i],
-                        strides[i],
-                    )
-                })
+                .map(|i| conv_out_dim(t.shape[2 + i], 0, 0, kshape[i], dils[i], strides[i]))
                 .collect::<Vec<i64>>(),
         ),
         "SAME_UPPER" | "SAME_LOWER" => (
-            if auto == "SAME_LOWER" { "same_lower" } else { "same" }.to_string(),
+            if auto == "SAME_LOWER" {
+                "same_lower"
+            } else {
+                "same"
+            }
+            .to_string(),
             vec![0i64; spatial * 2],
             (0..spatial)
-                .map(|i| t.shape[2 + i].div_euclid(strides[i]) + i64::from(t.shape[2 + i] % strides[i] != 0))
+                .map(|i| {
+                    t.shape[2 + i].div_euclid(strides[i])
+                        + i64::from(t.shape[2 + i] % strides[i] != 0)
+                })
                 .collect(),
         ),
         _ => {
@@ -2375,10 +2480,7 @@ fn map_conv_transpose(cx: &mut Ctx, node: &NodeProto, xs: &[String], out: &str) 
     let mut out_shape = vec![t.shape[0], w.shape[1] * groups as i64];
     let mut full_out = Vec::with_capacity(spatial);
     for i in 0..spatial {
-        let d = strides[i] * (t.shape[2 + i] - 1)
-            + opad[i]
-            + (kshape[i] - 1) * dils[i]
-            + 1
+        let d = strides[i] * (t.shape[2 + i] - 1) + opad[i] + (kshape[i] - 1) * dils[i] + 1
             - pads[i]
             - pads[i + spatial];
         if d <= 0 {
@@ -2469,7 +2571,14 @@ fn map_pool(cx: &mut Ctx, node: &NodeProto, xs: &[String], out: &str, avg: bool)
                 let s = strides[i];
                 t.shape[2 + i].div_euclid(s) + i64::from(t.shape[2 + i] % s != 0)
             } else {
-                pool_out_dim(t.shape[2 + i], pads[i], pads[i + spatial], ks[i], strides[i], ceil)
+                pool_out_dim(
+                    t.shape[2 + i],
+                    pads[i],
+                    pads[i + spatial],
+                    ks[i],
+                    strides[i],
+                    ceil,
+                )
             }
         })
         .collect();
@@ -2504,13 +2613,7 @@ fn map_pool(cx: &mut Ctx, node: &NodeProto, xs: &[String], out: &str, avg: bool)
     Ok(())
 }
 
-fn map_global_pool(
-    cx: &mut Ctx,
-    node: &NodeProto,
-    xs: &[String],
-    out: &str,
-    avg: bool,
-) -> Res<()> {
+fn map_global_pool(cx: &mut Ctx, node: &NodeProto, xs: &[String], out: &str, avg: bool) -> Res<()> {
     let t = cx.info(&xs[0])?.clone();
     let spatial = t.shape.len() - 2;
     let ks: Vec<i32> = t.shape[2..].iter().map(|&d| d as i32).collect();
@@ -2545,13 +2648,7 @@ fn map_global_pool(
     Ok(())
 }
 
-fn map_gather(
-    cx: &mut Ctx,
-    node: &NodeProto,
-    xs: &[String],
-    out: &str,
-    label: &str,
-) -> Res<()> {
+fn map_gather(cx: &mut Ctx, node: &NodeProto, xs: &[String], out: &str, label: &str) -> Res<()> {
     let t = cx.info(&xs[0])?.clone();
     let it = cx.info(&xs[1])?.clone();
     let ax = norm_axis(node.attr_i("axis", 0), t.shape.len(), "Gather")?;
@@ -2594,7 +2691,13 @@ fn map_gather(
         reshape_named(cx, &g, &out_shape, out)?;
     } else {
         let gi = cx.info(&g)?.clone();
-        cx.e1("identity", vec![("x".into(), bind(&g).1)], out, gi.dtype, &gi.shape);
+        cx.e1(
+            "identity",
+            vec![("x".into(), bind(&g).1)],
+            out,
+            gi.dtype,
+            &gi.shape,
+        );
     }
     let _ = label;
     Ok(())
@@ -2760,14 +2863,16 @@ fn map_cast(cx: &mut Ctx, node: &NodeProto, xs: &[String], out: &str) -> Res<()>
     // only when input was already fp32 — it never is), ints → int32.
     let (dt, mil_ty) = match to {
         elem::FLOAT | elem::FLOAT16 | elem::DOUBLE | elem::BFLOAT16 => (DType::Fp16, "fp16"),
-        elem::INT32 | elem::INT64 | elem::INT8 | elem::UINT8 | elem::INT16 | elem::UINT16
-        | elem::UINT32 | elem::UINT64 => (DType::Int32, "int32"),
+        elem::INT32
+        | elem::INT64
+        | elem::INT8
+        | elem::UINT8
+        | elem::INT16
+        | elem::UINT16
+        | elem::UINT32
+        | elem::UINT64 => (DType::Int32, "int32"),
         elem::BOOL => (DType::Bool, "bool"),
-        t => {
-            return Err(OnnxError::Unsupported(format!(
-                "Cast '{label}': to={t}"
-            )))
-        }
+        t => return Err(OnnxError::Unsupported(format!("Cast '{label}': to={t}"))),
     };
     if dt == t.dtype {
         cx.alias.insert(out.to_string(), xs[0].clone());
@@ -2830,7 +2935,11 @@ fn map_constant(cx: &mut Ctx, node: &NodeProto, out: &str) -> Res<()> {
         )
     } else if let Some(a) = node.attrs.get("value_floats") {
         let vs = a.floats.clone();
-        (Value::f16s(&[vs.len() as i64], &vs), DType::Fp16, vec![vs.len() as i64])
+        (
+            Value::f16s(&[vs.len() as i64], &vs),
+            DType::Fp16,
+            vec![vs.len() as i64],
+        )
     } else if let Some(a) = node.attrs.get("value_ints") {
         let vs = as_i32s(&a.ints)?;
         (
@@ -2850,8 +2959,7 @@ fn map_constant(cx: &mut Ctx, node: &NodeProto, out: &str) -> Res<()> {
         )));
     };
     let vt = cx.tt(dt, &shape);
-    cx.b
-        .op("const", vec![], vec![(out, vt)], vec![("val".into(), val)]);
+    cx.b.op("const", vec![], vec![(out, vt)], vec![("val".into(), val)]);
     cx.env.insert(out.to_string(), TInfo { shape, dtype: dt });
     *cx.hist.entry("const".to_string()).or_insert(0) += 1;
     Ok(())
@@ -2877,14 +2985,13 @@ fn map_pad(cx: &mut Ctx, node: &NodeProto, xs: &[String], out: &str, label: &str
         "constant" => "constant",
         "reflect" => "reflect",
         "edge" => "replicate",
-        m => {
-            return Err(OnnxError::Unsupported(format!(
-                "Pad '{label}': mode '{m}'"
-            )))
-        }
+        m => return Err(OnnxError::Unsupported(format!("Pad '{label}': mode '{m}'"))),
     };
     let cval = if xs.len() > 2 && !xs[2].is_empty() {
-        cx.static_f32(&node.inputs[2], label)?.first().copied().unwrap_or(0.0)
+        cx.static_f32(&node.inputs[2], label)?
+            .first()
+            .copied()
+            .unwrap_or(0.0)
     } else {
         node.attr_f("value", 0.0)
     };

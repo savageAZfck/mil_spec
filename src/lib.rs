@@ -42,6 +42,8 @@
 #![forbid(unsafe_code)]
 
 pub mod ir;
+pub mod proto;
+pub mod sha256;
 
 use std::io::{Seek, SeekFrom, Write};
 
@@ -3098,6 +3100,12 @@ pub struct ModelMeta {
     pub creator: String,
     /// `metadata.shortDescription` — human-readable model description.
     pub description: String,
+    /// `metadata.userDefined` (field 16, `map<string,string>`) —
+    /// free-form key/value metadata. coremltools uses this map for its
+    /// own bookkeeping (`com.github.apple.coremltools.*`); mil_convert
+    /// stores provenance and feature markers under `mil.*`.
+    /// Emitted in sorted key order for deterministic encoding.
+    pub user_defined: std::collections::BTreeMap<String, String>,
 }
 
 impl ModelMeta {
@@ -3108,6 +3116,7 @@ impl ModelMeta {
             opset: opset.to_string(),
             creator: "mil-spec".into(),
             description: "CoreML mlprogram written by mil-spec".into(),
+            user_defined: std::collections::BTreeMap::new(),
         }
     }
     /// Builder: set `metadata.creator`.
@@ -3118,6 +3127,11 @@ impl ModelMeta {
     /// Builder: set `metadata.shortDescription`.
     pub fn description(mut self, d: &str) -> Self {
         self.description = d.to_string();
+        self
+    }
+    /// Builder: add a `metadata.userDefined` entry.
+    pub fn user_meta(mut self, key: &str, value: &str) -> Self {
+        self.user_defined.insert(key.to_string(), value.to_string());
         self
     }
 }
@@ -3227,6 +3241,10 @@ pub fn encode_model_flex(
     f_str(&mut meta_msg, 1, &meta.description);
     f_str(&mut meta_msg, 2, "1.0");
     f_str(&mut meta_msg, 3, &meta.creator);
+    // userDefined = 16 (map<string,string>) — sorted for determinism.
+    for (k, v) in &meta.user_defined {
+        map_entry_str(&mut meta_msg, 16, k, v.as_bytes());
+    }
     f_msg(&mut desc, 100, &meta_msg);
 
     // Model { specVersion=1, description=2, mlProgram=502 }

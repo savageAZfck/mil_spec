@@ -16,6 +16,13 @@
 //!   a function input; every declared block output exists; every blob
 //!   reference lands inside `weight.bin`.
 //!
+//! - **Golden vectors** — [`golden`] freezes the [`reference`]
+//!   forward's logits for a fixed prompt into a versioned,
+//!   SHA-256-checksummed record (per-position top-k or full), then
+//!   re-checks a compiled package's logits against it: top-1
+//!   agreement, top-k overlap, bounded value drift, no NaNs. A
+//!   corrupted weight has to *fail* — the e2e plants one to prove it.
+//!
 //! The conformance battery runs valid graphs (must pass) alongside
 //! planted-invalid controls (must fail). If the controls ever pass, the
 //! verifier itself is broken — the same "dishonest harness" guard as
@@ -30,6 +37,11 @@
 
 #![forbid(unsafe_code)]
 
+/// Versioned golden-vector records: generate a fixed-prompt logit
+/// snapshot from the reference forward, then prove a compiled package
+/// still agrees with it — plus the CPU-vs-default-units differential
+/// helpers. See `golden` module docs for the record format.
+pub mod golden;
 /// Independent pure-Rust HF forward used to anchor converter tests.
 pub mod reference;
 

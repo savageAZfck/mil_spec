@@ -75,6 +75,17 @@ pub struct Options {
     /// the default (the emitted type declarations use it as the shape
     /// value). Empty/`len == 1` → the fixed `seq` graph.
     pub seq_lens: Vec<i64>,
+    /// Weight-const names the caller wants marked updatable
+    /// (`--updatable l5_wq,l5_wk,...`).
+    ///
+    /// **Honest limitation:** CoreML's real updatable-model machinery
+    /// (`NeuralNetwork.updatable`, the on-device update spec) exists
+    /// only on the neural-network proto — `mlProgram` has no
+    /// per-op/`isUpdatable` field for coremltools' `set_updatable` to
+    /// map onto. So this emits a documented `mil.updatable` entry in
+    /// `description.metadata.userDefined` naming the weights, nothing
+    /// more. Empty → no marker.
+    pub updatable: Vec<String>,
 }
 
 impl Default for Options {
@@ -91,6 +102,7 @@ impl Default for Options {
             plan: None,
             quant_policy: None,
             seq_lens: Vec::new(),
+            updatable: Vec::new(),
         }
     }
 }

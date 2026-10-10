@@ -33,6 +33,11 @@ fn main() -> ExitCode {
         "run" => cmd_run(&args[1..]),
         "verify" => ExitCode::from(mil_verify::run_battery() as u8),
         "check" => cmd_check(&args[1..]),
+        "fuse-lora" => cmd_fuse_lora(&args[1..]),
+        "requant" => cmd_requant(&args[1..]),
+        "graft" => cmd_graft(&args[1..]),
+        "reshape" => cmd_reshape(&args[1..]),
+        "attest" => cmd_attest(&args[1..]),
         "machine" => cmd_machine(&args[1..]),
         "help" | "-h" | "--help" => {
             usage();
@@ -65,6 +70,11 @@ fn usage() {
          \x20 milc run     <model.mlmodelc> [--units ane|gpu|all|cpu] [--steps N]\n\
          \x20 milc verify\n\
          \x20 milc check   <pkg.mlpackage>\n\
+         \x20 milc fuse-lora <pkg> --lora <adapter> -o <pkg>        # fuse adapter into package weights\n\
+         \x20 milc requant  <pkg> --to <int8|fp16|palette4> [-o <pkg>]\n\
+         \x20 milc graft    <donor> --layers a..b --onto <base> -o <pkg>\n\
+         \x20 milc reshape  <pkg> --seq-lens a,b,c [-o <pkg>]        # rewrite EnumeratedShapes\n\
+         \x20 milc attest   <pkg> [--source <dir>]                   # verify embedded provenance\n\
          \x20 milc machine dfa <patterns.txt> -o <pkg.mlpackage>   # blocklist → stateful DFA\n\
          \x20 milc machine sentinel -o <pkg.mlpackage> [--alpha A] [--eps E] [--thresh T]\n\
          \x20 milc machine memory -o <pkg.mlpackage> [--slots N] [--dim D]\n"
@@ -167,6 +177,21 @@ fn cmd_convert(args: &[String]) -> ExitCode {
                 // / *.npz) or a bare safetensors/npz file. Baked into the
                 // emitted weights as W + scale·(B @ A).
                 opts.lora = args.get(i + 1).map(PathBuf::from);
+                i += 2;
+            }
+            "--updatable" => {
+                // Metadata marker only — mlProgram has no real updatable
+                // field (that's a NeuralNetwork-spec feature). Names go
+                // into `mil.updatable` userDefined metadata.
+                opts.updatable = args
+                    .get(i + 1)
+                    .map(|s| {
+                        s.split(',')
+                            .map(|t| t.trim().to_string())
+                            .filter(|t| !t.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 i += 2;
             }
             other if !other.starts_with('-') => {
@@ -515,6 +540,34 @@ fn cmd_inspect(args: &[String]) -> ExitCode {
             if !s.block_outputs.is_empty() {
                 println!("block outputs: {}", s.block_outputs.join(", "));
             }
+            // userDefined metadata (provenance, updatable markers) —
+            // packages only; bare .mlmodel files have no manifest dir.
+            if path.is_dir() {
+                if let Ok(ud) = mil_convert::attest::read_user_defined(&path) {
+                    if !ud.is_empty() {
+                        println!("metadata ({}):", ud.len());
+                        for (k, v) in &ud {
+                            println!("  {k} = {v}");
+                        }
+                    }
+                }
+                if let Ok(pe) = mil_convert::surgery::PackageEdit::open(&path) {
+                    if let Ok(groups) = pe.weight_groups() {
+                        if !groups.is_empty() {
+                            println!("weight groups ({}):", groups.len());
+                            for g in &groups {
+                                println!(
+                                    "  {:<16} {:<8} {:?} ({} member(s))",
+                                    g.name,
+                                    g.kind.as_str(),
+                                    g.shape,
+                                    g.members.len()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             ExitCode::SUCCESS
         }
         None => {
@@ -793,6 +846,265 @@ fn cmd_check(args: &[String]) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+// ======== package surgery + provenance commands ========
+
+fn surg_out(r: mil_convert::surgery::SurgReport) -> ExitCode {
+    for l in &r.lines {
+        println!("{l}");
+    }
+    if let Some(w) = &r.written {
+        println!(
+            "wrote {} ({} ops, {} weight bytes, {} blobs)",
+            w.package.display(),
+            w.op_count,
+            w.weight_bytes,
+            w.blob_count
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// `milc fuse-lora <pkg> --lora <adapter> -o <pkg>` — fuse an adapter
+/// into a built package's weight blobs (same W + scale·(B@A) math as
+/// `convert --lora`, verified by the deterministic const names).
+fn cmd_fuse_lora(args: &[String]) -> ExitCode {
+    let mut pkg: Option<PathBuf> = None;
+    let mut lora: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--lora" => {
+                lora = args.get(i + 1).map(PathBuf::from);
+                i += 2;
+            }
+            "-o" | "--out" => {
+                out = args.get(i + 1).map(PathBuf::from);
+                i += 2;
+            }
+            other if !other.starts_with('-') => {
+                if pkg.is_none() {
+                    pkg = Some(PathBuf::from(other));
+                }
+                i += 1;
+            }
+            other => {
+                eprintln!("milc fuse-lora: unknown flag {other}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let (Some(pkg), Some(lora), Some(out)) = (pkg, lora, out) else {
+        eprintln!("milc fuse-lora: needs <pkg> --lora <adapter> -o <pkg>");
+        return ExitCode::from(2);
+    };
+    match mil_convert::surgery::fuse_lora(&pkg, &lora, &out) {
+        Ok(r) => surg_out(r),
+        Err(e) => {
+            eprintln!("milc fuse-lora: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `milc requant <pkg> --to <int8|fp16|palette4> [-o <pkg>]` — re-encode
+/// eligible weight groups. In-place when `-o` is omitted.
+fn cmd_requant(args: &[String]) -> ExitCode {
+    let mut pkg: Option<PathBuf> = None;
+    let mut to: Option<mil_convert::surgery::TargetQuant> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--to" => {
+                let v = args.get(i + 1).map(String::as_str).unwrap_or("");
+                match mil_convert::surgery::TargetQuant::parse(v) {
+                    Some(t) => to = Some(t),
+                    None => {
+                        eprintln!("milc requant: --to int8|fp16|palette4, got {v:?}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            "-o" | "--out" => {
+                out = args.get(i + 1).map(PathBuf::from);
+                i += 2;
+            }
+            other if !other.starts_with('-') => {
+                if pkg.is_none() {
+                    pkg = Some(PathBuf::from(other));
+                }
+                i += 1;
+            }
+            other => {
+                eprintln!("milc requant: unknown flag {other}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let (Some(pkg), Some(t)) = (pkg, to) else {
+        eprintln!("milc requant: needs <pkg> --to <int8|fp16|palette4>");
+        return ExitCode::from(2);
+    };
+    match mil_convert::surgery::requant(&pkg, t, out.as_deref()) {
+        Ok(r) => surg_out(r),
+        Err(e) => {
+            eprintln!("milc requant: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `milc graft <donor> --layers a..b --onto <base> -o <pkg>` — splice
+/// donor layer weights into a same-architecture base.
+fn cmd_graft(args: &[String]) -> ExitCode {
+    let mut donor: Option<PathBuf> = None;
+    let mut base: Option<PathBuf> = None;
+    let mut layers: Option<(usize, usize)> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--layers" => {
+                let v = args.get(i + 1).map(String::as_str).unwrap_or("");
+                match mil_convert::surgery::parse_layer_range(v) {
+                    Ok(r) => layers = Some(r),
+                    Err(e) => {
+                        eprintln!("milc graft: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            "--onto" => {
+                base = args.get(i + 1).map(PathBuf::from);
+                i += 2;
+            }
+            "-o" | "--out" => {
+                out = args.get(i + 1).map(PathBuf::from);
+                i += 2;
+            }
+            other if !other.starts_with('-') => {
+                if donor.is_none() {
+                    donor = Some(PathBuf::from(other));
+                }
+                i += 1;
+            }
+            other => {
+                eprintln!("milc graft: unknown flag {other}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let (Some(donor), Some(layers), Some(base), Some(out)) = (donor, layers, base, out) else {
+        eprintln!("milc graft: needs <donor> --layers a..b --onto <base> -o <pkg>");
+        return ExitCode::from(2);
+    };
+    match mil_convert::surgery::graft(&donor, &base, layers, &out) {
+        Ok(r) => surg_out(r),
+        Err(e) => {
+            eprintln!("milc graft: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `milc reshape <pkg> --seq-lens a,b,c [-o <pkg>]` — rewrite
+/// EnumeratedShapes on a flexible-shape package. In-place without -o.
+fn cmd_reshape(args: &[String]) -> ExitCode {
+    let mut pkg: Option<PathBuf> = None;
+    let mut seq_lens: Option<Vec<i64>> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--seq-lens" => {
+                seq_lens = args.get(i + 1).map(|s| {
+                    s.split(',')
+                        .filter_map(|t| t.trim().parse::<i64>().ok())
+                        .collect()
+                });
+                i += 2;
+            }
+            "-o" | "--out" => {
+                out = args.get(i + 1).map(PathBuf::from);
+                i += 2;
+            }
+            other if !other.starts_with('-') => {
+                if pkg.is_none() {
+                    pkg = Some(PathBuf::from(other));
+                }
+                i += 1;
+            }
+            other => {
+                eprintln!("milc reshape: unknown flag {other}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let (Some(pkg), Some(lens)) = (pkg, seq_lens) else {
+        eprintln!("milc reshape: needs <pkg> --seq-lens a,b,c");
+        return ExitCode::from(2);
+    };
+    match mil_convert::surgery::reshape(&pkg, &lens, out.as_deref()) {
+        Ok(r) => surg_out(r),
+        Err(e) => {
+            eprintln!("milc reshape: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `milc attest <pkg> [--source <dir>]` — verify embedded provenance:
+/// weight.bin hash always; per-source-file hashes with --source.
+fn cmd_attest(args: &[String]) -> ExitCode {
+    let mut pkg: Option<PathBuf> = None;
+    let mut source: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--source" => {
+                source = args.get(i + 1).map(PathBuf::from);
+                i += 2;
+            }
+            other if !other.starts_with('-') => {
+                if pkg.is_none() {
+                    pkg = Some(PathBuf::from(other));
+                }
+                i += 1;
+            }
+            other => {
+                eprintln!("milc attest: unknown flag {other}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(pkg) = pkg else {
+        eprintln!("milc attest: needs <pkg>");
+        return ExitCode::from(2);
+    };
+    match mil_convert::attest::verify(&pkg, source.as_deref()) {
+        Ok(r) => {
+            if r.has_provenance {
+                println!("provenance:");
+            }
+            for l in &r.lines {
+                println!("  {l}");
+            }
+            if r.ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(e) => {
+            eprintln!("milc attest: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 

@@ -166,10 +166,13 @@ impl TensorProto {
                 }
             }
             elem::INT64 => Ok(self.as_i64()?.iter().map(|&v| v as f32).collect()),
-            elem::INT32 | elem::UINT8 | elem::INT8 | elem::UINT16 | elem::INT16
-            | elem::UINT32 | elem::BOOL => {
-                Ok(self.as_i64()?.iter().map(|&v| v as f32).collect())
-            }
+            elem::INT32
+            | elem::UINT8
+            | elem::INT8
+            | elem::UINT16
+            | elem::INT16
+            | elem::UINT32
+            | elem::BOOL => Ok(self.as_i64()?.iter().map(|&v| v as f32).collect()),
             t => Err(OnnxError::Unsupported(format!(
                 "tensor '{}': dtype {} cannot be read as f32",
                 self.name,
@@ -209,8 +212,13 @@ impl TensorProto {
                     Ok(self.int64_data.clone())
                 }
             }
-            elem::INT32 | elem::UINT8 | elem::INT8 | elem::UINT16 | elem::INT16
-            | elem::UINT32 | elem::BOOL => {
+            elem::INT32
+            | elem::UINT8
+            | elem::INT8
+            | elem::UINT16
+            | elem::INT16
+            | elem::UINT32
+            | elem::BOOL => {
                 if self.raw.is_some() {
                     let w = match self.data_type {
                         elem::INT32 | elem::UINT32 => 4,

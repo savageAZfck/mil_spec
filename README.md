@@ -97,7 +97,7 @@ See `examples/compile_ir.rs` for a stateful KV-cache program.
 | **`mil_lint`** | The differentiator — static **ANE-placement analysis**. Predicts per-op execution unit (ANE/GPU/CPU) with a stated rule *before* you compile, flags CPU islands and fp32 regions, and estimates dispatch count — the number that decides whether a graph lives or dies on the ANE. coremltools can't do this at all. |
 | **`mil_compile`** | `.mlpackage` → `.mlmodelc`. Two backends: in-process `MLModel compileModelAtURL:` via the Objective-C runtime (no `xcrun`, no subprocess), and an `xcrun coremlc` driver with structured errors and `.mlmodelc` discovery. |
 | **`mil_verify`** | Reads specs back: generic protobuf decoder, structural diff (`milc diff` shows why `coremlc` rejected your graph), name-resolution validation, `weight.bin` integrity, and a conformance battery — valid graphs must pass, planted-invalid controls must fail, or the verifier itself is broken. |
-| **`milc`** | The CLI over all of it: `convert`, `lint`, `inspect`, `diff`, `compile`, `verify`, `check`. |
+| **`milc`** | The CLI over all of it: `convert`, `lint`, `inspect`, `diff`, `compile`, `verify`, `check`, plus package surgery (`fuse-lora`, `requant`, `graft`, `reshape`) and `attest`. |
 
 ```bash
 cargo build --release -p milc
@@ -112,6 +112,77 @@ milc verify                     # conformance battery
 
 A converted decoder reports ~100% ANE placement and 1 estimated dispatch —
 the fat-graph shape the 11-shard drafter needed.
+
+## Package surgery
+
+`mil_convert::surgery` is a generic editor over a built `.mlpackage`:
+decode the spec, index every weight group (raw fp16 consts, int8 and
+Q4-block `constexpr_blockwise_shift_scale`, palette4
+`constexpr_lut_to_dense`), stage blob replacements, and rewrite spec +
+`weight.bin` in one pass — with op-binding validation before a byte
+lands on disk. The CLI commands are thin shells over it:
+
+```bash
+milc fuse-lora drafter.mlpackage --lora adapters/dream -o tuned.mlpackage
+milc requant   drafter.mlpackage --to int8|fp16|palette4 [-o out.mlpackage]
+milc graft     donor.mlpackage --layers 0..4 --onto base.mlpackage -o out.mlpackage
+milc reshape   flex.mlpackage --seq-lens 2,8,32 [-o out.mlpackage]
+```
+
+- **fuse-lora** fuses adapter deltas into an existing package's weight
+  blobs. The packaged-const → HF-tensor mapping is *verifiable* because
+  `mil_convert` names conv weight consts deterministically
+  (`l{L}_{wq,wk,wv,wo,wg,wu,wd}`, `lm_w`); each target is decoded to
+  f32, fused through the same `W + scale·(B @ A)` path as
+  `convert --lora`, and re-emitted in its original encoding (int8 stays
+  int8 with fresh scales). An adapter for the wrong checkpoint is a
+  hard error before anything is written.
+- **requant** re-encodes conv weights in place. fp16 → int8/palette4,
+  int8 → fp16/palette4, palette4 → fp16 — decoded through f32, emitted
+  deterministically. Norm weights and biases stay fp16, matching the
+  converter's own policy. Without `-o` the package is rewritten
+  atomically in place (temp dir + rename).
+- **graft** splices `l{N}_*` layer weight groups from a donor package
+  into a same-architecture base — op stream and model description must
+  match exactly or it refuses, and payloads are copied losslessly
+  (same encoding, same shape).
+- **reshape** rewrites `EnumeratedShapes` on a flexible-shape package
+  (the `convert --seq-lens` kind): every varying dim must track the
+  same old list, and the new set becomes the enumerated entries with
+  `seq_lens[0]` as default.
+
+## Provenance (`milc attest`)
+
+Every `mil_convert` package now carries a provenance block in
+`description.metadata.userDefined` — the real CoreML key/value map, no
+fake fields. Keys are `mil.prov.*`: toolchain + version, unix
+timestamp, SHA-256 of the canonical config and options, SHA-256 of
+`weight.bin`, and a `name size sha256` fingerprint per source weight
+file in deterministic order.
+
+```bash
+milc attest drafter.mlpackage                    # re-hashes weight.bin
+milc attest drafter.mlpackage --source Qwen3-0.6B  # + source fingerprints
+```
+
+Tampered `weight.bin` or a mismatched source file exits nonzero;
+packages without provenance (older conversions, foreign tools) are
+reported, not failed. Package surgery refreshes `mil.prov.weights` so
+a legitimately-edited package still attests — that's the provenance
+describing what the package *contains*.
+
+## Updatable layers — the honest answer
+
+CoreML's real updatable-model machinery (`NeuralNetwork.updatable`,
+the `set_updatable` flags coremltools flips) lives on the
+**neural-network proto**. `mlProgram` — what this toolchain emits —
+has no per-op or per-const updatable field for it to map onto, so
+there is nothing real to set. Instead `convert --updatable a,b,c`
+writes a documented `mil.updatable` marker in the userDefined
+metadata naming the weight consts; `milc inspect` shows it and the
+package compiles unchanged. It is intent metadata, not CoreML
+on-device training support — anything claiming otherwise would be a
+fake.
 
 ## Why a hand-rolled writer
 

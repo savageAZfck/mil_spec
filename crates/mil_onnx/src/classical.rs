@@ -63,7 +63,7 @@
 use crate::map::Ctx;
 use crate::model::NodeProto;
 use crate::{BuiltModel, OnnxError};
-use mil_spec::{bind, DType, Feature, NVT, TensorType, Value, ValueType};
+use mil_spec::{bind, DType, Feature, TensorType, Value, ValueType, NVT};
 use std::collections::{HashMap, HashSet};
 
 type Res<T> = Result<T, OnnxError>;
@@ -173,8 +173,6 @@ struct EnsMats {
     off: Vec<f32>,
     /// `(L, K)` leaf values (tree weight folded in).
     v: Vec<f32>,
-    /// `(K,)` base values.
-    base: Vec<f32>,
     /// Outputs per score (classes/targets).
     k: usize,
 }
@@ -182,11 +180,7 @@ struct EnsMats {
 /// DFS a tree, accumulating path predicates into the violation matrices.
 /// `path` holds `(pivot_col, off, cle, clt)` violation contributions per
 /// ancestor step.
-fn build_tree_mats(
-    nodes: &HashMap<i64, TNode>,
-    root: i64,
-    ctx: &mut EnsBuild,
-) -> Res<()> {
+fn build_tree_mats(nodes: &HashMap<i64, TNode>, root: i64, ctx: &mut EnsBuild) -> Res<()> {
     fn walk(
         nodes: &HashMap<i64, TNode>,
         id: i64,
@@ -280,12 +274,14 @@ fn count_leaves(trees: &[TreeJSON]) -> usize {
 }
 
 /// Lower an ensemble to MIL ops on `x` (rank-2 `(B, F)` producer name).
-/// Returns the `(B, K)` score tensor name.
+/// Returns the `(B, K)` **votes** tensor — the raw leaf-value
+/// combination *without* `base_values`, so callers can apply the
+/// aggregate (`SUM`/`AVERAGE`) before adding the base (ONNX semantics:
+/// `post(aggregate(votes) + base)`).
 fn lower_ensemble(
     cx: &mut Ctx,
     trees: &[TreeJSON],
     n_out: usize,
-    base_values: &[f64],
     x: &str,
     x_shape: &[i64],
     pfx: &str,
@@ -335,7 +331,6 @@ fn lower_ensemble(
         mlt_t: compact(&build.mlt_t),
         off: build.off[..l].to_vec(),
         v: v[..l * k].to_vec(),
-        base: base_values.iter().map(|&x| x as f32).collect(),
         k,
     };
     emit_ensemble(cx, &mats, x, b, pfx)
@@ -360,20 +355,20 @@ fn find_root(map: &HashMap<i64, TNode>, t: &TreeJSON) -> Res<i64> {
 }
 
 /// Emit the violation-matrix ops. `x` is `(B, F)` fp16.
-/// Returns `(B, K)` scores name.
+/// Returns `(B, K)` votes name (leaf values only — no base).
 fn emit_ensemble(cx: &mut Ctx, m: &EnsMats, x: &str, b: i64, pfx: &str) -> Res<String> {
     let (j, l, k) = (m.j as i64, m.l as i64, m.k as i64);
     if m.j == 0 {
-        // Stump-only ensemble: every leaf is unconditional, so the score
-        // is `base + Σ_l V[l]` — an input-independent const.
-        let mut row = m.base.clone();
+        // Stump-only ensemble: every leaf is unconditional, so the votes
+        // are `Σ_l V[l]` — an input-independent const.
+        let mut row = vec![0.0f32; m.k];
         for li in 0..m.l {
-            for ki in 0..m.k {
-                row[ki] += m.v[li * m.k + ki];
+            for (ki, r) in row.iter_mut().enumerate() {
+                *r += m.v[li * m.k + ki];
             }
         }
         let data: Vec<f32> = (0..b).flat_map(|_| row.iter().copied()).collect();
-        return Ok(cx.k_f16t_named_ret(&format!("{pfx}_scores"), &[b, k], &data));
+        return Ok(cx.k_f16t_named_ret(&format!("{pfx}_votes"), &[b, k], &data));
     }
     // F = x[:, feat] — gather over feature axis
     let fidx = cx.k_i32t(&[j], &m.feat);
@@ -452,7 +447,10 @@ fn emit_ensemble(cx: &mut Ctx, m: &EnsMats, x: &str, b: i64, pfx: &str) -> Res<S
     let dtf3 = cx.k_str("fp16");
     let ind = cx.e1(
         "cast",
-        vec![("x".into(), bind(&ind_b).1), ("dtype".into(), bind(&dtf3).1)],
+        vec![
+            ("x".into(), bind(&ind_b).1),
+            ("dtype".into(), bind(&dtf3).1),
+        ],
         &format!("{pfx}_ind"),
         DType::Fp16,
         &[b, l],
@@ -460,7 +458,7 @@ fn emit_ensemble(cx: &mut Ctx, m: &EnsMats, x: &str, b: i64, pfx: &str) -> Res<S
     let tx3 = cx.k_bool(false);
     let ty3 = cx.k_bool(false);
     let vv = cx.k_f16t_w(&[l, k], &m.v);
-    let raw = cx.e1(
+    Ok(cx.e1(
         "matmul",
         vec![
             ("x".into(), bind(&ind).1),
@@ -468,12 +466,49 @@ fn emit_ensemble(cx: &mut Ctx, m: &EnsMats, x: &str, b: i64, pfx: &str) -> Res<S
             ("transpose_x".into(), bind(&tx3).1),
             ("transpose_y".into(), bind(&ty3).1),
         ],
-        &format!("{pfx}_raw"),
+        &format!("{pfx}_votes"),
         DType::Fp16,
         &[b, k],
-    );
-    let base = cx.k_f16t(&[1, k], &m.base);
-    cx.binary("add", &raw, &base, &format!("{pfx}_scores"))
+    ))
+}
+
+/// `scores = aggregate(votes) + base_values`, per ONNX
+/// `TreeEnsemble*` semantics — base is added *after* aggregation so
+/// `AVERAGE` doesn't scale it.
+fn apply_agg_base(
+    cx: &mut Ctx,
+    votes: &str,
+    k: i64,
+    aggregate: &str,
+    base_values: &[f64],
+    n_trees: usize,
+    pfx: &str,
+) -> Res<String> {
+    let mut s = votes.to_string();
+    match aggregate {
+        "sum" | "SUM" => {}
+        "average" | "AVERAGE" => {
+            let inv = cx.k_f16(1.0 / n_trees.max(1) as f32);
+            s = cx.binary("mul", &s, &inv, &format!("{pfx}_avg"))?;
+        }
+        a => {
+            return Err(OnnxError::Unsupported(format!(
+                "tree ensemble aggregate '{a}' — supported: sum|average"
+            )))
+        }
+    }
+    if base_values.is_empty() {
+        return Ok(s);
+    }
+    if base_values.len() != k as usize {
+        return Err(OnnxError::Schema(format!(
+            "base_values: {} elems, expected {k}",
+            base_values.len()
+        )));
+    }
+    let bv: Vec<f32> = base_values.iter().map(|&v| v as f32).collect();
+    let base = cx.k_f16t(&[1, k], &bv);
+    cx.binary("add", &s, &base, &format!("{pfx}_scores"))
 }
 
 impl<'a> Ctx<'a> {
@@ -510,9 +545,7 @@ fn apply_post(
 ) -> Res<String> {
     match post {
         PostTransform::None => Ok(scores.to_string()),
-        PostTransform::Logistic => {
-            Ok(cx.unary("sigmoid", scores, &format!("{pfx}_sig"))?)
-        }
+        PostTransform::Logistic => Ok(cx.unary("sigmoid", scores, &format!("{pfx}_sig"))?),
         PostTransform::Softmax => {
             let a = cx.k_i32s(-1);
             Ok(cx.e1(
@@ -650,9 +683,9 @@ impl NodeJSON {
             feature: self.feature.ok_or_else(|| {
                 OnnxError::Schema(format!("node {}: internal node needs 'feature'", self.id))
             })?,
-            threshold: self.threshold.ok_or_else(|| {
-                OnnxError::Schema(format!("node {}: needs 'threshold'", self.id))
-            })?,
+            threshold: self
+                .threshold
+                .ok_or_else(|| OnnxError::Schema(format!("node {}: needs 'threshold'", self.id)))?,
             mode: Mode::parse(self.mode.as_deref().unwrap_or("leq"))?,
             on_true: self
                 .left
@@ -723,7 +756,10 @@ fn parse_trees(v: &serde_json::Value) -> Res<Vec<TreeJSON>> {
             };
             nodes.push(NodeJSON {
                 id,
-                feature: nv.get("feature").and_then(|f| f.as_i64()).map(|f| f as usize),
+                feature: nv
+                    .get("feature")
+                    .and_then(|f| f.as_i64())
+                    .map(|f| f as usize),
                 threshold: nv.get("threshold").and_then(|f| f.as_f64()),
                 mode: nv.get("mode").and_then(|m| m.as_str()).map(String::from),
                 left: nv.get("left").and_then(|l| l.as_i64()),
@@ -835,17 +871,17 @@ pub fn convert_json(bytes: &[u8]) -> Res<BuiltModel> {
                 )));
             }
             let trees = parse_trees(&v)?;
-            let scores = lower_ensemble(&mut cx, &trees, n_out, &base, &x2, &x2_shape, "ens")?;
+            let votes = lower_ensemble(&mut cx, &trees, n_out, &x2, &x2_shape, "ens")?;
             let aggregate = jstr(&v, "aggregate").unwrap_or("sum");
-            let mut scores = scores;
-            if aggregate == "average" {
-                let inv = cx.k_f16(1.0 / trees.len().max(1) as f32);
-                scores = cx.binary("mul", &scores, &inv, "ens_avg")?;
-            } else if aggregate != "sum" {
-                return Err(OnnxError::Unsupported(format!(
-                    "aggregate '{aggregate}' — supported: sum|average"
-                )));
-            }
+            let scores = apply_agg_base(
+                &mut cx,
+                &votes,
+                n_out as i64,
+                aggregate,
+                &base,
+                trees.len(),
+                "ens",
+            )?;
             let _ = emit_outputs(
                 &mut cx,
                 &scores,
@@ -867,11 +903,12 @@ pub fn convert_json(bytes: &[u8]) -> Res<BuiltModel> {
 }
 
 /// Emit `linear` GLM path; returns nothing — outputs are wired inside.
+#[allow(clippy::too_many_arguments)] // mirrors the JSON/ONNX parameter lists
 fn lower_glm(
     cx: &mut Ctx,
     x: &str,
     x_shape: &[i64],
-    wflat: &[f32],   // (K, F) row-major
+    wflat: &[f32], // (K, F) row-major
     intercept: &[f32],
     k: usize,
     post: PostTransform,
@@ -921,7 +958,11 @@ fn finish_classical(mut cx: Ctx, input_sn: &str, n_feat: i64) -> Res<BuiltModel>
         }
     }
     cx.b.outputs = block_outs;
-    let wb = if cx.has_blob { Some(cx.wb.finish()) } else { None };
+    let wb = if cx.has_blob {
+        Some(cx.wb.finish())
+    } else {
+        None
+    };
     Ok(BuiltModel {
         block: cx.b,
         inputs: vec![Feature {
@@ -966,9 +1007,7 @@ pub(crate) fn map_ml_node(cx: &mut Ctx, node: &NodeProto, label: &str) -> Res<()
     let out_sn = cx.san(&out);
     let _ = out_sn;
     match node.op_type.as_str() {
-        "TreeEnsembleClassifier" | "TreeEnsembleRegressor" => {
-            map_tree_ensemble_ml(cx, node, label)
-        }
+        "TreeEnsembleClassifier" | "TreeEnsembleRegressor" => map_tree_ensemble_ml(cx, node, label),
         "LinearClassifier" | "LinearRegressor" => map_linear_ml(cx, node, label),
         "Normalizer" => {
             let xs0 = cx.resolve(&node.inputs[0], label)?;
@@ -976,11 +1015,32 @@ pub(crate) fn map_ml_node(cx: &mut Ctx, node: &NodeProto, label: &str) -> Res<()
             let norm = node.attr_str("norm").unwrap_or_else(|| "MAX".into());
             let axes: Vec<i64> = (1..t.shape.len() as i64).collect();
             let reduced = match norm.as_str() {
-                "L1" => cx.reduce("reduce_l1_norm", &xs0, &axes, true, &format!("{label}_n"), t.dtype)?,
-                "L2" => cx.reduce("reduce_l2_norm", &xs0, &axes, true, &format!("{label}_n"), t.dtype)?,
+                "L1" => cx.reduce(
+                    "reduce_l1_norm",
+                    &xs0,
+                    &axes,
+                    true,
+                    &format!("{label}_n"),
+                    t.dtype,
+                )?,
+                "L2" => cx.reduce(
+                    "reduce_l2_norm",
+                    &xs0,
+                    &axes,
+                    true,
+                    &format!("{label}_n"),
+                    t.dtype,
+                )?,
                 "MAX" => {
                     let a = cx.unary("abs", &xs0, &format!("{label}_abs"))?;
-                    cx.reduce("reduce_max", &a, &axes, true, &format!("{label}_n"), t.dtype)?
+                    cx.reduce(
+                        "reduce_max",
+                        &a,
+                        &axes,
+                        true,
+                        &format!("{label}_n"),
+                        t.dtype,
+                    )?
                 }
                 n => {
                     return Err(OnnxError::Unsupported(format!(
@@ -1000,8 +1060,16 @@ pub(crate) fn map_ml_node(cx: &mut Ctx, node: &NodeProto, label: &str) -> Res<()
             let f = *t.shape.last().unwrap_or(&1);
             let off = node.attr_floats("offset");
             let scale = node.attr_floats("scale");
-            let off = if off.is_empty() { vec![0.0; f as usize] } else { off };
-            let scale = if scale.is_empty() { vec![1.0; f as usize] } else { scale };
+            let off = if off.is_empty() {
+                vec![0.0; f as usize]
+            } else {
+                off
+            };
+            let scale = if scale.is_empty() {
+                vec![1.0; f as usize]
+            } else {
+                scale
+            };
             if off.len() != f as usize || scale.len() != f as usize {
                 return Err(OnnxError::BadShape(format!(
                     "Scaler '{label}': offset/scale must have {f} entries"
@@ -1064,7 +1132,8 @@ fn map_tree_ensemble_ml(cx: &mut Ctx, node: &NodeProto, label: &str) -> Res<()> 
             attr_ints(node, "target_ids"),
         )
     };
-    if valids.len() != targetids.len() || valids.len() != weights.len()
+    if valids.len() != targetids.len()
+        || valids.len() != weights.len()
         || valids.len() != wids.len()
     {
         return Err(OnnxError::Malformed {
@@ -1121,36 +1190,40 @@ fn map_tree_ensemble_ml(cx: &mut Ctx, node: &NodeProto, label: &str) -> Res<()> 
         .into_iter()
         .map(|nodes| TreeJSON { weight: 1.0, nodes })
         .collect();
-    let base = attr_floats(node, "base_values")
+    let base: Vec<f64> = attr_floats(node, "base_values")
         .iter()
         .map(|&v| v as f64)
-        .collect::<Vec<_>>();
-    let base = if base.is_empty() { vec![0.0; k] } else { base };
+        .collect();
     let post = PostTransform::parse(
-        &node.attr_str("post_transform").unwrap_or_else(|| "NONE".into()),
+        &node
+            .attr_str("post_transform")
+            .unwrap_or_else(|| "NONE".into()),
     )?;
-    let scores = lower_ensemble(cx, &trees, k, &base, &x2, &x2_shape, label)?;
+    let votes = lower_ensemble(cx, &trees, k, &x2, &x2_shape, label)?;
 
-    // aggregate_function for regressors
-    if !is_clf {
-        let agg = node.attr_str("aggregate_function").unwrap_or_else(|| "SUM".into());
-        if agg == "AVERAGE" {
-            let inv = cx.k_f16(1.0 / trees.len().max(1) as f32);
-            let s = cx.binary("mul", &scores, &inv, &format!("{label}_avg"))?;
-            return finish_ml_out(cx, node, &s, &x2_shape, post, None, label);
-        }
-        if agg != "SUM" {
-            return Err(OnnxError::Unsupported(format!(
-                "TreeEnsembleRegressor '{label}': aggregate '{agg}'"
-            )));
-        }
-    }
+    // aggregate_function is a regressor attribute; classifiers always
+    // sum per-class votes. Either way base_values is added after.
+    let agg = if is_clf {
+        "SUM".to_string()
+    } else {
+        node.attr_str("aggregate_function")
+            .unwrap_or_else(|| "SUM".into())
+    };
+    let scores = apply_agg_base(cx, &votes, k as i64, &agg, &base, trees.len(), label)?;
     let labels_i = if is_clf {
         Some(attr_ints(node, "classlabels_ints"))
     } else {
         None
     };
-    finish_ml_out(cx, node, &scores, &x2_shape, post, labels_i.as_deref(), label)
+    finish_ml_out(
+        cx,
+        node,
+        &scores,
+        &x2_shape,
+        post,
+        labels_i.as_deref(),
+        label,
+    )
 }
 
 /// ai.onnx.ml outputs: classifier gives Y (label) + Z (scores);
@@ -1274,14 +1347,22 @@ fn map_linear_ml(cx: &mut Ctx, node: &NodeProto, label: &str) -> Res<()> {
         &[x2_shape[0], kk as i64],
     );
     let post = PostTransform::parse(
-        &node.attr_str("post_transform").unwrap_or_else(|| "NONE".into()),
+        &node
+            .attr_str("post_transform")
+            .unwrap_or_else(|| "NONE".into()),
     )?;
     let labels_i = if is_clf {
         Some(attr_ints(node, "classlabels_ints"))
     } else {
         None
     };
-    finish_ml_out(cx, node, &scores, &x2_shape, post, labels_i.as_deref(), label)
+    finish_ml_out(
+        cx,
+        node,
+        &scores,
+        &x2_shape,
+        post,
+        labels_i.as_deref(),
+        label,
+    )
 }
-
-
