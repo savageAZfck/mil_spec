@@ -38,7 +38,15 @@ Compile with `xcrun coremlc compile model.mlpackage .` and you have a real
 
 | Piece | API |
 |---|---|
-| Graph ops (`const`, `mul`/`add`/`sub`, `conv` 1x1, `matmul`, `reshape`/`transpose`/`slice`/`concat`, `softmax`, `cast`, `reduce_mean`/`rsqrt`) | [`Block`] builder helpers |
+| Elementwise (`mul`/`add`/`sub`, `real_div`/`floor_div`/`modulo`, `pow`, `maximum`/`minimum`, `exp`/`exp2`/`log`, `sqrt`/`rsqrt`/`square`, `abs`/`floor`/`ceil`/`round`/`neg`/`sign`, `sin`/`cos`/`tan`/`asin`/`acos`/`atan`, `sinh`/`cosh`/`tanh`/`atanh`, `erf`, `inverse`, `clip`/`threshold`, `select`) | [`Block`] builder helpers |
+| Activations (`sigmoid`, `relu`, `relu6`, `leaky_relu`, `elu`, `gelu`, `softplus`, `softsign`, `sigmoid_hard`, `clamped_relu`, `prelu`, `softmax`, `log_softmax`) | [`Block`] builder helpers |
+| Reductions (`reduce_sum`/`mean`/`max`/`min`/`prod`, `reduce_l1_norm`/`l2_norm`/`sum_square`/`log_sum`/`log_sum_exp`, `reduce_argmax`/`argmin`, `cumsum`) | [`Block`] builder helpers |
+| Indexing (`gather`, `gather_along_axis`, `gather_nd`, `scatter`, `scatter_along_axis`, `scatter_nd`, `topk`, `argsort`, `one_hot`) | [`Block`] builder helpers |
+| Shape/layout (`reshape`, `transpose`, `expand_dims`, `squeeze`, `slice`, `slice_by_size`, `concat`, `split`, `tile`, `pad`, `broadcast_to`, `flatten2d`, `stack`, `reverse`, `sliding_windows`, `cast`) | [`Block`] builder helpers |
+| Normalization (`rms_norm`, `layer_norm`, `batch_norm`, `instance_norm`, `group_norm`, `l2_norm`, `local_response_norm`) | [`Block`] builder helpers |
+| Pooling & upsample (`avg_pool`, `max_pool`, `avg_pool_global`, `max_pool_global`, `upsample_nearest`, `upsample_bilinear`) | [`Block`] builder helpers |
+| Space transforms (`depth_to_space`, `space_to_depth`, `pixel_shuffle`) | [`Block`] builder helpers |
+| Conv & linear (`conv` N-D, `conv_transpose`, `conv1x1`, `linear`, `matmul`) | [`Block`] builder helpers |
 | Raw ops with full control | [`Block::op`], [`bind`], [`bind_many`], [`bind_const`] |
 | Stateful graphs (KV caches) | [`Feature::is_state`], [`Block::read_state`], [`Block::write_state`] |
 | Weight-only int8 (`constexpr_blockwise_shift_scale`) | [`Block::konst_q8`] |
@@ -84,7 +92,7 @@ See `examples/compile_ir.rs` for a stateful KV-cache program.
 
 | Crate | Job |
 |---|---|
-| **`mil_convert`** | safetensors *and* GGUF → `.mlpackage`. Streams HF checkpoints or llama.cpp files (all ggml quant types, split shards, Q/K un-permute, embedded tokenizer export to `tokenizer.json`) into fat single-graph decoders: packed-KV state (`slice_update` at runtime `pos`), GQA attention, per-channel int8 or fp16 conv weights. Config-driven — Qwen2/Qwen3/Llama-class today. |
+| **`mil_convert`** | safetensors *and* GGUF → `.mlpackage`. Streams HF checkpoints or llama.cpp files (all ggml quant types, split shards, Q/K un-permute, embedded tokenizer export to `tokenizer.json`) into fat single-graph decoders: packed-KV state (`slice_update` at runtime `pos`), GQA attention, per-channel int8 or fp16 conv weights. Optional **LoRA bake-in** (`--lora`): MLX/PEFT adapters from safetensors or `.npz`, fused as `W + scale·(B @ A)` in f32 before quantization. Config-driven — Qwen2/Qwen3/Llama-class today. |
 | **`mil_passes`** | Optimizer over `Block`: const dedup (the helpers emit ~5 identical consts per conv — this is the big spec shrinker), constant folding, no-op elimination, dead code, fixpoint. Deterministic, reports every change. |
 | **`mil_lint`** | The differentiator — static **ANE-placement analysis**. Predicts per-op execution unit (ANE/GPU/CPU) with a stated rule *before* you compile, flags CPU islands and fp32 regions, and estimates dispatch count — the number that decides whether a graph lives or dies on the ANE. coremltools can't do this at all. |
 | **`mil_compile`** | `.mlpackage` → `.mlmodelc`. Two backends: in-process `MLModel compileModelAtURL:` via the Objective-C runtime (no `xcrun`, no subprocess), and an `xcrun coremlc` driver with structured errors and `.mlmodelc` discovery. |
@@ -95,6 +103,7 @@ See `examples/compile_ir.rs` for a stateful KV-cache program.
 cargo build --release -p milc
 milc convert Qwen3-0.6B -o drafter.mlpackage --seq 1 --max-kv 2048
 milc convert model.gguf -o drafter.mlpackage   # GGUF auto-detected by magic
+milc convert Qwen3-0.6B -o tuned.mlpackage --lora adapters/dream  # LoRA bake-in (MLX/PEFT, safetensors or npz)
 milc gguf model.gguf --tokenizer tok.json     # inspect + tokenizer export
 milc lint drafter.mlpackage     # per-op ANE/GPU/CPU + dispatch estimate
 milc compile drafter.mlpackage  # via CoreML.framework, in-process

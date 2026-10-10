@@ -56,6 +56,10 @@ pub struct Options {
     pub spec_version: i32,
     /// `ModelMeta` opset name.
     pub opset: String,
+    /// Optional LoRA adapter (dir with `adapter_config.json` +
+    /// `adapters.safetensors`/`*.npz`, or a bare file). Fused in f32 as
+    /// `W + scale·(B @ A)` before fp16/int8 emission.
+    pub lora: Option<std::path::PathBuf>,
 }
 
 impl Default for Options {
@@ -68,6 +72,7 @@ impl Default for Options {
             embed: false,
             spec_version: 10,
             opset: "CoreML9".into(),
+            lora: None,
         }
     }
 }

@@ -671,6 +671,15 @@ mod imp {
                     let num = unsafe { msg1_i64(shp, sel("objectAtIndex:"), d as i64) };
                     shape.push(unsafe { msg0_i64(num, sel("longLongValue")) });
                 }
+                // strides — GPU-produced arrays are NOT guaranteed
+                // contiguous (padded rows have been observed on the
+                // CpuAndGpu path); honor the declared element strides.
+                let strd = unsafe { msg0(ma, sel("strides")) };
+                let mut strides = Vec::with_capacity(nd);
+                for d in 0..nd {
+                    let num = unsafe { msg1_i64(strd, sel("objectAtIndex:"), d as i64) };
+                    strides.push(unsafe { msg0_i64(num, sel("longLongValue")) });
+                }
                 // element size from the array's own dataType — same
                 // exact-code table as zero_multiarray; an unknown dtype
                 // is skipped, never guessed (a wrong size over-reads).
@@ -678,10 +687,27 @@ mod imp {
                 let Some(el) = ml_dtype_size(dt) else {
                     continue;
                 };
-                let ptr = unsafe { msg0_ptr(ma, sel("dataPointer")) };
+                let ptr = unsafe { msg0_ptr(ma, sel("dataPointer")) } as *const u8;
                 let bytes = n_el * el;
                 let mut data = vec![0u8; bytes];
-                unsafe { std::ptr::copy_nonoverlapping(ptr, data.as_mut_ptr(), bytes) };
+                // Map row-major flat index → strided source offset.
+                for flat in 0..n_el {
+                    let mut rem = flat as i64;
+                    let mut src: isize = 0;
+                    for d in (0..nd).rev() {
+                        let dim = shape[d].max(1);
+                        let idx = rem % dim;
+                        rem /= dim;
+                        src += (idx * strides[d]) as isize;
+                    }
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            ptr.offset(src * el as isize),
+                            data.as_mut_ptr().add(flat * el),
+                            el,
+                        )
+                    };
+                }
                 outputs.push(Output {
                     name,
                     shape,

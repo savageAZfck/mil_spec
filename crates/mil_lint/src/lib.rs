@@ -252,8 +252,23 @@ pub fn classify_op(
         "batch_norm" | "activation" => (Unit::Ane, "norm/act"),
 
         // Nonlinearities — elementwise activations are ANE-native.
-        "sigmoid" | "tanh" | "relu" | "relu6" | "leaky_relu" | "prelu" | "gelu" | "softplus"
-        | "softsign" | "sigmoid_hard" | "silu" | "elu" => {
+        "sigmoid"
+        | "tanh"
+        | "relu"
+        | "relu6"
+        | "leaky_relu"
+        | "prelu"
+        | "gelu"
+        | "softplus"
+        | "softsign"
+        | "sigmoid_hard"
+        | "silu"
+        | "elu"
+        | "clamped_relu"
+        | "scaled_tanh"
+        | "thresholded_relu"
+        | "softplus_parametric"
+        | "linear_activation" => {
             if f32 {
                 (Unit::Gpu, "activation fp32")
             } else {
@@ -262,9 +277,11 @@ pub fn classify_op(
         }
 
         // Elementwise fp16 — the ANE's bread and butter.
-        "add" | "sub" | "mul" | "div" | "real_div" | "pow" | "maximum" | "minimum" | "floor"
-        | "ceil" | "round" | "sqrt" | "rsqrt" | "exp" | "log" | "sin" | "cos" | "tan" | "abs"
-        | "sign" | "neg" | "inverse" | "clip" | "threshold" | "scale" => {
+        "add" | "sub" | "mul" | "div" | "real_div" | "floor_div" | "mod" | "pow" | "maximum"
+        | "minimum" | "floor" | "ceil" | "round" | "sqrt" | "rsqrt" | "exp" | "exp2" | "log"
+        | "sin" | "cos" | "tan" | "sinh" | "cosh" | "asin" | "acos" | "atan" | "atanh" | "erf"
+        | "abs" | "sign" | "neg" | "inverse" | "square" | "clip" | "threshold" | "scale"
+        | "identity" => {
             if f32 {
                 (Unit::Gpu, "elementwise fp32")
             } else {
@@ -274,7 +291,8 @@ pub fn classify_op(
 
         // Reductions — ANE does these but they serialize on the channel.
         "reduce_sum" | "reduce_mean" | "reduce_max" | "reduce_min" | "reduce_prod"
-        | "reduce_l2_norm" | "reduce_l1_norm" | "reduce_sumsquare" => {
+        | "reduce_l2_norm" | "reduce_l1_norm" | "reduce_sumsquare" | "reduce_sum_square"
+        | "reduce_log_sum" | "reduce_log_sum_exp" => {
             if f32 {
                 (Unit::Gpu, "reduce fp32")
             } else {
@@ -284,8 +302,10 @@ pub fn classify_op(
 
         // Shape gymnastics — free on ANE but each is a dispatch. Flag
         // heavy use so callers can fold them.
-        "reshape" | "transpose" | "expand_dims" | "squeeze" | "flatten" | "reverse"
-        | "slice_by_index" | "slice_by_size" | "split" => (Unit::Ane, "layout op"),
+        "reshape" | "transpose" | "expand_dims" | "squeeze" | "flatten" | "flatten2d"
+        | "reverse" | "slice_by_index" | "slice_by_size" | "split" | "sliding_windows"
+        | "depth_to_space" | "space_to_depth" | "pixel_shuffle" | "pixel_unshuffle"
+        | "batch_to_space" | "space_to_batch" | "broadcast_to" => (Unit::Ane, "layout op"),
 
         "concat" | "stack" | "tile" | "pad" => (Unit::Ane, "layout op"),
 
@@ -294,7 +314,7 @@ pub fn classify_op(
         "slice_update" | "slice_update_dynamic" => (Unit::Ane, "state write"),
 
         // Matmul — ANE runs it; big vocab-side matmuls are the border.
-        "matmul" | "batched_matmul" => {
+        "matmul" | "batched_matmul" | "linear" | "einsum" | "scaled_dot_product_attention" => {
             if f32 {
                 (Unit::Gpu, "matmul fp32")
             } else {
@@ -321,7 +341,9 @@ pub fn classify_op(
             }
         }
 
-        "layer_norm" | "instance_norm" | "local_response_norm" => (Unit::Ane, "norm"),
+        "layer_norm" | "instance_norm" | "local_response_norm" | "l2_norm" | "group_norm" => {
+            (Unit::Ane, "norm")
+        }
 
         // Quantized path — constexpr_blockwise_shift_scale is the int8
         // residency pattern; dequant happens on-ANE.
@@ -332,7 +354,8 @@ pub fn classify_op(
         "read_state" | "write_state" => (Unit::Ane, "state"),
 
         "cast" => (Unit::Ane, "cast"),
-        "gather" | "gather_nd" | "scatter" | "scatter_nd" => (Unit::Ane, "gather"),
+        "gather" | "gather_nd" | "gather_along_axis" | "scatter" | "scatter_nd"
+        | "scatter_along_axis" => (Unit::Ane, "gather"),
 
         // Const ops are metadata — placement follows their consumer.
         "const" => {
@@ -347,12 +370,22 @@ pub fn classify_op(
         "gru" | "lstm" | "rnn" | "uni_directional_lstm" | "bi_directional_lstm" => {
             (Unit::Gpu, "recurrent")
         }
-        "argmax" | "argmin" | "argsort" | "non_maximum_suppression" | "topk" => {
-            (Unit::Gpu, "argmax-family")
-        }
-        "upsample" | "resize_bilinear" | "resample" | "crop_resize" | "crop" => {
-            (Unit::Gpu, "resize")
-        }
+        "argmax"
+        | "argmin"
+        | "reduce_argmax"
+        | "reduce_argmin"
+        | "argsort"
+        | "non_maximum_suppression"
+        | "topk" => (Unit::Gpu, "argmax-family"),
+        "upsample"
+        | "upsample_nearest_neighbor"
+        | "upsample_bilinear"
+        | "resize_bilinear"
+        | "resize_nearest_neighbor"
+        | "resample"
+        | "crop_resize"
+        | "crop"
+        | "affine" => (Unit::Gpu, "resize"),
         "embedding" | "one_hot" => (Unit::Gpu, "embedding"),
 
         // --- CPU-only ---
@@ -360,9 +393,8 @@ pub fn classify_op(
         | "list_gather" | "list_scatter" | "select" => (Unit::Cpu, "control flow"),
         "random" | "random_bernoulli" | "random_categorical" | "random_normal"
         | "random_uniform" | "multinomial" => (Unit::Cpu, "random"),
-        "get_shape" | "fill" | "fill_dynamic" | "range_1d" | "non_zero" | "cumsum" => {
-            (Unit::Cpu, "dynamic shape")
-        }
+        "get_shape" | "shape" | "fill" | "fill_like" | "fill_dynamic" | "range_1d" | "non_zero"
+        | "cumsum" => (Unit::Cpu, "dynamic shape"),
 
         // Custom ops land wherever the extension registers.
         t if t.starts_with("custom") || t.contains("custom") => (Unit::Unknown, "custom op"),

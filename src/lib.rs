@@ -680,6 +680,18 @@ impl Block {
         .clone()
     }
 
+    /// `const` with a `str` scalar value (`pad_type`, `mode`, `dtype` args).
+    pub fn konst_str(&mut self, name: &str, v: &str) -> String {
+        let vt = self.tt(DType::Str, &[]);
+        self.op(
+            "const",
+            vec![],
+            vec![(name, vt)],
+            vec![("val".into(), Value::Str(v.into()))],
+        )[0]
+        .clone()
+    }
+
     /// `const` referencing a blob in `weight.bin` at `offset`.
     ///
     /// `file` is the BlobFileValue path — `"@model_path/weights/weight.bin"`
@@ -823,16 +835,7 @@ impl Block {
         let strides = self.fresh("stride");
         let strides = self.konst_i32(&strides, &[1, 1]);
         let pad_type = self.fresh("padtype");
-        let pad_type = {
-            let vt = self.tt(DType::Str, &[]);
-            self.op(
-                "const",
-                vec![],
-                vec![(&pad_type, vt)],
-                vec![("val".into(), Value::Str("valid".into()))],
-            )[0]
-            .clone()
-        };
+        let pad_type = self.konst_str(&pad_type, "valid");
         let pads = self.fresh("pad");
         let pads = self.konst_i32(&pads, &[0, 0, 0, 0]);
         let dil = self.fresh("dil");
@@ -868,16 +871,7 @@ impl Block {
         let strides = self.fresh("stride");
         let strides = self.konst_i32(&strides, &[1, 1]);
         let pad_type = self.fresh("padtype");
-        let pad_type = {
-            let vt = self.tt(DType::Str, &[]);
-            self.op(
-                "const",
-                vec![],
-                vec![(&pad_type, vt)],
-                vec![("val".into(), Value::Str("valid".into()))],
-            )[0]
-            .clone()
-        };
+        let pad_type = self.konst_str(&pad_type, "valid");
         let pads = self.fresh("pad");
         let pads = self.konst_i32(&pads, &[0, 0, 0, 0]);
         let dil = self.fresh("dil");
@@ -1076,16 +1070,7 @@ impl Block {
         out_f32: bool,
     ) -> String {
         let d = self.fresh("dtype");
-        let d = {
-            let vt = self.tt(DType::Str, &[]);
-            self.op(
-                "const",
-                vec![],
-                vec![(&d, vt)],
-                vec![("val".into(), Value::Str(to.into()))],
-            )[0]
-            .clone()
-        };
+        let d = self.konst_str(&d, to);
         let dt = if out_f32 { DType::Fp32 } else { DType::Fp16 };
         let vt = self.tt(dt, out_shape);
         self.o1(
@@ -1094,6 +1079,1681 @@ impl Block {
             name,
             vt,
         )
+    }
+
+    // --- elementwise unary ---
+    // All signatures are the iOS15+ MIL form `y = op(x)` (plus the const
+    // params noted per helper); output dtype follows the input (fp16 here).
+
+    fn unary(&mut self, ty: &str, x: &str, shape: &[i64], name: &str) -> String {
+        let vt = self.tt(DType::Fp16, shape);
+        self.o1(ty, vec![("x".into(), bind(x).1)], name, vt)
+    }
+
+    fn binary(&mut self, ty: &str, x: &str, y: &str, shape: &[i64], name: &str) -> String {
+        let vt = self.tt(DType::Fp16, shape);
+        self.o1(
+            ty,
+            vec![("x".into(), bind(x).1), ("y".into(), bind(y).1)],
+            name,
+            vt,
+        )
+    }
+
+    /// `exp` elementwise.
+    pub fn exp(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        self.unary("exp", x, shape, name)
+    }
+
+    /// `exp2` elementwise (2^x).
+    pub fn exp2(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        self.unary("exp2", x, shape, name)
+    }
+
+    /// `log` elementwise with an `epsilon` const (`y = log(x + eps)` —
+    /// optional in the spec, required by the CoreML9+ parser).
+    pub fn log(&mut self, x: &str, eps: f32, shape: &[i64], name: &str) -> String {
+        let e = self.fresh("eps");
+        let e = self.konst_f16(&e, eps);
+        let vt = self.tt(DType::Fp16, shape);
+        self.o1(
+            "log",
+            vec![("x".into(), bind(x).1), ("epsilon".into(), bind(&e).1)],
+            name,
+            vt,
+        )
+    }
+
+    /// `sqrt` elementwise.
+    pub fn sqrt(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        self.unary("sqrt", x, shape, name)
+    }
+
+    /// `rsqrt` elementwise with an `epsilon` const input (MIL computes
+    /// `rsqrt(x + epsilon)` — pass `0.0` for the exact reciprocal root).
+    pub fn rsqrt(&mut self, x: &str, eps: f32, shape: &[i64], name: &str) -> String {
+        let e = self.fresh("eps");
+        let e = self.konst_f16(&e, eps);
+        let vt = self.tt(DType::Fp16, shape);
+        self.o1(
+            "rsqrt",
+            vec![("x".into(), bind(x).1), ("epsilon".into(), bind(&e).1)],
+            name,
+            vt,
+        )
+    }
+
+    /// `abs` elementwise.
+    pub fn abs(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        self.unary("abs", x, shape, name)
+    }
+
+    /// `floor` elementwise.
+    pub fn floor(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        self.unary("floor", x, shape, name)
+    }
+
+    /// `ceil` elementwise.
+    pub fn ceil(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        self.unary("ceil", x, shape, name)
+    }
+
+    /// `round` elementwise (half away from zero).
+    pub fn round(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        self.unary("round", x, shape, name)
+    }
+
+    /// Elementwise negation. MIL has no `neg` op — the idiom is `mul(x, -1)`
+    /// (an fp16 scalar const, exactly what CoreML emits for unary minus).
+    pub fn neg(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        let m1 = self.konst_f16(&format!("{name}_m1"), -1.0);
+        self.mul(x, &m1, shape, name)
+    }
+
+    /// `sign` elementwise (-1, 0, +1).
+    pub fn sign(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        self.unary("sign", x, shape, name)
+    }
+
+    /// `sin` elementwise.
+    pub fn sin(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        self.unary("sin", x, shape, name)
+    }
+
+    /// `cos` elementwise.
+    pub fn cos(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        self.unary("cos", x, shape, name)
+    }
+
+    /// `tan` elementwise.
+    pub fn tan(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        self.unary("tan", x, shape, name)
+    }
+
+    /// `sinh` elementwise.
+    pub fn sinh(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        self.unary("sinh", x, shape, name)
+    }
+
+    /// `cosh` elementwise.
+    pub fn cosh(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        self.unary("cosh", x, shape, name)
+    }
+
+    /// `tanh` elementwise.
+    pub fn tanh(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        self.unary("tanh", x, shape, name)
+    }
+
+    /// `erf` elementwise (Gauss error function).
+    pub fn erf(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        self.unary("erf", x, shape, name)
+    }
+
+    /// `sigmoid` elementwise.
+    pub fn sigmoid(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        self.unary("sigmoid", x, shape, name)
+    }
+
+    /// `relu` elementwise.
+    pub fn relu(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        self.unary("relu", x, shape, name)
+    }
+
+    /// `relu6` elementwise.
+    pub fn relu6(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        self.unary("relu6", x, shape, name)
+    }
+
+    /// `leaky_relu` elementwise with const `alpha`.
+    pub fn leaky_relu(&mut self, x: &str, alpha: f32, shape: &[i64], name: &str) -> String {
+        let a = self.fresh("alpha");
+        let a = self.konst_f16(&a, alpha);
+        let vt = self.tt(DType::Fp16, shape);
+        self.o1(
+            "leaky_relu",
+            vec![("x".into(), bind(x).1), ("alpha".into(), bind(&a).1)],
+            name,
+            vt,
+        )
+    }
+
+    /// `gelu` elementwise. `tanh_approx` selects the `"TANH_APPROXIMATION"`
+    /// mode const; `false` emits `"EXACT"` (the MIL default).
+    pub fn gelu(&mut self, x: &str, tanh_approx: bool, shape: &[i64], name: &str) -> String {
+        let m = self.fresh("mode");
+        let m = self.konst_str(
+            &m,
+            if tanh_approx {
+                "TANH_APPROXIMATION"
+            } else {
+                "EXACT"
+            },
+        );
+        let vt = self.tt(DType::Fp16, shape);
+        self.o1(
+            "gelu",
+            vec![("x".into(), bind(x).1), ("mode".into(), bind(&m).1)],
+            name,
+            vt,
+        )
+    }
+
+    /// `clip` elementwise to `[alpha, beta]` (const fp16 scalars).
+    pub fn clip(&mut self, x: &str, alpha: f32, beta: f32, shape: &[i64], name: &str) -> String {
+        let a = self.fresh("alpha");
+        let a = self.konst_f16(&a, alpha);
+        let b_ = self.fresh("beta");
+        let b_ = self.konst_f16(&b_, beta);
+        let vt = self.tt(DType::Fp16, shape);
+        self.o1(
+            "clip",
+            vec![
+                ("x".into(), bind(x).1),
+                ("alpha".into(), bind(&a).1),
+                ("beta".into(), bind(&b_).1),
+            ],
+            name,
+            vt,
+        )
+    }
+
+    /// `inverse` elementwise: `1 / (x + epsilon)` (epsilon is a const for
+    /// stability — pass `0.0` for the exact reciprocal).
+    pub fn inverse(&mut self, x: &str, eps: f32, shape: &[i64], name: &str) -> String {
+        let e = self.fresh("eps");
+        let e = self.konst_f16(&e, eps);
+        let vt = self.tt(DType::Fp16, shape);
+        self.o1(
+            "inverse",
+            vec![("x".into(), bind(x).1), ("epsilon".into(), bind(&e).1)],
+            name,
+            vt,
+        )
+    }
+
+    /// `threshold` elementwise: `max(x, alpha)` — values below `alpha`
+    /// are clamped *up* to `alpha` (MIL semantics, not "keep or zero").
+    pub fn threshold(&mut self, x: &str, alpha: f32, shape: &[i64], name: &str) -> String {
+        let a = self.fresh("alpha");
+        let a = self.konst_f16(&a, alpha);
+        let vt = self.tt(DType::Fp16, shape);
+        self.o1(
+            "threshold",
+            vec![("x".into(), bind(x).1), ("alpha".into(), bind(&a).1)],
+            name,
+            vt,
+        )
+    }
+
+    // --- elementwise binary ---
+
+    /// `pow` elementwise.
+    pub fn pow(&mut self, x: &str, y: &str, shape: &[i64], name: &str) -> String {
+        self.binary("pow", x, y, shape, name)
+    }
+
+    /// `maximum` elementwise.
+    pub fn maximum(&mut self, x: &str, y: &str, shape: &[i64], name: &str) -> String {
+        self.binary("maximum", x, y, shape, name)
+    }
+
+    /// `minimum` elementwise.
+    pub fn minimum(&mut self, x: &str, y: &str, shape: &[i64], name: &str) -> String {
+        self.binary("minimum", x, y, shape, name)
+    }
+
+    /// `real_div` elementwise (fp division; `div` is integer semantics).
+    pub fn real_div(&mut self, x: &str, y: &str, shape: &[i64], name: &str) -> String {
+        self.binary("real_div", x, y, shape, name)
+    }
+
+    /// `floor_div` elementwise (fp division, floor of the quotient).
+    pub fn floor_div(&mut self, x: &str, y: &str, shape: &[i64], name: &str) -> String {
+        self.binary("floor_div", x, y, shape, name)
+    }
+
+    /// `mod` elementwise (fp remainder).
+    pub fn modulo(&mut self, x: &str, y: &str, shape: &[i64], name: &str) -> String {
+        self.binary("mod", x, y, shape, name)
+    }
+
+    /// `log_softmax` on `axis` — not a MIL op type, so this composites
+    /// `x - reduce_log_sum_exp(x, keep_dims=true)`.
+    pub fn log_softmax(&mut self, x: &str, axis: i32, out_shape: &[i64], name: &str) -> String {
+        let lse = self.reduce_log_sum_exp(x, &[axis], true, out_shape, &format!("{name}_lse"));
+        self.sub(x, &lse, out_shape, name)
+    }
+
+    /// `select` elementwise: `cond ? a : b` (`cond` is a bool-typed name).
+    pub fn select(&mut self, cond: &str, a: &str, b: &str, shape: &[i64], name: &str) -> String {
+        let vt = self.tt(DType::Fp16, shape);
+        self.o1(
+            "select",
+            vec![
+                ("cond".into(), bind(cond).1),
+                ("a".into(), bind(a).1),
+                ("b".into(), bind(b).1),
+            ],
+            name,
+            vt,
+        )
+    }
+
+    // --- reductions ---
+    //
+    // Axes family (reduce_sum/mean/max/min/prod/l1/l2/log_sum/log_sum_exp/
+    // sum_square): x, axes (int32 vector const), keep_dims (bool const).
+    // Axis family (reduce_argmax/argmin): x, axis (int32 scalar), keep_dims.
+
+    fn reduce(
+        &mut self,
+        ty: &str,
+        x: &str,
+        axes: &[i32],
+        keep_dims: bool,
+        out_shape: &[i64],
+        name: &str,
+    ) -> String {
+        let a = self.fresh("axes");
+        let a = self.konst_i32(&a, axes);
+        let kd = self.fresh("kd");
+        let kd = self.konst_bool(&kd, keep_dims);
+        let vt = self.tt(DType::Fp16, out_shape);
+        self.o1(
+            ty,
+            vec![
+                ("x".into(), bind(x).1),
+                ("axes".into(), bind(&a).1),
+                ("keep_dims".into(), bind(&kd).1),
+            ],
+            name,
+            vt,
+        )
+    }
+
+    /// `reduce_sum` over `axes`.
+    pub fn reduce_sum(
+        &mut self,
+        x: &str,
+        axes: &[i32],
+        keep: bool,
+        out: &[i64],
+        n: &str,
+    ) -> String {
+        self.reduce("reduce_sum", x, axes, keep, out, n)
+    }
+
+    /// `reduce_mean` over `axes`.
+    pub fn reduce_mean(
+        &mut self,
+        x: &str,
+        axes: &[i32],
+        keep: bool,
+        out: &[i64],
+        n: &str,
+    ) -> String {
+        self.reduce("reduce_mean", x, axes, keep, out, n)
+    }
+
+    /// `reduce_max` over `axes`.
+    pub fn reduce_max(
+        &mut self,
+        x: &str,
+        axes: &[i32],
+        keep: bool,
+        out: &[i64],
+        n: &str,
+    ) -> String {
+        self.reduce("reduce_max", x, axes, keep, out, n)
+    }
+
+    /// `reduce_min` over `axes`.
+    pub fn reduce_min(
+        &mut self,
+        x: &str,
+        axes: &[i32],
+        keep: bool,
+        out: &[i64],
+        n: &str,
+    ) -> String {
+        self.reduce("reduce_min", x, axes, keep, out, n)
+    }
+
+    /// `reduce_prod` over `axes`.
+    pub fn reduce_prod(
+        &mut self,
+        x: &str,
+        axes: &[i32],
+        keep: bool,
+        out: &[i64],
+        n: &str,
+    ) -> String {
+        self.reduce("reduce_prod", x, axes, keep, out, n)
+    }
+
+    /// `reduce_l1_norm` over `axes` (Σ|x|).
+    pub fn reduce_l1_norm(
+        &mut self,
+        x: &str,
+        axes: &[i32],
+        keep: bool,
+        out: &[i64],
+        n: &str,
+    ) -> String {
+        self.reduce("reduce_l1_norm", x, axes, keep, out, n)
+    }
+
+    /// `reduce_l2_norm` over `axes` (sqrt(Σx²)).
+    pub fn reduce_l2_norm(
+        &mut self,
+        x: &str,
+        axes: &[i32],
+        keep: bool,
+        out: &[i64],
+        n: &str,
+    ) -> String {
+        self.reduce("reduce_l2_norm", x, axes, keep, out, n)
+    }
+
+    /// `reduce_sum_square` over `axes` (Σx²).
+    pub fn reduce_sum_square(
+        &mut self,
+        x: &str,
+        axes: &[i32],
+        keep: bool,
+        out: &[i64],
+        n: &str,
+    ) -> String {
+        self.reduce("reduce_sum_square", x, axes, keep, out, n)
+    }
+
+    /// `reduce_log_sum` over `axes` (log(Σx)).
+    pub fn reduce_log_sum(
+        &mut self,
+        x: &str,
+        axes: &[i32],
+        keep: bool,
+        out: &[i64],
+        n: &str,
+    ) -> String {
+        self.reduce("reduce_log_sum", x, axes, keep, out, n)
+    }
+
+    /// `reduce_log_sum_exp` over `axes` (log(Σexp x)).
+    pub fn reduce_log_sum_exp(
+        &mut self,
+        x: &str,
+        axes: &[i32],
+        keep: bool,
+        out: &[i64],
+        n: &str,
+    ) -> String {
+        self.reduce("reduce_log_sum_exp", x, axes, keep, out, n)
+    }
+
+    fn reduce_arg(
+        &mut self,
+        ty: &str,
+        x: &str,
+        axis: i32,
+        keep_dims: bool,
+        out_shape: &[i64],
+        name: &str,
+    ) -> String {
+        let a = self.fresh("axis");
+        let a = self.konst_scalar_i32(&a, axis);
+        let kd = self.fresh("kd");
+        let kd = self.konst_bool(&kd, keep_dims);
+        let vt = self.tt(DType::Int32, out_shape);
+        self.o1(
+            ty,
+            vec![
+                ("x".into(), bind(x).1),
+                ("axis".into(), bind(&a).1),
+                ("keep_dims".into(), bind(&kd).1),
+            ],
+            name,
+            vt,
+        )
+    }
+
+    /// `reduce_argmax` along `axis`; int32 output.
+    pub fn reduce_argmax(
+        &mut self,
+        x: &str,
+        axis: i32,
+        keep: bool,
+        out: &[i64],
+        n: &str,
+    ) -> String {
+        self.reduce_arg("reduce_argmax", x, axis, keep, out, n)
+    }
+
+    /// `reduce_argmin` along `axis`; int32 output.
+    pub fn reduce_argmin(
+        &mut self,
+        x: &str,
+        axis: i32,
+        keep: bool,
+        out: &[i64],
+        n: &str,
+    ) -> String {
+        self.reduce_arg("reduce_argmin", x, axis, keep, out, n)
+    }
+
+    /// `cumsum` along `axis` (`exclusive` shifts the prefix sums right,
+    /// `reverse` accumulates from the back).
+    pub fn cumsum(
+        &mut self,
+        x: &str,
+        axis: i32,
+        exclusive: bool,
+        reverse: bool,
+        shape: &[i64],
+        name: &str,
+    ) -> String {
+        let a = self.fresh("axis");
+        let a = self.konst_scalar_i32(&a, axis);
+        let ex = self.fresh("ex");
+        let ex = self.konst_bool(&ex, exclusive);
+        let rv = self.fresh("rv");
+        let rv = self.konst_bool(&rv, reverse);
+        let vt = self.tt(DType::Fp16, shape);
+        self.o1(
+            "cumsum",
+            vec![
+                ("x".into(), bind(x).1),
+                ("axis".into(), bind(&a).1),
+                ("exclusive".into(), bind(&ex).1),
+                ("reverse".into(), bind(&rv).1),
+            ],
+            name,
+            vt,
+        )
+    }
+
+    // --- indexing / data movement ---
+
+    /// `validate_indices=false` const — declared on every gather/scatter
+    /// op from the iOS17 spec on; the CoreML9+ parser rejects the op when
+    /// the binding is absent even though the spec marks it optional.
+    fn konst_validate_indices(&mut self) -> String {
+        let v = self.fresh("vi");
+        self.konst_bool(&v, false)
+    }
+
+    /// `gather`: slices of `x` along `axis` at `indices` (an int32-typed
+    /// name — bind a `konst_i32` or an int32 model input). Output shape is
+    /// `x.shape[:axis] + indices.shape + x.shape[axis+1:]`. `batch_dims`
+    /// leading dims of `x`/`indices` are treated as aligned batch
+    /// coordinates (0 for the classic gather).
+    pub fn gather(
+        &mut self,
+        x: &str,
+        indices: &str,
+        axis: i32,
+        batch_dims: i32,
+        out_shape: &[i64],
+        name: &str,
+    ) -> String {
+        let a = self.fresh("axis");
+        let a = self.konst_scalar_i32(&a, axis);
+        let bd = self.fresh("bd");
+        let bd = self.konst_scalar_i32(&bd, batch_dims);
+        let vi = self.konst_validate_indices();
+        let vt = self.tt(DType::Fp16, out_shape);
+        self.o1(
+            "gather",
+            vec![
+                ("x".into(), bind(x).1),
+                ("indices".into(), bind(indices).1),
+                ("axis".into(), bind(&a).1),
+                ("batch_dims".into(), bind(&bd).1),
+                ("validate_indices".into(), bind(&vi).1),
+            ],
+            name,
+            vt,
+        )
+    }
+
+    /// `gather_along_axis` (`take_along_axis`): `indices` has the same rank
+    /// as `x`; the output takes `indices`' shape.
+    pub fn gather_along_axis(
+        &mut self,
+        x: &str,
+        indices: &str,
+        axis: i32,
+        out_shape: &[i64],
+        name: &str,
+    ) -> String {
+        let a = self.fresh("axis");
+        let a = self.konst_scalar_i32(&a, axis);
+        let vi = self.konst_validate_indices();
+        let vt = self.tt(DType::Fp16, out_shape);
+        self.o1(
+            "gather_along_axis",
+            vec![
+                ("x".into(), bind(x).1),
+                ("indices".into(), bind(indices).1),
+                ("axis".into(), bind(&a).1),
+                ("validate_indices".into(), bind(&vi).1),
+            ],
+            name,
+            vt,
+        )
+    }
+
+    /// `scatter`: write `updates` into `data` at `indices` along `axis`.
+    /// `mode` is one of `"update"`, `"add"`, `"sub"`, `"mul"`, `"div"`,
+    /// `"max"`, `"min"`. Output has `data`'s shape.
+    #[allow(clippy::too_many_arguments)] // mirrors the MIL op's parameter list
+    pub fn scatter(
+        &mut self,
+        data: &str,
+        indices: &str,
+        updates: &str,
+        axis: i32,
+        mode: &str,
+        out_shape: &[i64],
+        name: &str,
+    ) -> String {
+        let a = self.fresh("axis");
+        let a = self.konst_scalar_i32(&a, axis);
+        let m = self.fresh("mode");
+        let m = self.konst_str(&m, mode);
+        let vi = self.konst_validate_indices();
+        let vt = self.tt(DType::Fp16, out_shape);
+        self.o1(
+            "scatter",
+            vec![
+                ("data".into(), bind(data).1),
+                ("indices".into(), bind(indices).1),
+                ("updates".into(), bind(updates).1),
+                ("axis".into(), bind(&a).1),
+                ("mode".into(), bind(&m).1),
+                ("validate_indices".into(), bind(&vi).1),
+            ],
+            name,
+            vt,
+        )
+    }
+
+    /// `scatter_along_axis`: `indices` and `updates` share the output
+    /// shape; `mode` accepts the same strings as [`Block::scatter`].
+    #[allow(clippy::too_many_arguments)] // mirrors the MIL op's parameter list
+    pub fn scatter_along_axis(
+        &mut self,
+        data: &str,
+        indices: &str,
+        updates: &str,
+        axis: i32,
+        mode: &str,
+        out_shape: &[i64],
+        name: &str,
+    ) -> String {
+        let a = self.fresh("axis");
+        let a = self.konst_scalar_i32(&a, axis);
+        let m = self.fresh("mode");
+        let m = self.konst_str(&m, mode);
+        let vi = self.konst_validate_indices();
+        let vt = self.tt(DType::Fp16, out_shape);
+        self.o1(
+            "scatter_along_axis",
+            vec![
+                ("data".into(), bind(data).1),
+                ("indices".into(), bind(indices).1),
+                ("updates".into(), bind(updates).1),
+                ("axis".into(), bind(&a).1),
+                ("mode".into(), bind(&m).1),
+                ("validate_indices".into(), bind(&vi).1),
+            ],
+            name,
+            vt,
+        )
+    }
+
+    /// `topk` along `axis`: returns `(values_name, indices_name)` — the
+    /// indices output is int32 with the same shape as the values.
+    pub fn topk(
+        &mut self,
+        x: &str,
+        k: i32,
+        axis: i32,
+        ascending: bool,
+        out_shape: &[i64],
+        name: &str,
+    ) -> (String, String) {
+        let kc = self.fresh("k");
+        let kc = self.konst_scalar_i32(&kc, k);
+        let a = self.fresh("axis");
+        let a = self.konst_scalar_i32(&a, axis);
+        let asc = self.fresh("asc");
+        let asc = self.konst_bool(&asc, ascending);
+        let vname = format!("{name}_val");
+        let iname = format!("{name}_idx");
+        self.op(
+            "topk",
+            vec![
+                ("x".into(), bind(x).1),
+                ("k".into(), bind(&kc).1),
+                ("axis".into(), bind(&a).1),
+                ("ascending".into(), bind(&asc).1),
+            ],
+            vec![
+                (&vname, self.tt(DType::Fp16, out_shape)),
+                (&iname, self.tt(DType::Int32, out_shape)),
+            ],
+            vec![],
+        );
+        (vname, iname)
+    }
+
+    /// `tile`: replicate `x` by `reps` per dimension.
+    pub fn tile(&mut self, x: &str, reps: &[i32], out_shape: &[i64], name: &str) -> String {
+        let r = self.fresh("reps");
+        let r = self.konst_i32(&r, reps);
+        let vt = self.tt(DType::Fp16, out_shape);
+        self.o1(
+            "tile",
+            vec![("x".into(), bind(x).1), ("reps".into(), bind(&r).1)],
+            name,
+            vt,
+        )
+    }
+
+    /// `pad`: `pad` is `[2*N]` — `pad[2i]`/`pad[2i+1]` before/after the
+    /// last N dims. `mode` is `"constant"`, `"reflect"`, or `"replicate"`;
+    /// `constant_val` applies to constant mode only.
+    pub fn pad(
+        &mut self,
+        x: &str,
+        pad: &[i32],
+        mode: &str,
+        constant_val: f32,
+        out_shape: &[i64],
+        name: &str,
+    ) -> String {
+        let p = self.fresh("pad");
+        let p = self.konst_i32(&p, pad);
+        let m = self.fresh("mode");
+        let m = self.konst_str(&m, mode);
+        let cv = self.fresh("cv");
+        let cv = self.konst_f16(&cv, constant_val);
+        let vt = self.tt(DType::Fp16, out_shape);
+        self.o1(
+            "pad",
+            vec![
+                ("x".into(), bind(x).1),
+                ("pad".into(), bind(&p).1),
+                ("mode".into(), bind(&m).1),
+                ("constant_val".into(), bind(&cv).1),
+            ],
+            name,
+            vt,
+        )
+    }
+
+    /// `split` into `outs` along `axis` — `outs` are `(name, shape)` pairs
+    /// whose axis dim must sum to `x`'s. `split_sizes` is derived from the
+    /// output shapes; `num_splits` is also emitted for the spec's
+    /// either-or requirement.
+    pub fn split(&mut self, x: &str, axis: i32, outs: &[(&str, &[i64])]) -> Vec<String> {
+        let sizes: Vec<i32> = outs
+            .iter()
+            .map(|(_, s)| {
+                let ax = if axis < 0 {
+                    (s.len() as i32 + axis) as usize
+                } else {
+                    axis as usize
+                };
+                s[ax] as i32
+            })
+            .collect();
+        let ss = self.fresh("ss");
+        let ss = self.konst_i32(&ss, &sizes);
+        let ns = self.fresh("ns");
+        let ns = self.konst_scalar_i32(&ns, outs.len() as i32);
+        let a = self.fresh("axis");
+        let a = self.konst_scalar_i32(&a, axis);
+        let out_nvts: Vec<(&str, ValueType)> = outs
+            .iter()
+            .map(|(n, s)| (*n, self.tt(DType::Fp16, s)))
+            .collect();
+        self.op(
+            "split",
+            vec![
+                ("x".into(), bind(x).1),
+                ("num_splits".into(), bind(&ns).1),
+                ("split_sizes".into(), bind(&ss).1),
+                ("axis".into(), bind(&a).1),
+            ],
+            out_nvts,
+            vec![],
+        )
+    }
+
+    /// Materialize `x` broadcast to `shape`. MIL has no `broadcast_to`
+    /// op (coremltools lowers the builder call), so this composites a
+    /// multiply by an fp16 ones tensor — broadcasting does the rest.
+    pub fn broadcast_to(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        let n: usize = shape.iter().map(|d| *d as usize).product();
+        let ones = self.fresh("ones");
+        let ones = {
+            let vt = self.tt(DType::Fp16, shape);
+            self.op(
+                "const",
+                vec![],
+                vec![(&ones, vt)],
+                vec![("val".into(), Value::f16s(shape, &vec![1.0; n]))],
+            )[0]
+            .clone()
+        };
+        self.mul(x, &ones, shape, name)
+    }
+
+    /// `flatten2d`: collapse dims `[0..axis)` and `[axis..rank)` into two
+    /// dims (`axis` default 1 in MIL; pass it explicitly here).
+    pub fn flatten2d(&mut self, x: &str, axis: i32, out_shape: &[i64], name: &str) -> String {
+        let a = self.fresh("axis");
+        let a = self.konst_scalar_i32(&a, axis);
+        let vt = self.tt(DType::Fp16, out_shape);
+        self.o1(
+            "flatten2d",
+            vec![("x".into(), bind(x).1), ("axis".into(), bind(&a).1)],
+            name,
+            vt,
+        )
+    }
+
+    /// `stack`: join tensors along a NEW `axis` (every input gains one dim).
+    pub fn stack(&mut self, xs: &[String], axis: i32, out_shape: &[i64], name: &str) -> String {
+        let a = self.fresh("axis");
+        let a = self.konst_scalar_i32(&a, axis);
+        let refs: Vec<&str> = xs.iter().map(|s| s.as_str()).collect();
+        let vt = self.tt(DType::Fp16, out_shape);
+        self.o1(
+            "stack",
+            vec![
+                ("values".into(), bind_many(&refs)),
+                ("axis".into(), bind(&a).1),
+            ],
+            name,
+            vt,
+        )
+    }
+
+    /// `reverse`: flip `x` along `axes`.
+    pub fn reverse(&mut self, x: &str, axes: &[i32], out_shape: &[i64], name: &str) -> String {
+        let a = self.fresh("axes");
+        let a = self.konst_i32(&a, axes);
+        let vt = self.tt(DType::Fp16, out_shape);
+        self.o1(
+            "reverse",
+            vec![("x".into(), bind(x).1), ("axes".into(), bind(&a).1)],
+            name,
+            vt,
+        )
+    }
+
+    // --- normalization ---
+
+    /// `layer_norm`: `gamma`/`beta` are bound const names shaped
+    /// `x.shape[axes]` (None omits them — MIL defaults to ones/zeros).
+    #[allow(clippy::too_many_arguments)] // mirrors the MIL op's parameter list
+    pub fn layer_norm(
+        &mut self,
+        x: &str,
+        axes: &[i32],
+        gamma: Option<&str>,
+        beta: Option<&str>,
+        eps: f32,
+        shape: &[i64],
+        name: &str,
+    ) -> String {
+        let a = self.fresh("axes");
+        let a = self.konst_i32(&a, axes);
+        let e = self.fresh("eps");
+        let e = self.konst_f16(&e, eps);
+        let mut inputs = vec![
+            ("x".into(), bind(x).1),
+            ("axes".into(), bind(&a).1),
+            ("epsilon".into(), bind(&e).1),
+        ];
+        if let Some(g) = gamma {
+            inputs.push(("gamma".into(), bind(g).1));
+        }
+        if let Some(b) = beta {
+            inputs.push(("beta".into(), bind(b).1));
+        }
+        let vt = self.tt(DType::Fp16, shape);
+        self.o1("layer_norm", inputs, name, vt)
+    }
+
+    /// `batch_norm`: `mean`, `variance` (and optional `gamma`/`beta`) are
+    /// bound `[C]` const names — statistics must be frozen at compile time.
+    #[allow(clippy::too_many_arguments)] // mirrors the MIL op's parameter list
+    pub fn batch_norm(
+        &mut self,
+        x: &str,
+        mean: &str,
+        variance: &str,
+        gamma: Option<&str>,
+        beta: Option<&str>,
+        eps: f32,
+        shape: &[i64],
+        name: &str,
+    ) -> String {
+        let e = self.fresh("eps");
+        let e = self.konst_f16(&e, eps);
+        let mut inputs = vec![
+            ("x".into(), bind(x).1),
+            ("mean".into(), bind(mean).1),
+            ("variance".into(), bind(variance).1),
+            ("epsilon".into(), bind(&e).1),
+        ];
+        if let Some(g) = gamma {
+            inputs.push(("gamma".into(), bind(g).1));
+        }
+        if let Some(b) = beta {
+            inputs.push(("beta".into(), bind(b).1));
+        }
+        let vt = self.tt(DType::Fp16, shape);
+        self.o1("batch_norm", inputs, name, vt)
+    }
+
+    /// `instance_norm`: per-instance, per-channel statistics over the
+    /// spatial dims; optional `[C]` `gamma`/`beta`.
+    pub fn instance_norm(
+        &mut self,
+        x: &str,
+        gamma: Option<&str>,
+        beta: Option<&str>,
+        eps: f32,
+        shape: &[i64],
+        name: &str,
+    ) -> String {
+        let e = self.fresh("eps");
+        let e = self.konst_f16(&e, eps);
+        let mut inputs = vec![("x".into(), bind(x).1), ("epsilon".into(), bind(&e).1)];
+        if let Some(g) = gamma {
+            inputs.push(("gamma".into(), bind(g).1));
+        }
+        if let Some(b) = beta {
+            inputs.push(("beta".into(), bind(b).1));
+        }
+        let vt = self.tt(DType::Fp16, shape);
+        self.o1("instance_norm", inputs, name, vt)
+    }
+
+    /// `local_response_norm` across channels: `x_i / (k + (alpha/size)·Σx_j²)^beta`.
+    #[allow(clippy::too_many_arguments)] // mirrors the MIL op's parameter list
+    pub fn local_response_norm(
+        &mut self,
+        x: &str,
+        size: i32,
+        alpha: f32,
+        beta: f32,
+        k: f32,
+        shape: &[i64],
+        name: &str,
+    ) -> String {
+        let sz = self.fresh("size");
+        let sz = self.konst_scalar_i32(&sz, size);
+        let al = self.fresh("alpha");
+        let al = self.konst_f16(&al, alpha);
+        let be = self.fresh("beta");
+        let be = self.konst_f16(&be, beta);
+        let kk = self.fresh("k");
+        let kk = self.konst_f16(&kk, k);
+        let vt = self.tt(DType::Fp16, shape);
+        self.o1(
+            "local_response_norm",
+            vec![
+                ("x".into(), bind(x).1),
+                ("size".into(), bind(&sz).1),
+                ("alpha".into(), bind(&al).1),
+                ("beta".into(), bind(&be).1),
+                ("k".into(), bind(&kk).1),
+            ],
+            name,
+            vt,
+        )
+    }
+
+    /// Group normalization — MIL has no `group_norm` op, so this is a
+    /// composite: reshape `(n, g*c, h, w)` → `(n, g, c*h*w)`, `layer_norm`
+    /// over the merged group extent, reshape back, then channel-wise
+    /// `gamma`/`beta` (bound `(1, c, 1, 1)` consts). `g` groups over `c`
+    /// channels per group.
+    #[allow(clippy::too_many_arguments)] // mirrors the MIL op's parameter list
+    pub fn group_norm(
+        &mut self,
+        x: &str,
+        n: i64,
+        c: i64,
+        h: i64,
+        w: i64,
+        groups: i64,
+        gamma: Option<&str>,
+        beta: Option<&str>,
+        eps: f32,
+        pfx: &str,
+    ) -> String {
+        let cg = c / groups;
+        let r = self.reshape(x, &[n, groups, cg * h * w], &format!("{pfx}_gr"));
+        let ln = self.layer_norm(
+            &r,
+            &[2],
+            None,
+            None,
+            eps,
+            &[n, groups, cg * h * w],
+            &format!("{pfx}_gln"),
+        );
+        let back = self.reshape(&ln, &[n, c, h, w], &format!("{pfx}_gb"));
+        let shape4 = [n, c, h, w];
+        let with_g = match gamma {
+            Some(g) => self.mul(&back, g, &shape4, &format!("{pfx}_gg")),
+            None => back,
+        };
+        match beta {
+            Some(bt) => self.add(&with_g, bt, &shape4, &format!("{pfx}_gn")),
+            None => with_g,
+        }
+    }
+
+    // --- pooling ---
+
+    /// `avg_pool` over the spatial dims of `x` (`(n, c, *D)`). `pad_type`
+    /// is `"valid"`, `"same"`, `"custom"`, or `"same_lower"`; `pad` is
+    /// `[2*len(D)]` before/after pairs used when `pad_type == "custom"`.
+    #[allow(clippy::too_many_arguments)] // mirrors the MIL op's parameter list
+    pub fn avg_pool(
+        &mut self,
+        x: &str,
+        kernel_sizes: &[i32],
+        strides: &[i32],
+        pad_type: &str,
+        pad: &[i32],
+        out_shape: &[i64],
+        name: &str,
+    ) -> String {
+        self.pool(
+            "avg_pool",
+            x,
+            kernel_sizes,
+            strides,
+            pad_type,
+            pad,
+            true,
+            out_shape,
+            name,
+        )
+    }
+
+    /// `max_pool` — same contract as [`Block::avg_pool`].
+    #[allow(clippy::too_many_arguments)] // mirrors the MIL op's parameter list
+    pub fn max_pool(
+        &mut self,
+        x: &str,
+        kernel_sizes: &[i32],
+        strides: &[i32],
+        pad_type: &str,
+        pad: &[i32],
+        out_shape: &[i64],
+        name: &str,
+    ) -> String {
+        self.pool(
+            "max_pool",
+            x,
+            kernel_sizes,
+            strides,
+            pad_type,
+            pad,
+            false,
+            out_shape,
+            name,
+        )
+    }
+
+    /// Global average pooling over `spatial` dims: kernel covers the whole
+    /// spatial extent, valid padding, unit stride. `x` is `(n, c, *D)`;
+    /// output is `(n, c, 1, …, 1)`.
+    pub fn avg_pool_global(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        let spatial: Vec<i32> = shape[2..].iter().map(|d| *d as i32).collect();
+        let n_out: Vec<i64> = shape
+            .iter()
+            .take(2)
+            .cloned()
+            .chain(std::iter::repeat(1).take(shape.len() - 2))
+            .collect();
+        self.pool(
+            "avg_pool",
+            x,
+            &spatial,
+            &vec![1; spatial.len()],
+            "valid",
+            &vec![0; spatial.len() * 2],
+            true,
+            &n_out,
+            name,
+        )
+    }
+
+    /// Global max pooling — same contract as [`Block::avg_pool_global`].
+    pub fn max_pool_global(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        let spatial: Vec<i32> = shape[2..].iter().map(|d| *d as i32).collect();
+        let n_out: Vec<i64> = shape
+            .iter()
+            .take(2)
+            .cloned()
+            .chain(std::iter::repeat(1).take(shape.len() - 2))
+            .collect();
+        self.pool(
+            "max_pool",
+            x,
+            &spatial,
+            &vec![1; spatial.len()],
+            "valid",
+            &vec![0; spatial.len() * 2],
+            false,
+            &n_out,
+            name,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pool(
+        &mut self,
+        ty: &str,
+        x: &str,
+        kernel_sizes: &[i32],
+        strides: &[i32],
+        pad_type: &str,
+        pad: &[i32],
+        avg: bool,
+        out_shape: &[i64],
+        name: &str,
+    ) -> String {
+        let ks = self.fresh("ks");
+        let ks = self.konst_i32(&ks, kernel_sizes);
+        let st = self.fresh("st");
+        let st = self.konst_i32(&st, strides);
+        let pt = self.fresh("pt");
+        let pt = self.konst_str(&pt, pad_type);
+        let pd = self.fresh("pd");
+        let pd = self.konst_i32(&pd, pad);
+        let cm = self.fresh("cm");
+        let cm = self.konst_bool(&cm, false);
+        let mut inputs = vec![
+            ("x".into(), bind(x).1),
+            ("kernel_sizes".into(), bind(&ks).1),
+            ("strides".into(), bind(&st).1),
+            ("pad_type".into(), bind(&pt).1),
+            ("pad".into(), bind(&pd).1),
+            ("ceil_mode".into(), bind(&cm).1),
+        ];
+        if avg {
+            let ex = self.fresh("ex");
+            let ex = self.konst_bool(&ex, false);
+            inputs.push(("exclude_padding_from_average".into(), bind(&ex).1));
+        }
+        let vt = self.tt(DType::Fp16, out_shape);
+        self.o1(ty, inputs, name, vt)
+    }
+
+    // --- resizing ---
+
+    /// `upsample_nearest_neighbor` over the last two dims by integer
+    /// scale factors.
+    pub fn upsample_nearest(
+        &mut self,
+        x: &str,
+        scale_h: i32,
+        scale_w: i32,
+        out_shape: &[i64],
+        name: &str,
+    ) -> String {
+        let sh = self.fresh("sh");
+        let sh = self.konst_scalar_i32(&sh, scale_h);
+        let sw = self.fresh("sw");
+        let sw = self.konst_scalar_i32(&sw, scale_w);
+        let vt = self.tt(DType::Fp16, out_shape);
+        self.o1(
+            "upsample_nearest_neighbor",
+            vec![
+                ("x".into(), bind(x).1),
+                ("scale_factor_height".into(), bind(&sh).1),
+                ("scale_factor_width".into(), bind(&sw).1),
+            ],
+            name,
+            vt,
+        )
+    }
+
+    /// `upsample_bilinear` over the last two dims; `align_corners` chooses
+    /// the sampling grid (MIL default `true`).
+    pub fn upsample_bilinear(
+        &mut self,
+        x: &str,
+        scale_h: i32,
+        scale_w: i32,
+        align_corners: bool,
+        out_shape: &[i64],
+        name: &str,
+    ) -> String {
+        let sh = self.fresh("sh");
+        let sh = self.konst_scalar_i32(&sh, scale_h);
+        let sw = self.fresh("sw");
+        let sw = self.konst_scalar_i32(&sw, scale_w);
+        let ac = self.fresh("ac");
+        let ac = self.konst_bool(&ac, align_corners);
+        let vt = self.tt(DType::Fp16, out_shape);
+        self.o1(
+            "upsample_bilinear",
+            vec![
+                ("x".into(), bind(x).1),
+                ("scale_factor_height".into(), bind(&sh).1),
+                ("scale_factor_width".into(), bind(&sw).1),
+                ("align_corners".into(), bind(&ac).1),
+            ],
+            name,
+            vt,
+        )
+    }
+
+    // --- conv / linear ---
+
+    /// General N-D `conv`: `w` is `(cout, cin/groups, *K)`; `strides`,
+    /// `dilations` have one entry per spatial dim; `pad` is
+    /// `[2*len(D)]` before/after pairs (used with `pad_type="custom"`;
+    /// emit zeros for `valid`). `groups` splits channel dims.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv(
+        &mut self,
+        x: &str,
+        w: &str,
+        bias: Option<&str>,
+        strides: &[i32],
+        pad_type: &str,
+        pad: &[i32],
+        dilations: &[i32],
+        groups: i32,
+        out_shape: &[i64],
+        name: &str,
+    ) -> String {
+        let st = self.fresh("stride");
+        let st = self.konst_i32(&st, strides);
+        let pt = self.fresh("padtype");
+        let pt = self.konst_str(&pt, pad_type);
+        let pd = self.fresh("pad");
+        let pd = self.konst_i32(&pd, pad);
+        let dl = self.fresh("dil");
+        let dl = self.konst_i32(&dl, dilations);
+        let g = self.fresh("grp");
+        let g = self.konst_scalar_i32(&g, groups);
+        let mut inputs = vec![
+            ("x".into(), bind(x).1),
+            ("weight".into(), bind(w).1),
+            ("strides".into(), bind(&st).1),
+            ("pad_type".into(), bind(&pt).1),
+            ("pad".into(), bind(&pd).1),
+            ("dilations".into(), bind(&dl).1),
+            ("groups".into(), bind(&g).1),
+        ];
+        if let Some(bi) = bias {
+            inputs.push(("bias".into(), bind(bi).1));
+        }
+        let vt = self.tt(DType::Fp16, out_shape);
+        self.o1("conv", inputs, name, vt)
+    }
+
+    /// `linear`: `x @ weight.T + bias` — `x` is `(*D, in)`, `weight` is
+    /// `(out, in)`, optional `bias` is `(out,)`. Rank ≤ 3.
+    pub fn linear(
+        &mut self,
+        x: &str,
+        w: &str,
+        bias: Option<&str>,
+        out_shape: &[i64],
+        name: &str,
+    ) -> String {
+        let mut inputs = vec![("x".into(), bind(x).1), ("weight".into(), bind(w).1)];
+        if let Some(bi) = bias {
+            inputs.push(("bias".into(), bind(bi).1));
+        }
+        let vt = self.tt(DType::Fp16, out_shape);
+        self.o1("linear", inputs, name, vt)
+    }
+
+    // --- extended elementwise ---
+
+    /// `square` elementwise (x²).
+    pub fn square(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        self.unary("square", x, shape, name)
+    }
+
+    /// `asin` elementwise.
+    pub fn asin(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        self.unary("asin", x, shape, name)
+    }
+
+    /// `acos` elementwise.
+    pub fn acos(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        self.unary("acos", x, shape, name)
+    }
+
+    /// `atan` elementwise.
+    pub fn atan(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        self.unary("atan", x, shape, name)
+    }
+
+    /// `atanh` elementwise.
+    pub fn atanh(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        self.unary("atanh", x, shape, name)
+    }
+
+    /// `softplus` elementwise: `log(1 + e^x)`.
+    pub fn softplus(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        self.unary("softplus", x, shape, name)
+    }
+
+    /// `softsign` elementwise: `x / (1 + |x|)`.
+    pub fn softsign(&mut self, x: &str, shape: &[i64], name: &str) -> String {
+        self.unary("softsign", x, shape, name)
+    }
+
+    /// `sigmoid_hard` elementwise: `clamp(alpha*x + beta, 0, 1)`.
+    pub fn sigmoid_hard(
+        &mut self,
+        x: &str,
+        alpha: f32,
+        beta: f32,
+        shape: &[i64],
+        name: &str,
+    ) -> String {
+        let a = self.fresh("alpha");
+        let a = self.konst_f16(&a, alpha);
+        let b_ = self.fresh("beta");
+        let b_ = self.konst_f16(&b_, beta);
+        let vt = self.tt(DType::Fp16, shape);
+        self.o1(
+            "sigmoid_hard",
+            vec![
+                ("x".into(), bind(x).1),
+                ("alpha".into(), bind(&a).1),
+                ("beta".into(), bind(&b_).1),
+            ],
+            name,
+            vt,
+        )
+    }
+
+    /// `elu` elementwise: `x > 0 ? x : alpha*(e^x - 1)`.
+    pub fn elu(&mut self, x: &str, alpha: f32, shape: &[i64], name: &str) -> String {
+        let a = self.fresh("alpha");
+        let a = self.konst_f16(&a, alpha);
+        let vt = self.tt(DType::Fp16, shape);
+        self.o1(
+            "elu",
+            vec![("x".into(), bind(x).1), ("alpha".into(), bind(&a).1)],
+            name,
+            vt,
+        )
+    }
+
+    /// `clamped_relu` elementwise: `min(max(x, alpha), beta)`.
+    pub fn clamped_relu(
+        &mut self,
+        x: &str,
+        alpha: f32,
+        beta: f32,
+        shape: &[i64],
+        name: &str,
+    ) -> String {
+        let a = self.fresh("alpha");
+        let a = self.konst_f16(&a, alpha);
+        let b_ = self.fresh("beta");
+        let b_ = self.konst_f16(&b_, beta);
+        let vt = self.tt(DType::Fp16, shape);
+        self.o1(
+            "clamped_relu",
+            vec![
+                ("x".into(), bind(x).1),
+                ("alpha".into(), bind(&a).1),
+                ("beta".into(), bind(&b_).1),
+            ],
+            name,
+            vt,
+        )
+    }
+
+    /// `prelu` elementwise: `x > 0 ? x : alpha_c * x`; `alpha` is a bound
+    /// `[C]` const matched against the channel dim of `x`.
+    pub fn prelu(&mut self, x: &str, alpha: &str, shape: &[i64], name: &str) -> String {
+        let vt = self.tt(DType::Fp16, shape);
+        self.o1(
+            "prelu",
+            vec![("x".into(), bind(x).1), ("alpha".into(), bind(alpha).1)],
+            name,
+            vt,
+        )
+    }
+
+    /// `l2_norm` elementwise: `x / sqrt(Σx² + epsilon)` over the whole
+    /// tensor (MIL `l2_norm` op, not the reduction).
+    pub fn l2_norm(&mut self, x: &str, eps: f32, shape: &[i64], name: &str) -> String {
+        let e = self.fresh("eps");
+        let e = self.konst_f16(&e, eps);
+        let vt = self.tt(DType::Fp16, shape);
+        self.o1(
+            "l2_norm",
+            vec![("x".into(), bind(x).1), ("epsilon".into(), bind(&e).1)],
+            name,
+            vt,
+        )
+    }
+
+    // --- extended indexing ---
+
+    /// `gather_nd`: `indices[..., 0:N]` indexes the first N dims of `x`;
+    /// output shape is `indices.shape[:-1] + x.shape[N:]`.
+    pub fn gather_nd(&mut self, x: &str, indices: &str, out_shape: &[i64], name: &str) -> String {
+        let vi = self.konst_validate_indices();
+        let vt = self.tt(DType::Fp16, out_shape);
+        self.o1(
+            "gather_nd",
+            vec![
+                ("x".into(), bind(x).1),
+                ("indices".into(), bind(indices).1),
+                ("validate_indices".into(), bind(&vi).1),
+            ],
+            name,
+            vt,
+        )
+    }
+
+    /// `scatter_nd`: write `updates` into `data` at `indices`
+    /// (`indices.shape[-1] <= rank(data)`; `mode` accepts the same strings
+    /// as [`Block::scatter`]). Output has `data`'s shape.
+    pub fn scatter_nd(
+        &mut self,
+        data: &str,
+        indices: &str,
+        updates: &str,
+        mode: &str,
+        out_shape: &[i64],
+        name: &str,
+    ) -> String {
+        let m = self.fresh("mode");
+        let m = self.konst_str(&m, mode);
+        let vi = self.konst_validate_indices();
+        let vt = self.tt(DType::Fp16, out_shape);
+        self.o1(
+            "scatter_nd",
+            vec![
+                ("data".into(), bind(data).1),
+                ("indices".into(), bind(indices).1),
+                ("updates".into(), bind(updates).1),
+                ("mode".into(), bind(&m).1),
+                ("validate_indices".into(), bind(&vi).1),
+            ],
+            name,
+            vt,
+        )
+    }
+
+    /// `argsort` along `axis`; int32 index output.
+    pub fn argsort(
+        &mut self,
+        x: &str,
+        axis: i32,
+        ascending: bool,
+        shape: &[i64],
+        name: &str,
+    ) -> String {
+        let a = self.fresh("axis");
+        let a = self.konst_scalar_i32(&a, axis);
+        let asc = self.fresh("asc");
+        let asc = self.konst_bool(&asc, ascending);
+        let vt = self.tt(DType::Int32, shape);
+        self.o1(
+            "argsort",
+            vec![
+                ("x".into(), bind(x).1),
+                ("axis".into(), bind(&a).1),
+                ("ascending".into(), bind(&asc).1),
+            ],
+            name,
+            vt,
+        )
+    }
+
+    /// `one_hot`: `indices` (int32 tensor name) → one-hot at `axis` with
+    /// vector size `depth`; `on_value`/`off_value` are fp16 scalar consts.
+    #[allow(clippy::too_many_arguments)] // mirrors the MIL op's parameter list
+    pub fn one_hot(
+        &mut self,
+        indices: &str,
+        depth: i32,
+        axis: i32,
+        on_value: f32,
+        off_value: f32,
+        out_shape: &[i64],
+        name: &str,
+    ) -> String {
+        let d = self.fresh("depth");
+        let d = self.konst_scalar_i32(&d, depth);
+        let a = self.fresh("axis");
+        let a = self.konst_scalar_i32(&a, axis);
+        let on = self.fresh("on");
+        let on = self.konst_f16(&on, on_value);
+        let off = self.fresh("off");
+        let off = self.konst_f16(&off, off_value);
+        let vt = self.tt(DType::Fp16, out_shape);
+        self.o1(
+            "one_hot",
+            vec![
+                ("indices".into(), bind(indices).1),
+                ("one_hot_vector_size".into(), bind(&d).1),
+                ("axis".into(), bind(&a).1),
+                ("on_value".into(), bind(&on).1),
+                ("off_value".into(), bind(&off).1),
+            ],
+            name,
+            vt,
+        )
+    }
+
+    // --- space transforms ---
+
+    /// `depth_to_space`: `[n, c*b², h, w]` → `[n, c, h*b, w*b]`.
+    pub fn depth_to_space(
+        &mut self,
+        x: &str,
+        block_size: i32,
+        out_shape: &[i64],
+        name: &str,
+    ) -> String {
+        let bs = self.fresh("bs");
+        let bs = self.konst_scalar_i32(&bs, block_size);
+        let vt = self.tt(DType::Fp16, out_shape);
+        self.o1(
+            "depth_to_space",
+            vec![("x".into(), bind(x).1), ("block_size".into(), bind(&bs).1)],
+            name,
+            vt,
+        )
+    }
+
+    /// `space_to_depth`: `[n, c, h*b, w*b]` → `[n, c*b², h, w]`.
+    pub fn space_to_depth(
+        &mut self,
+        x: &str,
+        block_size: i32,
+        out_shape: &[i64],
+        name: &str,
+    ) -> String {
+        let bs = self.fresh("bs");
+        let bs = self.konst_scalar_i32(&bs, block_size);
+        let vt = self.tt(DType::Fp16, out_shape);
+        self.o1(
+            "space_to_depth",
+            vec![("x".into(), bind(x).1), ("block_size".into(), bind(&bs).1)],
+            name,
+            vt,
+        )
+    }
+
+    /// `pixel_shuffle`: `[n, c*r², h, w]` → `[n, c, h*r, w*r]` (PyTorch
+    /// `nn.PixelShuffle` layout).
+    pub fn pixel_shuffle(
+        &mut self,
+        x: &str,
+        upscale_factor: i32,
+        out_shape: &[i64],
+        name: &str,
+    ) -> String {
+        let u = self.fresh("up");
+        let u = self.konst_scalar_i32(&u, upscale_factor);
+        let vt = self.tt(DType::Fp16, out_shape);
+        self.o1(
+            "pixel_shuffle",
+            vec![
+                ("x".into(), bind(x).1),
+                ("upscale_factor".into(), bind(&u).1),
+            ],
+            name,
+            vt,
+        )
+    }
+
+    /// `sliding_windows`: extract `size`-windows along `axis` at `stride`,
+    /// appending a trailing `size` dim. Output rank is `rank(x)+1`.
+    pub fn sliding_windows(
+        &mut self,
+        x: &str,
+        axis: i32,
+        size: i32,
+        stride: i32,
+        out_shape: &[i64],
+        name: &str,
+    ) -> String {
+        let a = self.fresh("axis");
+        let a = self.konst_scalar_i32(&a, axis);
+        let s = self.fresh("size");
+        let s = self.konst_scalar_i32(&s, size);
+        let st = self.fresh("stride");
+        let st = self.konst_scalar_i32(&st, stride);
+        let vt = self.tt(DType::Fp16, out_shape);
+        self.o1(
+            "sliding_windows",
+            vec![
+                ("x".into(), bind(x).1),
+                ("axis".into(), bind(&a).1),
+                ("size".into(), bind(&s).1),
+                ("stride".into(), bind(&st).1),
+            ],
+            name,
+            vt,
+        )
+    }
+
+    /// `slice_by_size`: `x[begin..begin+size)` per dim (`begin`/`size` are
+    /// rank-length int32 vectors).
+    pub fn slice_by_size(
+        &mut self,
+        x: &str,
+        begin: &[i32],
+        size: &[i32],
+        out_shape: &[i64],
+        name: &str,
+    ) -> String {
+        let b0 = self.fresh("begin");
+        let b0 = self.konst_i32(&b0, begin);
+        let s0 = self.fresh("size");
+        let s0 = self.konst_i32(&s0, size);
+        let vt = self.tt(DType::Fp16, out_shape);
+        self.o1(
+            "slice_by_size",
+            vec![
+                ("x".into(), bind(x).1),
+                ("begin".into(), bind(&b0).1),
+                ("size".into(), bind(&s0).1),
+            ],
+            name,
+            vt,
+        )
+    }
+
+    /// `conv_transpose` (fractionally-strided conv): `w` is
+    /// `(cin, cout/groups, *K)`; `output_shape` is `[n, cout, *D_out]` when
+    /// the output extent is ambiguous (`pad_type="same"`), else `None`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv_transpose(
+        &mut self,
+        x: &str,
+        w: &str,
+        bias: Option<&str>,
+        strides: &[i32],
+        pad_type: &str,
+        pad: &[i32],
+        dilations: &[i32],
+        groups: i32,
+        output_shape: Option<&[i32]>,
+        out_shape: &[i64],
+        name: &str,
+    ) -> String {
+        let st = self.fresh("stride");
+        let st = self.konst_i32(&st, strides);
+        let pt = self.fresh("padtype");
+        let pt = self.konst_str(&pt, pad_type);
+        let pd = self.fresh("pad");
+        let pd = self.konst_i32(&pd, pad);
+        let dl = self.fresh("dil");
+        let dl = self.konst_i32(&dl, dilations);
+        let g = self.fresh("grp");
+        let g = self.konst_scalar_i32(&g, groups);
+        let mut inputs = vec![
+            ("x".into(), bind(x).1),
+            ("weight".into(), bind(w).1),
+            ("strides".into(), bind(&st).1),
+            ("pad_type".into(), bind(&pt).1),
+            ("pad".into(), bind(&pd).1),
+            ("dilations".into(), bind(&dl).1),
+            ("groups".into(), bind(&g).1),
+        ];
+        if let Some(bi) = bias {
+            inputs.push(("bias".into(), bind(bi).1));
+        }
+        if let Some(os) = output_shape {
+            let o = self.fresh("oshape");
+            let o = self.konst_i32(&o, os);
+            inputs.push(("output_shape".into(), bind(&o).1));
+        }
+        let vt = self.tt(DType::Fp16, out_shape);
+        self.o1("conv_transpose", inputs, name, vt)
     }
 
     /// RMSNorm (fp16-safe):

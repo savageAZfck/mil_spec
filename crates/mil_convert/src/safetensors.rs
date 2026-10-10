@@ -182,6 +182,44 @@ impl Safetensors {
         };
         Ok((t.shape.clone(), out))
     }
+
+    /// Tensor contents as f32 elements.
+    ///
+    /// F32 passes through; F16 and BF16 are widened per-element.
+    /// Returned shape is the stored shape.
+    pub fn tensor_f32(&self, name: &str) -> std::io::Result<(Vec<i64>, Vec<f32>)> {
+        let t = self.map.get(name).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("tensor {name} not in {}", self.path.display()),
+            )
+        })?;
+        let raw = self.tensor_bytes(name)?;
+        let out = match t.dtype {
+            StDType::F32 => raw
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+            StDType::F16 => raw
+                .chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect(),
+            StDType::Bf16 => raw
+                .chunks_exact(2)
+                .map(|c| {
+                    let bits = u16::from_le_bytes([c[0], c[1]]);
+                    f32::from_bits((bits as u32) << 16)
+                })
+                .collect(),
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{name}: dtype {other:?} cannot convert to f32"),
+                ))
+            }
+        };
+        Ok((t.shape.clone(), out))
+    }
 }
 
 /// Open every `.safetensors` file in a directory (handles sharded

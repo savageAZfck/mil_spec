@@ -418,6 +418,7 @@ fn package_vs_reference(
         embed: false,
         spec_version: 10,
         opset: "CoreML9".into(),
+        lora: None,
     };
     let pkg = work.0.join("model.mlpackage");
     let compiled = work.0.join("model.compiled");
@@ -664,6 +665,7 @@ fn contract_probe(tag: &str, hf_dir: &Path) {
         embed: false,
         spec_version: 10,
         opset: "CoreML9".into(),
+        lora: None,
     };
     let pkg = work.0.join("m.mlpackage");
     let compiled = work.0.join("m.compiled");

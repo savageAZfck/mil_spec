@@ -37,11 +37,14 @@
 pub mod builder;
 pub mod config;
 pub mod gguf;
+pub mod lora;
+pub mod npz;
 pub mod safetensors;
 
 pub use builder::{Options, Quant};
 pub use config::ModelConfig;
 pub use gguf::Gguf;
+pub use lora::{Lora, LoraPair};
 
 use mil_spec::{encode_model, write_mlpackage_stream, BlobWriter, ModelMeta};
 use std::path::Path;
@@ -55,6 +58,22 @@ pub trait WeightSource {
     fn has(&self, name: &str) -> bool;
     /// `(shape, f16 LE bytes)` for `name`.
     fn tensor_f16(&self, name: &str) -> std::io::Result<(Vec<i64>, Vec<u8>)>;
+    /// `(shape, f32 elements)` for `name`. Default decodes the f16
+    /// form; stores that keep f32 natively should override.
+    fn tensor_f32(&self, name: &str) -> std::io::Result<(Vec<i64>, Vec<f32>)> {
+        let (shape, bytes) = self.tensor_f16(name)?;
+        Ok((
+            shape,
+            bytes
+                .chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect(),
+        ))
+    }
+    /// Logical shape for `name` without reading tensor bytes.
+    fn shape(&self, name: &str) -> std::io::Result<Vec<i64>> {
+        Ok(self.tensor_f16(name)?.0)
+    }
 }
 
 impl WeightSource for Vec<safetensors::Safetensors> {
@@ -69,6 +88,24 @@ impl WeightSource for Vec<safetensors::Safetensors> {
             )
         })?;
         st.tensor_f16(name)
+    }
+    fn tensor_f32(&self, name: &str) -> std::io::Result<(Vec<i64>, Vec<f32>)> {
+        let st = safetensors::find(self, name).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("missing weight {name}"),
+            )
+        })?;
+        st.tensor_f32(name)
+    }
+    fn shape(&self, name: &str) -> std::io::Result<Vec<i64>> {
+        let st = safetensors::find(self, name).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("missing weight {name}"),
+            )
+        })?;
+        Ok(st.info(name).map(|i| i.shape.clone()).unwrap_or_default())
     }
 }
 
@@ -201,6 +238,24 @@ fn convert_impl(
     out_pkg: &Path,
     opts: &Options,
 ) -> Result<ConvertReport> {
+    // Optional LoRA bake-in. Validate every adapter target against the
+    // checkpoint before `weight.bin` is opened, then wrap the source so
+    // emitters stream fused values through the normal fp16/int8 path.
+    let lora = match &opts.lora {
+        Some(p) => {
+            Some(lora::Lora::load(p).map_err(|e| ConvertError::Config(format!("lora: {e}")))?)
+        }
+        None => None,
+    };
+    let fused_src;
+    let src: &dyn WeightSource = match &lora {
+        Some(l) => {
+            l.validate(src).map_err(ConvertError::Io)?;
+            fused_src = lora::FusedSource::new(src, l);
+            &fused_src
+        }
+        None => src,
+    };
     for l in 0..cfg.num_layers {
         for suffix in [
             "input_layernorm.weight",
@@ -477,6 +532,7 @@ mod tests {
             embed: false,
             spec_version: 10,
             opset: "CoreML9".into(),
+            lora: None,
         };
         let r = convert(&model, &pkg, &opts).unwrap();
         assert!(r.op_count > 0);

@@ -1,7 +1,7 @@
 //! `milc` — the mil_spec toolchain CLI.
 //!
 //! ```text
-//! milc convert <model_dir> -o <pkg> [--seq N] [--max-kv N] [--fp16]
+//! milc convert <model_dir> -o <pkg> [--seq N] [--max-kv N] [--fp16] [--lora <adapter>]
 //! milc lint    <pkg>                  # ANE-placement report
 //! milc inspect <pkg>                  # spec summary
 //! milc diff    <a> <b>                # structural spec diff
@@ -55,7 +55,7 @@ fn usage() {
         "milc — the mil_spec toolchain\n\
          \n\
          usage:\n\
-         \x20 milc convert <model_dir|model.gguf> -o <pkg.mlpackage> [--seq N] [--max-kv N] [--fp16]\n\
+         \x20 milc convert <model_dir|model.gguf> -o <pkg.mlpackage> [--seq N] [--max-kv N] [--fp16] [--lora <adapter>]\n\
          \x20 milc gguf    <file.gguf> [--json] [--tokenizer <out.json>]   # header, metadata, tensor table\n\
          \x20 milc lint    <pkg.mlpackage|file.mlmodel>\n\
          \x20 milc inspect <pkg.mlpackage|file.mlmodel>\n\
@@ -116,6 +116,13 @@ fn cmd_convert(args: &[String]) -> ExitCode {
             }
             "--opset" => {
                 opts.opset = args.get(i + 1).cloned().unwrap_or_else(|| "CoreML9".into());
+                i += 2;
+            }
+            "--lora" => {
+                // Adapter dir (adapter_config.json + adapters.safetensors
+                // / *.npz) or a bare safetensors/npz file. Baked into the
+                // emitted weights as W + scale·(B @ A).
+                opts.lora = args.get(i + 1).map(PathBuf::from);
                 i += 2;
             }
             other if !other.starts_with('-') => {

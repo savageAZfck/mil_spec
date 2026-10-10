@@ -874,6 +874,27 @@ impl WeightSource for Gguf {
             }
         })
     }
+    fn tensor_f32(&self, name: &str) -> std::io::Result<(Vec<i64>, Vec<f32>)> {
+        Gguf::tensor_f32(self, name).map_err(|e| match e {
+            GgufError::Io(e) => e,
+            GgufError::Format(m) => {
+                let kind = if m.contains("not in file") || m.contains("no ggml name") {
+                    std::io::ErrorKind::NotFound
+                } else {
+                    std::io::ErrorKind::InvalidData
+                };
+                std::io::Error::new(kind, m)
+            }
+        })
+    }
+    fn shape(&self, name: &str) -> std::io::Result<Vec<i64>> {
+        self.tensor_hf(name).map(|t| t.hf_shape()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("missing weight {name}"),
+            )
+        })
+    }
 }
 
 /// Inverse of the llama.cpp Q/K head interleave. Not an involution in
