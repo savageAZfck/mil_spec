@@ -81,7 +81,7 @@ macro_rules! e5sym {
     }};
 }
 
-struct Api {
+pub(crate) struct Api {
     cfg_create: unsafe extern "C" fn(*mut *mut c_void) -> Rc,
     cfg_set_cache: unsafe extern "C" fn(*mut c_void, *const c_char) -> Rc,
     comp_create_cfg: unsafe extern "C" fn(*mut *mut c_void, *mut c_void) -> Rc,
@@ -123,7 +123,7 @@ struct Api {
 }
 
 impl Api {
-    fn open() -> Result<Self, E5Error> {
+    pub(crate) fn open() -> Result<Self, E5Error> {
         let path = CString::new(ESPRESSO).unwrap();
         let h = unsafe { dlopen(path.as_ptr(), RTLD_NOW) };
         if h.is_null() {
@@ -168,6 +168,104 @@ impl Api {
             stream_exec: e5sym!(h, "e5rt_execution_stream_execute_sync", (*mut c_void) -> Rc),
         })
     }
+}
+
+impl Api {
+    /// Retain an input/output/inout port on `op`.
+    pub(crate) fn port(
+        &self,
+        op: *mut c_void,
+        kind: PortKind,
+        name: &str,
+    ) -> Result<*mut c_void, E5Error> {
+        let f = match kind {
+            PortKind::In => self.op_in_port,
+            PortKind::Out => self.op_out_port,
+            PortKind::InOut => self.op_inout_port,
+        };
+        let mut p = std::ptr::null_mut();
+        check(unsafe { f(op, cstr(name).as_ptr(), &mut p) }, "retain_port")?;
+        Ok(p)
+    }
+
+    /// Port names by kind.
+    pub(crate) fn port_names(&self, op: *mut c_void, kind: PortKind) -> Vec<String> {
+        let (num, get) = match kind {
+            PortKind::In => (self.op_num_inputs, self.op_input_names),
+            PortKind::Out => (self.op_num_outputs, self.op_output_names),
+            PortKind::InOut => (self.op_num_inouts, self.op_inout_names),
+        };
+        unsafe {
+            let mut n = 0u64;
+            if num(op, &mut n) != 0 || n == 0 {
+                return vec![];
+            }
+            let mut ptrs = vec![std::ptr::null::<c_char>(); n as usize];
+            if get(op, n, ptrs.as_mut_ptr()) != 0 {
+                return vec![];
+            }
+            ptrs.iter()
+                .filter(|p| !p.is_null())
+                .map(|p| std::ffi::CStr::from_ptr(*p).to_string_lossy().into_owned())
+                .collect()
+        }
+    }
+
+    /// Element count for a port's tensor descriptor.
+    pub(crate) fn port_elems(&self, port: *mut c_void) -> u64 {
+        unsafe {
+            let mut td = std::ptr::null_mut();
+            if (self.port_tensor_desc)(port, &mut td) != 0 || td.is_null() {
+                return 0;
+            }
+            let mut elems = 0u64;
+            let _ = (self.td_num_elems)(td, &mut elems);
+            let _ = (self.td_release)(&mut td);
+            elems
+        }
+    }
+
+    /// Allocate a CPU-type buffer of `bytes`.
+    pub(crate) fn buf(&self, bytes: u64) -> Result<*mut c_void, E5Error> {
+        let mut b = std::ptr::null_mut();
+        check(unsafe { (self.buf_alloc)(&mut b, bytes, 0) }, "buffer_object_alloc")?;
+        Ok(b)
+    }
+
+    /// Bind `buf` to `port`.
+    pub(crate) fn bind(&self, port: *mut c_void, buf: *mut c_void) -> Result<(), E5Error> {
+        check(unsafe { (self.port_bind)(port, buf) }, "io_port_bind")
+    }
+
+    /// Host data pointer for a buffer.
+    pub(crate) fn ptr(&self, buf: *mut c_void) -> Result<*mut u16, E5Error> {
+        let mut p = std::ptr::null_mut();
+        check(unsafe { (self.buf_ptr)(buf, &mut p) }, "buffer_get_data_ptr")?;
+        Ok(p as *mut u16)
+    }
+
+    /// New execution stream.
+    pub(crate) fn stream(&self) -> Result<*mut c_void, E5Error> {
+        let mut s = std::ptr::null_mut();
+        check(unsafe { (self.stream_create)(&mut s) }, "stream_create")?;
+        Ok(s)
+    }
+
+    pub(crate) fn encode(&self, stream: *mut c_void, op: *mut c_void) -> Result<(), E5Error> {
+        check(unsafe { (self.stream_encode)(stream, op) }, "encode_operation")
+    }
+
+    pub(crate) fn exec(&self, stream: *mut c_void) -> Result<(), E5Error> {
+        check(unsafe { (self.stream_exec)(stream) }, "execute_sync")
+    }
+}
+
+/// Which of an op's three port families.
+#[derive(Clone, Copy)]
+pub(crate) enum PortKind {
+    In,
+    Out,
+    InOut,
 }
 
 fn check(rc: Rc, what: &'static str) -> Result<(), E5Error> {
@@ -219,9 +317,12 @@ impl Program {
     /// `inputs`/`inouts`/`outputs`: `(port_name, n_elems)` fp16 ports to
     /// bind. Stateful models: `state<>` params are *inout* ports —
     /// read and written in place by the engine across calls.
-    /// Compile `mil` for `mask` and return (api, op, function_names).
-    fn make_op(mil: &Path, mask: DeviceMask) -> Result<(Api, *mut c_void, Vec<String>), E5Error> {
-        let api = Api::open()?;
+    /// Compile `mil` for `mask` and return (op, function_names) on `api`.
+    pub(crate) fn make_op_on(
+        api: &Api,
+        mil: &Path,
+        mask: DeviceMask,
+    ) -> Result<(*mut c_void, Vec<String>), E5Error> {
         unsafe {
             let mut cfg = std::ptr::null_mut();
             check((api.cfg_create)(&mut cfg), "config_options_create")?;
@@ -272,7 +373,7 @@ impl Program {
             check((api.op_opts_set_intermed)(oo, 1), "op_set_intermediate_buffers")?;
             let mut op = std::ptr::null_mut();
             check((api.op_create)(&mut op, oo), "op_create")?;
-            Ok((api, op, functions))
+            Ok((op, functions))
         }
     }
 
@@ -348,7 +449,8 @@ impl Program {
     /// Compile + self-configuring bind: port names and element counts
     /// are read back from the op's tensor descriptors.
     pub fn compile_auto(mil: &Path, mask: DeviceMask) -> Result<(Self, PortMap), E5Error> {
-        let (api, op, functions) = Self::make_op(mil, mask)?;
+        let api = Api::open()?;
+        let (op, functions) = Self::make_op_on(&api, mil, mask)?;
         let map = Self::port_map(op, &api);
         let ins = Self::bind_ports(&api, op, api.op_in_port, &map.inputs)?;
         let inouts = Self::bind_ports(&api, op, api.op_inout_port, &map.inouts)?;
@@ -379,7 +481,8 @@ impl Program {
         outputs: &[(&str, u64)],
         inouts: &[(&str, u64)],
     ) -> Result<Self, E5Error> {
-        let (api, op, functions) = Self::make_op(mil, mask)?;
+        let api = Api::open()?;
+        let (op, functions) = Self::make_op_on(&api, mil, mask)?;
         unsafe {
             let ins = Self::bind_ports(
                 &api,

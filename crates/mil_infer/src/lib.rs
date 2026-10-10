@@ -37,6 +37,11 @@ pub use anec::{Anec, AnecError, Verdict, ARCHES};
 /// compile once, eval many, no entitlement required.
 pub mod e5rt;
 
+/// Chained multi-shard decode on the ANE — layer shards ping-pong
+/// through shared `hidden` buffers in one execution stream.
+pub mod ane_pipeline;
+pub use ane_pipeline::Pipeline;
+
 /// Which hardware units the model is allowed to use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComputeUnits {
