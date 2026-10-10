@@ -87,7 +87,8 @@ fn usage() {
          \x20 milc machine memory -o <pkg.mlpackage> [--slots N] [--dim D]\n\
          \x20 milc ane lower    <model.mil> [-o <out.mil>] [--pos N] # stripe-split states, bake indices → ANE dialect\n\
          \x20 milc ane validate <model.mil> [--arch h16g]            # direct ANEC verdict, no CoreML\n\
-         \x20 milc ane compile  <model.mil> [-o <dir>] [--arch h16g] # direct ANE Mach-O, no CoreML\n"
+         \x20 milc ane compile  <model.mil> [-o <dir>] [--arch h16g] # direct ANE Mach-O, no CoreML\n\
+         \x20 milc ane run      <model.mil> [--steps N]              # compile + execute on the engine via e5rt\n"
     );
 }
 
@@ -106,7 +107,7 @@ fn cmd_ane(args: &[String]) -> ExitCode {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "lower" | "validate" | "compile" => {
+            "lower" | "validate" | "compile" | "run" => {
                 if mode.is_empty() {
                     mode = args[i].as_str();
                 }
@@ -121,7 +122,7 @@ fn cmd_ane(args: &[String]) -> ExitCode {
                     arch = a.clone();
                 }
             }
-            "--pos" => {
+            "--pos" | "--steps" => {
                 i += 1;
                 pos = args
                     .get(i)
@@ -146,8 +147,55 @@ fn cmd_ane(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
     if mode.is_empty() {
-        eprintln!("milc ane: need lower, validate, or compile");
+        eprintln!("milc ane: need lower, validate, compile, or run");
         return ExitCode::from(2);
+    }
+    if mode == "run" {
+        let steps = if pos > 0 { pos as u32 } else { 1 };
+        let (prog, map) = match mil_infer::e5rt::Program::compile_auto(
+            &mil,
+            mil_infer::e5rt::DeviceMask::Ane,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("milc ane run: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        println!("functions: {:?}", prog.functions);
+        for (n, e) in &map.inputs {
+            let v = vec![0x3c00u16; *e as usize]; // fp16 1.0 seed
+            let _ = prog.set_input_f16(n, &v);
+            println!("  input  {n:12} {e} elems");
+        }
+        for (n, e) in &map.inouts {
+            let v = vec![0u16; *e as usize];
+            let _ = prog.set_input_f16(n, &v);
+            println!("  inout  {n:12} {e} elems");
+        }
+        for (n, e) in &map.outputs {
+            println!("  output {n:12} {e} elems");
+        }
+        for i in 0..steps {
+            let t = std::time::Instant::now();
+            if let Err(e) = prog.execute() {
+                eprintln!("milc ane run: step {i}: {e}");
+                return ExitCode::FAILURE;
+            }
+            println!("step {i}: {:?}", t.elapsed());
+        }
+        for (n, _) in map.outputs.iter().chain(map.inouts.iter()) {
+            if let Ok(v) = prog.output_f16(n) {
+                let nz = v.iter().filter(|b| **b != 0).count();
+                let head: Vec<f32> = v
+                    .iter()
+                    .take(6)
+                    .map(|b| half::f16::from_bits(*b).to_f32())
+                    .collect();
+                println!("{n}: {nz}/{} nonzero, head {head:?}", v.len());
+            }
+        }
+        return ExitCode::SUCCESS;
     }
     if mode == "lower" {
         let text = match std::fs::read_to_string(&mil) {

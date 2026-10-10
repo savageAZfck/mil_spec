@@ -155,3 +155,22 @@ The rules above are executable, not just documented:
 
       milc ane lower model.mil -o model.ane.mil   # → this dialect
       milc ane compile model.ane.mil -o out/      # → *.macho, no CoreML
+
+## Execution (e5rt)
+
+`mil_infer::e5rt` executes compiled programs on the ANE via
+`Espresso.framework`'s `e5rt_*` C API — `dlopen`+`dlsym` only, no
+entitlement. `e5rt_e5_compiler_compile` sends the MIL through `aned`'s
+full MIL→MLIR→LLIR→ANECIR→HWX pipeline (signs + caches per-PID); each
+eval is bind→encode→`execute_sync` on the hardware lane.
+
+Ports self-describe: `get_{input,output,inout}_names` +
+`io_port_retain_tensor_desc` give names and element counts — `state<>`
+params surface as *inout* ports, resident and written in-place across
+calls. `Program::compile_auto` discovers and binds everything.
+
+Verified on the 8-layer stateful transformer: ~1.1 ms/step on h16g,
+all 8 `kv_*` states write back exactly their [2,3,5,64] update regions,
+output fully populated. `milc ane run <model.mil> [--steps N]` drives it.
+
+      milc ane run model.ane.mil --steps 3   # compile → bind → execute

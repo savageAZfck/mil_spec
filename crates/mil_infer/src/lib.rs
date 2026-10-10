@@ -33,6 +33,10 @@ pub use shard::{ShardManifest, ShardedModel};
 pub mod anec;
 pub use anec::{Anec, AnecError, Verdict, ARCHES};
 
+/// Direct execution on the ANE via Espresso's `e5rt_*` C API —
+/// compile once, eval many, no entitlement required.
+pub mod e5rt;
+
 /// Which hardware units the model is allowed to use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComputeUnits {
