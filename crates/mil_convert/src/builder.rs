@@ -1220,27 +1220,17 @@ pub fn build_range(
             flex,
         );
 
-        // ---- packed-KV slice_updates: row 2*lr = K, row 2*lr+1 = V ----
-        // updates land as (1, kvh, S, dh) — same layout the state stores.
+        // ---- packed-KV slice_update: rows 2*lr (K) and 2*lr+1 (V) in
+        // ONE op — the update is (2, kvh, S, dh), same layout the state
+        // stores. Every slice_update is a CPU-scheduled op that splits
+        // the ANE program, so halving their count halves the dispatch
+        // boundaries (measured: MLComputePlan puts slice_update on CPU).
+        let kvc = b.concat(&[kr, v4], 0, &[2, kvh, s, hd], &format!("{pfx}_kvc"));
         kv = slice_update(
             &mut b,
             &kv,
-            &kr,
+            &kvc,
             (lr * 2) as i32,
-            (lr * 2 + 1) as i32,
-            "pos",
-            fx.as_ref().map(|f| f.seq.as_str()),
-            kvh,
-            s,
-            hd,
-            &kv_shape,
-            &format!("{pfx}_ku"),
-        );
-        kv = slice_update(
-            &mut b,
-            &kv,
-            &v4,
-            (lr * 2 + 1) as i32,
             (lr * 2 + 2) as i32,
             "pos",
             fx.as_ref().map(|f| f.seq.as_str()),
@@ -1248,7 +1238,7 @@ pub fn build_range(
             s,
             hd,
             &kv_shape,
-            &format!("{pfx}_vu"),
+            &format!("{pfx}_kvu"),
         );
 
         // ---- read this layer's K/V rows post-write ----
