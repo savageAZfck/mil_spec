@@ -26,6 +26,7 @@ fn main() -> ExitCode {
     match args[0].as_str() {
         "convert" => cmd_convert(&args[1..]),
         "gguf" => cmd_gguf(&args[1..]),
+        "onnx" => cmd_onnx(&args[1..]),
         "lint" => cmd_lint(&args[1..]),
         "inspect" => cmd_inspect(&args[1..]),
         "diff" => cmd_diff(&args[1..]),
@@ -60,9 +61,10 @@ fn usage() {
         "milc — the mil_spec toolchain\n\
          \n\
          usage:\n\
-         \x20 milc convert <model_dir|model.gguf> -o <pkg.mlpackage> [--seq N] [--seq-lens a,b,c] [--max-kv N] [--fp16] [--lora <adapter>]\n\
+         \x20 milc convert <model_dir|model.gguf> -o <pkg.mlpackage> [--seq N] [--seq-lens a,b,c | --seq-range LO..HI] [--max-kv N] [--fp16] [--lora <adapter>]\n\
          \x20                    [--plan] [--quant-policy uniform|placement|error] [--plan-file <json>]\n\
          \x20 milc gguf    <file.gguf> [--json] [--tokenizer <out.json>]   # header, metadata, tensor table\n\
+         \x20 milc onnx    <model.onnx|model.json> -o <pkg.mlpackage> [--dim name=N]... [--inline-max BYTES] [--classical]\n\
          \x20 milc lint    <pkg.mlpackage|file.mlmodel>\n\
          \x20 milc inspect <pkg.mlpackage|file.mlmodel>\n\
          \x20 milc diff    <a.mlmodel|pkg> <b.mlmodel|pkg>\n\
@@ -73,8 +75,8 @@ fn usage() {
          \x20 milc fuse-lora <pkg> --lora <adapter> -o <pkg>        # fuse adapter into package weights\n\
          \x20 milc requant  <pkg> --to <int8|fp16|palette4> [-o <pkg>]\n\
          \x20 milc graft    <donor> --layers a..b --onto <base> -o <pkg>\n\
-         \x20 milc reshape  <pkg> --seq-lens a,b,c [-o <pkg>]        # rewrite EnumeratedShapes\n\
-         \x20 milc attest   <pkg> [--source <dir>]                   # verify embedded provenance\n\
+         \x20 milc reshape  <pkg> --seq-lens a,b,c | --seq-range LO..HI [-o <pkg>]   # rewrite enumerated shapes / shape range\n\
+         \x20 milc attest   <pkg> [--source <dir|file>]                 # verify embedded provenance\n\
          \x20 milc machine dfa <patterns.txt> -o <pkg.mlpackage>   # blocklist → stateful DFA\n\
          \x20 milc machine sentinel -o <pkg.mlpackage> [--alpha A] [--eps E] [--thresh T]\n\
          \x20 milc machine memory -o <pkg.mlpackage> [--slots N] [--dim D]\n"
@@ -88,6 +90,26 @@ fn spec_bytes(path: &Path) -> Result<Vec<u8>, String> {
     } else {
         std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))
     }
+}
+
+/// `LO..HI` → `(lo, hi)`; a missing/negative HI parses as `-1`
+/// (unbounded) so the option check can reject it with a clear message.
+fn parse_seq_range(s: &str) -> Result<(i64, i64), String> {
+    let (lo, hi) = s
+        .split_once("..")
+        .ok_or_else(|| format!("--seq-range {s:?}: expected LO..HI"))?;
+    let lo = lo
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| format!("--seq-range {s:?}: LO must be an integer"))?;
+    let hi = if hi.trim().is_empty() {
+        -1
+    } else {
+        hi.trim()
+            .parse::<i64>()
+            .map_err(|_| format!("--seq-range {s:?}: HI must be an integer"))?
+    };
+    Ok((lo, hi))
 }
 
 fn cmd_convert(args: &[String]) -> ExitCode {
@@ -122,6 +144,22 @@ fn cmd_convert(args: &[String]) -> ExitCode {
                 if opts.seq_lens.is_empty() {
                     eprintln!("milc convert: --seq-lens needs a,b,c");
                     return ExitCode::from(2);
+                }
+                i += 2;
+            }
+            "--seq-range" => {
+                // ShapeRange on the sequence dim — continuous lengths
+                // LO..HI instead of an enumerated list.
+                match args.get(i + 1).map(|s| parse_seq_range(s)) {
+                    Some(Ok(r)) => opts.seq_range = Some(r),
+                    Some(Err(e)) => {
+                        eprintln!("milc convert: {e}");
+                        return ExitCode::from(2);
+                    }
+                    None => {
+                        eprintln!("milc convert: --seq-range needs LO..HI");
+                        return ExitCode::from(2);
+                    }
                 }
                 i += 2;
             }
@@ -275,6 +313,13 @@ fn cmd_convert(args: &[String]) -> ExitCode {
         Ok(r) => {
             println!("wrote {}", r.package.display());
             println!("{} ops, {} weight bytes", r.op_count, r.weight_bytes);
+            if opts.seq_range.is_some() {
+                eprintln!(
+                    "note: --seq-range gives continuous sequence lengths, but Apple documents EnumeratedShapes \
+                     as the performance/Neural Engine option and range-flexible models may not run on the ANE; \
+                     use --seq-lens a,b,c for ANE workloads (milc reshape switches an existing package either way)"
+                );
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -1013,21 +1058,40 @@ fn cmd_graft(args: &[String]) -> ExitCode {
     }
 }
 
-/// `milc reshape <pkg> --seq-lens a,b,c [-o <pkg>]` — rewrite
-/// EnumeratedShapes on a flexible-shape package. In-place without -o.
+/// `milc reshape <pkg> --seq-lens a,b,c | --seq-range LO..HI [-o <pkg>]`
+/// — rewrite the sequence flexibility (enumerated shapes or shape
+/// range) of a flexible-shape package. In-place without -o.
 fn cmd_reshape(args: &[String]) -> ExitCode {
     let mut pkg: Option<PathBuf> = None;
-    let mut seq_lens: Option<Vec<i64>> = None;
+    let mut target: Option<mil_convert::surgery::SeqFlex> = None;
     let mut out: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--seq-lens" => {
-                seq_lens = args.get(i + 1).map(|s| {
-                    s.split(',')
-                        .filter_map(|t| t.trim().parse::<i64>().ok())
-                        .collect()
+                target = args.get(i + 1).map(|s| {
+                    mil_convert::surgery::SeqFlex::Lens(
+                        s.split(',')
+                            .filter_map(|t| t.trim().parse::<i64>().ok())
+                            .collect(),
+                    )
                 });
+                i += 2;
+            }
+            "--seq-range" => {
+                match args.get(i + 1).map(|s| parse_seq_range(s)) {
+                    Some(Ok((lo, hi))) => {
+                        target = Some(mil_convert::surgery::SeqFlex::Range(lo, hi));
+                    }
+                    Some(Err(e)) => {
+                        eprintln!("milc reshape: {e}");
+                        return ExitCode::from(2);
+                    }
+                    None => {
+                        eprintln!("milc reshape: --seq-range needs LO..HI");
+                        return ExitCode::from(2);
+                    }
+                }
                 i += 2;
             }
             "-o" | "--out" => {
@@ -1046,11 +1110,11 @@ fn cmd_reshape(args: &[String]) -> ExitCode {
             }
         }
     }
-    let (Some(pkg), Some(lens)) = (pkg, seq_lens) else {
-        eprintln!("milc reshape: needs <pkg> --seq-lens a,b,c");
+    let (Some(pkg), Some(target)) = (pkg, target) else {
+        eprintln!("milc reshape: needs <pkg> and --seq-lens a,b,c or --seq-range LO..HI");
         return ExitCode::from(2);
     };
-    match mil_convert::surgery::reshape(&pkg, &lens, out.as_deref()) {
+    match mil_convert::surgery::reshape_flex(&pkg, &target, out.as_deref()) {
         Ok(r) => surg_out(r),
         Err(e) => {
             eprintln!("milc reshape: {e}");
@@ -1106,6 +1170,166 @@ fn cmd_attest(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `milc onnx <model.onnx|model.json> -o <pkg> [--dim name=N]...
+/// [--inline-max BYTES] [--classical]` — ONNX / classical-ML JSON →
+/// `.mlpackage` with embedded provenance.
+fn cmd_onnx(args: &[String]) -> ExitCode {
+    let mut input: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut opts = mil_onnx::ConvertOptions::default();
+    let mut classical = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" | "--out" => {
+                out = args.get(i + 1).map(PathBuf::from);
+                i += 2;
+            }
+            "--dim" => {
+                let Some((k, v)) = args.get(i + 1).and_then(|s| s.split_once('=')) else {
+                    eprintln!("milc onnx: --dim needs name=N");
+                    return ExitCode::from(2);
+                };
+                let Ok(n) = v.trim().parse::<i64>() else {
+                    eprintln!("milc onnx: --dim {k}={v}: value must be an integer");
+                    return ExitCode::from(2);
+                };
+                if opts.dims.insert(k.trim().to_string(), n).is_some() {
+                    eprintln!("milc onnx: --dim {k} given twice");
+                    return ExitCode::from(2);
+                }
+                i += 2;
+            }
+            "--inline-max" => {
+                let Some(n) = args.get(i + 1).and_then(|s| s.parse::<usize>().ok()) else {
+                    eprintln!("milc onnx: --inline-max needs BYTES");
+                    return ExitCode::from(2);
+                };
+                opts.inline_max_bytes = n;
+                i += 2;
+            }
+            "--classical" => {
+                classical = true;
+                i += 1;
+            }
+            other if !other.starts_with('-') => {
+                if input.is_none() {
+                    input = Some(PathBuf::from(other));
+                }
+                i += 1;
+            }
+            other => {
+                eprintln!("milc onnx: unknown flag {other}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let (Some(input), Some(out)) = (input, out) else {
+        eprintln!(
+            "usage: milc onnx <model.onnx|model.json> -o <pkg.mlpackage> [--dim name=N]... [--inline-max BYTES] [--classical]"
+        );
+        return ExitCode::from(2);
+    };
+    let classical = classical
+        || input
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("json"))
+            .unwrap_or(false);
+    let bytes = match std::fs::read(&input) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("milc onnx: {}: {e}", input.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    if classical && !opts.dims.is_empty() {
+        eprintln!("milc onnx: --dim applies to ONNX inputs, not classical JSON");
+        return ExitCode::from(2);
+    }
+    let built = if classical {
+        mil_onnx::convert_classical_json(&bytes)
+    } else {
+        mil_onnx::ModelProto::decode(&bytes).and_then(|m| mil_onnx::convert_with(&m, &opts))
+    };
+    let built = match built {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("milc onnx: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let weight_hash = built
+        .weight_bin
+        .as_deref()
+        .map(mil_spec::sha256::sha256_hex);
+    let options_desc = format!(
+        "{}|inline_max={}|dims={:?}",
+        if classical { "classical" } else { "onnx" },
+        opts.inline_max_bytes,
+        opts.dims
+    );
+    let prov = match mil_convert::attest::provenance_map_files(
+        &format!("mil_onnx {}", mil_onnx::VERSION),
+        &options_desc,
+        std::slice::from_ref(&input),
+        weight_hash.as_deref(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("milc onnx: provenance: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut meta = mil_spec::ModelMeta::new(10, "CoreML9")
+        .creator("mil_onnx")
+        .description(&format!(
+            "converted by mil_onnx from {}",
+            input
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
+    for (k, v) in prov {
+        meta = meta.user_meta(&k, &v);
+    }
+    let spec =
+        match mil_convert::attest::encode_with_program_hash(meta, |m| Ok(built.encode_spec(m))) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("milc onnx: provenance: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+    if let Err(e) = built.write_spec(&out, &spec) {
+        eprintln!("milc onnx: write {}: {e}", out.display());
+        return ExitCode::FAILURE;
+    }
+
+    println!("{} → {}", input.display(), out.display());
+    for (what, fs) in [("input", &built.inputs), ("output", &built.outputs)] {
+        for f in fs.iter() {
+            println!("  {what:<6} {} {:?} {:?}", f.name, f.shape, f.dtype);
+        }
+    }
+    if !opts.dims.is_empty() {
+        let d: Vec<String> = opts.dims.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        println!("  dims bound: {}", d.join(", "));
+    }
+    let total: usize = built.op_histogram.values().sum();
+    let hist: Vec<String> = built
+        .op_histogram
+        .iter()
+        .map(|(k, v)| format!("{k}×{v}"))
+        .collect();
+    println!("  ops    {total}: {}", hist.join(" "));
+    match &built.weight_bin {
+        Some(w) => println!("  weight.bin {} bytes", w.len()),
+        None => println!("  weight.bin none (all weights inlined)"),
+    }
+    ExitCode::SUCCESS
 }
 
 fn cmd_machine(args: &[String]) -> ExitCode {

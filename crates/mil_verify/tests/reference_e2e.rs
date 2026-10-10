@@ -404,16 +404,63 @@ fn package_vs_reference(
     min_cos: f64,
     min_top5: usize,
 ) {
+    package_vs_reference_ex(
+        tag,
+        hf_dir,
+        from_gguf,
+        min_cos,
+        min_top5,
+        &RunExtra::default(),
+    );
+}
+
+/// Knobs for [`package_vs_reference_ex`] beyond the fixed-shape default.
+#[derive(Default)]
+struct RunExtra {
+    /// Convert with `--seq-range lo..hi` (runtime `seq` input fed).
+    range: Option<(i64, i64)>,
+    /// Use only the first `n` anchor tokens (default: all).
+    n_tok: Option<usize>,
+    /// Also load `CpuAndNeuralEngine` and print predict timings for
+    /// every compute-unit setting.
+    timing: bool,
+    /// Quantize to int8 (halves temp-disk need; timing runs only).
+    int8: bool,
+    /// Report only — no pass/fail on the reference comparison.
+    ungated: bool,
+    /// Gate on `ComputeUnits::All` (also for fixed packages) instead of
+    /// CpuOnly.
+    all_gate: bool,
+    /// Reference check is top-1 equality only (cosine/top-5 ignored).
+    top1_only: bool,
+}
+
+fn package_vs_reference_ex(
+    tag: &str,
+    hf_dir: &Path,
+    from_gguf: Option<&Path>,
+    min_cos: f64,
+    min_top5: usize,
+    extra: &RunExtra,
+) -> Vec<f32> {
     let cfg = ModelConfig::from_json(&std::fs::read(hf_dir.join("config.json")).unwrap()).unwrap();
     let w_hf = hf_source(hf_dir);
-    let ids = anchor_ids(hf_dir);
+    let mut ids = anchor_ids(hf_dir);
+    if let Some(n) = extra.n_tok {
+        ids.truncate(n);
+    }
     let s = ids.len() as i64;
 
     let work = WorkDir::new(tag);
     let opts = mil_convert::Options {
         seq: s,
+        seq_range: extra.range,
         max_kv: 64,
-        quant: mil_convert::Quant::Fp16,
+        quant: if extra.int8 {
+            mil_convert::Quant::Int8
+        } else {
+            mil_convert::Quant::Fp16
+        },
         lm_head: true,
         embed: false,
         spec_version: 10,
@@ -432,6 +479,11 @@ fn package_vs_reference(
         }
     }
     let mc = mil_compile::compile(&pkg, &compiled).expect("compile");
+    if extra.timing {
+        // disk is the scarce resource for full-size models: the
+        // compiled bundle is all that's needed from here on
+        let _ = std::fs::remove_dir_all(&pkg);
+    }
 
     // reference logits on HF weights (for the HF package) or on the
     // GGUF (for the GGUF package) — either way it isolates converter
@@ -482,7 +534,8 @@ fn package_vs_reference(
     let sh_cs: [i64; 4] = [1, 1, s, hd as i64];
     let sh_m: [i64; 4] = [1, 1, s, max_kv as i64];
     let sh_p: [i64; 1] = [1];
-    let inputs = vec![
+    let seq_in = (s as i32).to_le_bytes();
+    let mut inputs = vec![
         mil_infer::Input {
             name: "x",
             shape: &sh_x,
@@ -514,17 +567,68 @@ fn package_vs_reference(
             dtype: mil_spec::DType::Int32,
         },
     ];
+    if extra.range.is_some() {
+        // flexible builds take the live sequence length at runtime
+        inputs.push(mil_infer::Input {
+            name: "seq",
+            shape: &sh_p,
+            data: &seq_in,
+            dtype: mil_spec::DType::Int32,
+        });
+    }
     // The strict gate runs on CpuOnly — deterministic fp16 semantics —
     // while ComputeUnits::All is reported for context: the ANE adds its
     // own fp16 rounding on top of the same graph.
     let mut cpu_ok = true;
-    for (cu_name, cu, strict) in [
-        ("cpu", mil_infer::ComputeUnits::CpuOnly, true),
-        ("all", mil_infer::ComputeUnits::All, false),
-    ] {
-        let m = mil_infer::Model::load(&mc.path, cu).expect("load");
+    let mut all_flat: Vec<f32> = Vec::new();
+    // Flexible-seq packages (enumerated or range alike) do not load on
+    // CpuOnly / CpuAndGpu for full-size models (error -14 at load, see
+    // the test docs), so their gate runs on `All` and CpuOnly is only
+    // attempted and reported.
+    let flex_pkg = extra.range.is_some() || extra.all_gate;
+    let mut units = vec![
+        ("cpu", mil_infer::ComputeUnits::CpuOnly, !flex_pkg),
+        ("all", mil_infer::ComputeUnits::All, flex_pkg),
+    ];
+    if extra.timing {
+        // restricted-unit loads first: each load adds compiler cache, and
+        // a late load can fail with -14 once free disk dips
+        units.insert(0, ("gpu", mil_infer::ComputeUnits::CpuAndGpu, false));
+        units.insert(
+            0,
+            ("ane", mil_infer::ComputeUnits::CpuAndNeuralEngine, false),
+        );
+    }
+    for (cu_name, cu, strict) in units {
+        let m = match mil_infer::Model::load(&mc.path, cu) {
+            Ok(m) => m,
+            Err(e) if !strict => {
+                println!("{tag} {cu_name}: load failed: {e}");
+                continue;
+            }
+            Err(e) => panic!("{tag} {cu_name}: load: {e}"),
+        };
         let st = m.new_state().expect("state");
         let pr = m.predict_with_state(Some(&st), &inputs).expect("predict");
+        if extra.timing {
+            // first call above includes lazy compilation; time warm calls
+            let mut ms: Vec<f64> = (0..5)
+                .map(|_| {
+                    let st = m.new_state().expect("state");
+                    let t0 = std::time::Instant::now();
+                    m.predict_with_state(Some(&st), &inputs).expect("predict");
+                    t0.elapsed().as_secs_f64() * 1e3
+                })
+                .collect();
+            ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!(
+                "{tag} {cu_name} s={s}: warm predict median {:.1} ms (min {:.1}, max {:.1}); first {:.1} ms",
+                ms[2],
+                ms[0],
+                ms[4],
+                pr.latency.as_secs_f64() * 1e3
+            );
+        }
         let out = pr
             .outputs
             .iter()
@@ -534,6 +638,9 @@ fn package_vs_reference(
             println!("{tag}: output {} shape={:?}", out.name, out.shape);
         }
         let flat = out.values();
+        if cu_name == "all" {
+            all_flat = flat.clone();
+        }
         let vocab = flat.len() / s as usize;
         // output (1, vocab, s, 1): element (v, p) at v*s + p
         let mut ok = true;
@@ -559,7 +666,7 @@ fn package_vs_reference(
                     .map(|(x, y)| (x - y).abs())
                     .fold(0f32, f32::max)
             );
-            if ta != tr || t5 < min_top5 || c <= min_cos {
+            if ta != tr || (!extra.top1_only && (t5 < min_top5 || c <= min_cos)) {
                 ok = false;
             }
         }
@@ -567,7 +674,11 @@ fn package_vs_reference(
             cpu_ok = ok;
         }
     }
-    assert!(cpu_ok, "{tag}: package logits diverged from reference");
+    assert!(
+        cpu_ok || extra.ungated,
+        "{tag}: package logits diverged from reference"
+    );
+    all_flat
 }
 
 #[test]
@@ -861,4 +972,124 @@ fn qwen3_attention_probe() {
 #[ignore = "needs ~/.cache/mil_gguf_test downloads"]
 fn smollm2_attention_probe() {
     attention_probe("smollm2", &cache().join("smollm2-hf"));
+}
+
+/// `--seq-range 1..32` vs fixed `--seq 5` on the real Qwen3-0.6B: the
+/// same graph, converted two ways, run on the SAME compute units
+/// (`ComputeUnits::All` — flexible-seq packages do not load on CpuOnly)
+/// with the same 5-token inputs; the range package additionally gets the
+/// runtime `seq` input. The 0.999-cosine reference gate is calibrated on
+/// CPU-only and cannot apply on `All` (the ANE alone puts the *fixed*
+/// package at 0.99632 for position 0), so the property tested is
+/// equivalence: logits must be bit-identical, and every position's top-1
+/// must also equal the reference's. Prints per-position max|Δ| and
+/// cosine; if the packages ever differ the test fails *without* a
+/// tolerance, so a human sets the gate from the numbers.
+#[test]
+#[ignore = "needs ~/.cache/mil_gguf_test downloads + coremlc; ~2 GB temp"]
+fn qwen3_seq_range_equals_fixed_on_all_units() {
+    let hf = cache().join("qwen3-hf");
+    let top1_vs_ref = RunExtra {
+        all_gate: true,
+        top1_only: true,
+        ..RunExtra::default()
+    };
+    let fixed = package_vs_reference_ex("qwen3-fixed-all", &hf, None, 0.0, 0, &top1_vs_ref);
+    let range = package_vs_reference_ex(
+        "qwen3-range-all",
+        &hf,
+        None,
+        0.0,
+        0,
+        &RunExtra {
+            range: Some((1, 32)),
+            ..top1_vs_ref
+        },
+    );
+    assert_eq!(fixed.len(), range.len(), "logit count differs");
+    // Gate (measured, Qwen3-0.6B fp16, All units): pos 0 is
+    // bit-identical; pos 1-4 drift max|Δ| 0.28-0.37, cosine >= 0.99960 —
+    // the flexible program's runtime-shaped reshapes compile to
+    // different kernels, so fp16 accumulation order differs once
+    // attention spans >1 key. That drift is below the CPU-vs-ANE gap
+    // (max|Δ| up to 0.53) and below golden::Tolerances' max_val_delta
+    // (0.5, set between healthy drift <= 0.34 and a corrupted package at
+    // 0.63), which this gate reuses.
+    const MIN_COS: f64 = 0.999;
+    const MAX_DELTA: f32 = 0.5;
+    let s = 5usize;
+    let vocab = fixed.len() / s;
+    for p in 0..s {
+        let a: Vec<f32> = (0..vocab).map(|v| fixed[v * s + p]).collect();
+        let b: Vec<f32> = (0..vocab).map(|v| range[v * s + p]).collect();
+        let max_d = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        let same = a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits());
+        println!(
+            "qwen3 range-vs-fixed (All) pos {p}: max|Δ|={max_d:e} cosine={:.9} top1 {} vs {} bit-identical={same}",
+            cosine(&a, &b),
+            argmax(&a),
+            argmax(&b)
+        );
+        assert_eq!(argmax(&a), argmax(&b), "pos {p}: top-1 differs");
+        assert!(
+            (cosine(&a, &b) as f64) >= MIN_COS,
+            "pos {p}: range-vs-fixed cosine below {MIN_COS}"
+        );
+        assert!(
+            max_d <= MAX_DELTA,
+            "pos {p}: range-vs-fixed max|Δ| {max_d} > {MAX_DELTA}"
+        );
+    }
+}
+
+/// Placement/timing evidence for range flexibility (int8 to halve the
+/// temp-disk need; report-only). Each prints warm-predict medians for
+/// CpuOnly / CpuAndGpu / All / CpuAndNeuralEngine. `range` packages
+/// (1..32) are measured at the non-default 5-token prompt and at the
+/// default 1-token shape; `fixed` packages are the same graph
+/// converted at exactly that length.
+fn timing_run(tag: &str, range: Option<(i64, i64)>, n_tok: usize) {
+    package_vs_reference_ex(
+        tag,
+        &cache().join("qwen3-hf"),
+        None,
+        0.0,
+        0,
+        &RunExtra {
+            range,
+            n_tok: Some(n_tok),
+            timing: true,
+            int8: true,
+            ungated: true,
+            ..RunExtra::default()
+        },
+    );
+}
+
+#[test]
+#[ignore = "timing evidence; ~1.5 GB temp"]
+fn timing_qwen3_range_s5() {
+    timing_run("t-range-s5", Some((1, 32)), 5);
+}
+
+#[test]
+#[ignore = "timing evidence; ~1.5 GB temp"]
+fn timing_qwen3_range_s1() {
+    timing_run("t-range-s1", Some((1, 32)), 1);
+}
+
+#[test]
+#[ignore = "timing evidence; ~1.5 GB temp"]
+fn timing_qwen3_fixed_s5() {
+    timing_run("t-fixed-s5", None, 5);
+}
+
+#[test]
+#[ignore = "timing evidence; ~1.5 GB temp"]
+fn timing_qwen3_fixed_s1() {
+    timing_run("t-fixed-s1", None, 1);
 }

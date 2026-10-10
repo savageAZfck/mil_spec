@@ -27,14 +27,54 @@ pub const INLINE_MAX_BYTES: usize = 1024;
 pub struct ConvertOptions {
     /// Inline-const threshold in bytes (see [`INLINE_MAX_BYTES`]).
     pub inline_max_bytes: usize,
+    /// Bindings for symbolic (`dim_param`) input dims, e.g.
+    /// `batch → 2`. Every binding must name a param that exists in the
+    /// graph and be positive.
+    pub dims: BTreeMap<String, i64>,
 }
 
 impl Default for ConvertOptions {
     fn default() -> Self {
         ConvertOptions {
             inline_max_bytes: INLINE_MAX_BYTES,
+            dims: BTreeMap::new(),
         }
     }
+}
+
+/// Every `dim_param` name in the graph's inputs/outputs, sorted.
+fn graph_params(g: &crate::model::GraphProto) -> Vec<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for vi in g.inputs.iter().chain(g.outputs.iter()) {
+        for d in vi.shape.iter().flatten() {
+            if let Dim::Param(p) = d {
+                out.insert(p.clone());
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+fn check_dim_bindings(g: &crate::model::GraphProto, dims: &BTreeMap<String, i64>) -> Res<()> {
+    let params = graph_params(g);
+    for (name, &v) in dims {
+        if !params.contains(name) {
+            let have = if params.is_empty() {
+                "the graph has no symbolic dims".to_string()
+            } else {
+                format!("symbolic dims in this graph: {}", params.join(", "))
+            };
+            return Err(OnnxError::BadShape(format!(
+                "--dim {name}={v}: no such symbolic dim; {have}"
+            )));
+        }
+        if v <= 0 {
+            return Err(OnnxError::BadShape(format!(
+                "--dim {name}={v}: bindings must be positive"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -627,6 +667,7 @@ fn as_i32s(vs: &[i64]) -> Res<Vec<i32>> {
 /// Convert a decoded ONNX model into a [`BuiltModel`].
 pub fn convert_graph(model: &ModelProto, opts: &ConvertOptions) -> Res<BuiltModel> {
     let g = &model.graph;
+    check_dim_bindings(g, &opts.dims)?;
     let mut cx = Ctx {
         b: Block::new(),
         env: HashMap::new(),
@@ -662,7 +703,7 @@ pub fn convert_graph(model: &ModelProto, opts: &ConvertOptions) -> Res<BuiltMode
         if cx.init.contains_key(&sn) {
             continue; // opset≥9: initializers may be listed as inputs
         }
-        let shape = static_shape(vi, "input")?;
+        let shape = static_shape(vi, "input", &opts.dims)?;
         let dtype = feature_dtype(vi.elem_type, &vi.name)?;
         cx.env.insert(
             sn.clone(),
@@ -711,16 +752,35 @@ pub fn convert_graph(model: &ModelProto, opts: &ConvertOptions) -> Res<BuiltMode
                     node: "graph output".into(),
                 })?;
         let shape = match &vi.shape {
-            Some(dims) => dims
-                .iter()
-                .map(|d| match d {
-                    Dim::Value(v) => Ok(*v),
-                    _ => Err(OnnxError::Unsupported(format!(
-                        "output '{}' has non-static dims",
-                        vi.name
-                    ))),
-                })
-                .collect::<Res<Vec<i64>>>()?,
+            Some(dims) => {
+                let inferred = cx.info(&resolved)?.shape.clone();
+                dims.iter()
+                    .enumerate()
+                    .map(|(i, d)| match d {
+                        Dim::Value(v) if *v >= 0 => Ok(*v),
+                        // a bound symbolic dim must agree with the shape
+                        // the graph actually computes
+                        Dim::Param(p) if opts.dims.contains_key(p) => {
+                            let v = opts.dims[p];
+                            match inferred.get(i) {
+                                Some(&iv) if iv != v => Err(OnnxError::BadShape(format!(
+                                    "output '{}' dim {i} ('{p}'={v}) but the graph computes {iv}",
+                                    vi.name
+                                ))),
+                                _ => Ok(v),
+                            }
+                        }
+                        Dim::Param(p) => Err(OnnxError::Unsupported(format!(
+                            "output '{}' has non-static dims: symbolic dim '{p}' — bind it with --dim {p}=N",
+                            vi.name
+                        ))),
+                        _ => Err(OnnxError::Unsupported(format!(
+                            "output '{}' has non-static dims",
+                            vi.name
+                        ))),
+                    })
+                    .collect::<Res<Vec<i64>>>()?
+            }
             None => cx.info(&resolved)?.shape.clone(),
         };
         let dtype = feature_dtype(vi.elem_type, &vi.name)?;
@@ -762,7 +822,11 @@ pub fn convert_graph(model: &ModelProto, opts: &ConvertOptions) -> Res<BuiltMode
     })
 }
 
-fn static_shape(vi: &crate::model::ValueInfo, what: &str) -> Res<Vec<i64>> {
+fn static_shape(
+    vi: &crate::model::ValueInfo,
+    what: &str,
+    dims_bound: &BTreeMap<String, i64>,
+) -> Res<Vec<i64>> {
     let dims = vi.shape.as_ref().ok_or_else(|| {
         OnnxError::Unsupported(format!("{what} '{}' has no declared shape", vi.name))
     })?;
@@ -773,10 +837,12 @@ fn static_shape(vi: &crate::model::ValueInfo, what: &str) -> Res<Vec<i64>> {
                 "{what} '{}': dim {v} (unspecified)",
                 vi.name
             ))),
-            Dim::Param(p) => Err(OnnxError::Unsupported(format!(
-                "{what} '{}': symbolic dim '{p}' — static shapes only",
-                vi.name
-            ))),
+            Dim::Param(p) => dims_bound.get(p).copied().ok_or_else(|| {
+                OnnxError::Unsupported(format!(
+                    "{what} '{}': symbolic dim '{p}' — bind it with --dim {p}=N",
+                    vi.name
+                ))
+            }),
             Dim::Unknown => Err(OnnxError::Unsupported(format!(
                 "{what} '{}': unspecified dim",
                 vi.name

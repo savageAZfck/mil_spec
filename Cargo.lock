@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "mil_convert"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "half",
  "mil_compile",
@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "mil_onnx"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "half",
  "mil_compile",
@@ -149,7 +149,7 @@ dependencies = [
 
 [[package]]
 name = "mil_spec"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "half",
  "tempfile",
@@ -157,7 +157,7 @@ dependencies = [
 
 [[package]]
 name = "mil_verify"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "half",
  "mil_compile",
@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "milc"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "half",
  "mil_compile",
@@ -178,6 +178,7 @@ dependencies = [
  "mil_infer",
  "mil_lint",
  "mil_machines",
+ "mil_onnx",
  "mil_passes",
  "mil_spec",
  "mil_verify",

@@ -14,7 +14,8 @@
 //!   the same `constexpr` patterns [`crate::builder`] produces.
 //! - [`graft`] splices layer weight payloads between same-architecture
 //!   packages after a structural-compatibility check.
-//! - [`reshape`] rewrites `EnumeratedShapes` sets on a flexible-shape
+//! - [`reshape`] / [`reshape_flex`] rewrite the enumerated shapes or
+//!   shape range of a flexible-shape
 //!   package without reconverting.
 //! - [`fuse_lora`] bakes a LoRA adapter into a built package's weight
 //!   blobs. The mapping is verifiable: `mil_convert` names every conv
@@ -1106,6 +1107,10 @@ impl PackageEdit {
         if let Some(h) = &weight_hash {
             patch_prov_weights(&mut model, h);
         }
+        // the spec changed (ops, descriptions): keep `mil.prov.program`
+        // describing it; the hash excludes userDefined so ordering with
+        // the weights patch above does not matter
+        crate::attest::refresh_program_hash(&mut model);
         let spec = proto::encode(&model);
         mil_spec::write_mlpackage_stream(
             out_dir,
@@ -1498,18 +1503,59 @@ pub fn graft(
     })
 }
 
-/// Rewrite `EnumeratedShapes` on a flexible-shape package. Every
-/// feature's varying dim must track the same seq-len list — the exact
-/// property `--seq-lens` conversions produce — and the new set is the
-/// old template with those dims rebound to `seq_lens`. The default
-/// shape becomes the first entry's.
+/// Target sequence flexibility for [`reshape_flex`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SeqFlex {
+    /// `EnumeratedShapes` over these sequence lengths (first = default).
+    Lens(Vec<i64>),
+    /// `ShapeRange` over `lo..=hi` (default = `lo`).
+    Range(i64, i64),
+}
+
+/// What a feature's varying dims looked like before the rewrite.
+#[derive(PartialEq)]
+enum OldFlex {
+    Lens(Vec<i64>),
+    Range(i64, i64),
+}
+
+impl std::fmt::Display for OldFlex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OldFlex::Lens(l) => write!(f, "{l:?}"),
+            OldFlex::Range(lo, hi) => write!(f, "{lo}..{hi}"),
+        }
+    }
+}
+
+/// Rewrite `EnumeratedShapes` on a flexible-shape package — the
+/// enumerated-target form of [`reshape_flex`].
 pub fn reshape(pkg: &Path, seq_lens: &[i64], out: Option<&Path>) -> R<SurgReport> {
-    if seq_lens.is_empty() || seq_lens.iter().any(|&v| v <= 0) {
-        return err("reshape: --seq-lens needs positive a,b,c");
+    reshape_flex(pkg, &SeqFlex::Lens(seq_lens.to_vec()), out)
+}
+
+/// Rewrite the sequence flexibility of a flexible-shape package, in
+/// either direction between enumerated shapes and a shape range. Every
+/// feature's varying dims must track the same sequence description —
+/// the exact property `--seq-lens` / `--seq-range` conversions produce
+/// — and the new flexibility is the old template with those dims
+/// rebound. The default shape becomes the first entry's (enumerated) or
+/// the lower bound (range). Fixed-shape packages are refused.
+pub fn reshape_flex(pkg: &Path, target: &SeqFlex, out: Option<&Path>) -> R<SurgReport> {
+    match target {
+        SeqFlex::Lens(l) if l.is_empty() || l.iter().any(|&v| v <= 0) => {
+            return err("reshape: --seq-lens needs positive a,b,c");
+        }
+        SeqFlex::Range(lo, hi) if *lo < 1 || hi < lo => {
+            return err(format!(
+                "reshape: --seq-range {lo}..{hi} needs 1 <= LO <= HI"
+            ));
+        }
+        _ => {}
     }
     let mut pe = PackageEdit::open(pkg)?;
     let mut desc = pe.description()?;
-    let mut old_lens: Option<Vec<i64>> = None;
+    let mut old: Option<OldFlex> = None;
     let mut rewritten = 0usize;
     let mut lines = Vec::new();
 
@@ -1520,98 +1566,161 @@ pub fn reshape(pkg: &Path, seq_lens: &[i64], out: Option<&Path>) -> R<SurgReport
             };
             let Some(mut fty) = feat.msg(3) else { continue };
             let Some(mut ma) = fty.msg(5) else { continue };
-            let Some(es) = ma.msg(21) else { continue };
             let name = feat.str(1).unwrap_or_default();
             let rank = ma.get_all(1).len();
-            let entries: Vec<Vec<i64>> = es
-                .msgs(1)
-                .iter()
-                .map(|s| {
-                    s.get_all(1)
-                        .iter()
-                        .map(|v| v.as_varint().unwrap_or(0) as i64)
-                        .collect()
-                })
-                .collect();
-            if entries.is_empty() || entries.iter().any(|e| e.len() != rank) {
-                return err(format!("reshape: {name}: malformed enumeratedShapes"));
-            }
-            // Varying dims must all carry the same value list — the old
-            // seq-lens set — and non-varying dims must agree.
-            let mut varying: Vec<(usize, Vec<i64>)> = Vec::new();
-            for d in 0..rank {
-                let vals: Vec<i64> = entries.iter().map(|e| e[d]).collect();
-                if vals.iter().collect::<BTreeSet<_>>().len() > 1 {
-                    varying.push((d, vals));
+
+            // Read the current flexibility into (template shape, varying
+            // dim indices, old description).
+            let (template, varying, old_f): (Vec<i64>, Vec<usize>, OldFlex) = if let Some(es) =
+                ma.msg(21)
+            {
+                let entries: Vec<Vec<i64>> = es
+                    .msgs(1)
+                    .iter()
+                    .map(|s| {
+                        s.get_all(1)
+                            .iter()
+                            .map(|v| v.as_varint().unwrap_or(0) as i64)
+                            .collect()
+                    })
+                    .collect();
+                if entries.is_empty() || entries.iter().any(|e| e.len() != rank) {
+                    return err(format!("reshape: {name}: malformed enumeratedShapes"));
                 }
-            }
-            if varying.is_empty() {
-                continue;
-            }
-            for (_d, vals) in &varying {
-                match &old_lens {
-                    None => old_lens = Some(vals.clone()),
-                    Some(l) if l != vals => {
-                        return err(format!(
-                            "reshape: {name} varies on a different sequence {vals:?} than {l:?}"
-                        ));
+                // Varying dims must all carry the same value list.
+                let mut varying: Vec<(usize, Vec<i64>)> = Vec::new();
+                for d in 0..rank {
+                    let vals: Vec<i64> = entries.iter().map(|e| e[d]).collect();
+                    if vals.iter().collect::<BTreeSet<_>>().len() > 1 {
+                        varying.push((d, vals));
                     }
-                    _ => {}
                 }
-            }
-            // New entries: entry i copies entries[0] with every varying
-            // dim set to seq_lens[i].
-            let mut new_es = PMut::default();
-            for &nl in seq_lens.iter() {
-                let mut shape = entries[0].clone();
-                for (d, _) in &varying {
-                    shape[*d] = nl;
+                if varying.is_empty() {
+                    continue;
                 }
-                let mut sm = PMut::default();
-                for &d in &shape {
-                    sm.push(1, PVal::Varint(d as u64));
+                let first = varying[0].1.clone();
+                if let Some((_, vals)) = varying.iter().find(|(_, v)| *v != first) {
+                    return err(format!(
+                        "reshape: {name} varies on different sequences {vals:?} and {first:?}"
+                    ));
                 }
-                new_es.push_msg(1, &sm);
+                (
+                    entries[0].clone(),
+                    varying.iter().map(|(d, _)| *d).collect(),
+                    OldFlex::Lens(first),
+                )
+            } else if let Some(sr) = ma.msg(31) {
+                let ranges: Vec<(i64, i64)> = sr
+                    .msgs(1)
+                    .iter()
+                    .map(|s| {
+                        (
+                            s.varint(1).unwrap_or(0) as i64,
+                            s.varint(2).map(|v| v as i64).unwrap_or(0),
+                        )
+                    })
+                    .collect();
+                if ranges.len() != rank {
+                    return err(format!("reshape: {name}: malformed shapeRange"));
+                }
+                let varying: Vec<usize> =
+                    (0..rank).filter(|&d| ranges[d].0 != ranges[d].1).collect();
+                if varying.is_empty() {
+                    continue;
+                }
+                let first = ranges[varying[0]];
+                if let Some(&d) = varying.iter().find(|&&d| ranges[d] != first) {
+                    return err(format!(
+                            "reshape: {name} dim {d} varies over {:?}, not the sequence range {first:?}",
+                            ranges[d]
+                        ));
+                }
+                (
+                    ranges.iter().map(|r| r.0).collect(),
+                    varying,
+                    OldFlex::Range(first.0, first.1),
+                )
+            } else {
+                continue;
+            };
+            match &old {
+                None => old = Some(old_f),
+                Some(o) if *o != old_f => {
+                    return err(format!(
+                        "reshape: {name} varies on a different sequence {old_f} than {o}"
+                    ));
+                }
+                _ => {}
             }
-            ma.set_msg(21, &new_es);
-            // Default shape = first enumerated entry.
-            ma.remove_all(1);
-            for (d, _) in &varying {
-                let _ = d;
-            }
-            let default_shape: Vec<i64> = {
-                let mut s = entries[0].clone();
-                for (d, _) in &varying {
-                    s[*d] = seq_lens[0];
+
+            // Build the replacement flexibility + default shape.
+            let at = |v: i64| -> Vec<i64> {
+                let mut s = template.clone();
+                for &d in &varying {
+                    s[d] = v;
                 }
                 s
             };
+            ma.remove_all(21);
+            ma.remove_all(31);
+            let default_shape = match target {
+                SeqFlex::Lens(lens) => {
+                    let mut new_es = PMut::default();
+                    for &nl in lens {
+                        let mut sm = PMut::default();
+                        for d in at(nl) {
+                            sm.push(1, PVal::Varint(d as u64));
+                        }
+                        new_es.push_msg(1, &sm);
+                    }
+                    ma.set_msg(21, &new_es);
+                    lines.push(format!("  {name}: {} enumerated shape(s)", lens.len()));
+                    at(lens[0])
+                }
+                SeqFlex::Range(lo, hi) => {
+                    let mut sr = PMut::default();
+                    for (d, &t) in template.iter().enumerate() {
+                        let (a, b) = if varying.contains(&d) {
+                            (*lo, *hi)
+                        } else {
+                            (t, t)
+                        };
+                        let mut sz = PMut::default();
+                        sz.push(1, PVal::Varint(a as u64));
+                        sz.push(2, PVal::Varint(b as u64));
+                        sr.push_msg(1, &sz);
+                    }
+                    ma.set_msg(31, &sr);
+                    lines.push(format!("  {name}: shape range {lo}..{hi}"));
+                    at(*lo)
+                }
+            };
+            ma.remove_all(1);
             for &d in &default_shape {
                 ma.push(1, PVal::Varint(d as u64));
             }
             fty.set_msg(5, &ma);
             feat.set_msg(3, &fty);
             f.val = PVal::Len(proto::encode(&feat));
-            lines.push(format!("  {name}: {} enumerated shape(s)", seq_lens.len()));
             rewritten += 1;
         }
     }
-    if old_lens.is_none() || rewritten == 0 {
+    let Some(old) = old.filter(|_| rewritten > 0) else {
         return err(format!(
-            "reshape: {} has no enumeratedShapes — was it converted without --seq-lens?",
+            "reshape: {} has no sequence flexibility (enumeratedShapes or shapeRange) — was it converted without --seq-lens/--seq-range?",
             pkg.display()
         ));
-    }
+    };
     pe.set_description(desc);
     let dst = out.unwrap_or(pkg);
     let written = write_maybe_inplace(&pe, pkg, dst)?;
+    let new_desc = match target {
+        SeqFlex::Lens(l) => format!("{l:?}"),
+        SeqFlex::Range(lo, hi) => format!("{lo}..{hi}"),
+    };
     lines.insert(
         0,
-        format!(
-            "seq lens {:?} → {:?} across {rewritten} feature(s)",
-            old_lens.unwrap(),
-            seq_lens
-        ),
+        format!("seq {old} → {new_desc} across {rewritten} feature(s)"),
     );
     Ok(SurgReport {
         lines,

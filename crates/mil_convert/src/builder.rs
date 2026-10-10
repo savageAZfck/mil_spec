@@ -75,6 +75,12 @@ pub struct Options {
     /// the default (the emitted type declarations use it as the shape
     /// value). Empty/`len == 1` → the fixed `seq` graph.
     pub seq_lens: Vec<i64>,
+    /// Continuous sequence range `(lo, hi)` (`--seq-range LO..HI`) —
+    /// the same flexible-seq program as `seq_lens`, but the features
+    /// carry a `ShapeRange` on the sequence dim instead of
+    /// `EnumeratedShapes`; `lo` is the default shape. Mutually exclusive
+    /// with `seq_lens.len() > 1`; `hi` must be finite and `<= max_kv`.
+    pub seq_range: Option<(i64, i64)>,
     /// Weight-const names the caller wants marked updatable
     /// (`--updatable l5_wq,l5_wk,...`).
     ///
@@ -102,8 +108,45 @@ impl Default for Options {
             plan: None,
             quant_policy: None,
             seq_lens: Vec::new(),
+            seq_range: None,
             updatable: Vec::new(),
         }
+    }
+}
+
+impl Options {
+    /// Validate the sequence-flexibility options: `seq_range` excludes
+    /// a multi-entry `seq_lens`, needs `1 <= lo <= hi`, and `hi` must be
+    /// finite (`-1`/unbounded is rejected) and `<= max_kv`, since the
+    /// runtime sequence can never exceed the KV capacity.
+    pub fn check_seq_flex(&self) -> Result<(), String> {
+        let Some((lo, hi)) = self.seq_range else {
+            return Ok(());
+        };
+        if self.seq_lens.len() > 1 {
+            return Err("--seq-range and --seq-lens are mutually exclusive".into());
+        }
+        if hi < 0 {
+            return Err(format!(
+                "--seq-range {lo}..{hi}: unbounded upper bound is not allowed (the sequence cannot exceed --max-kv {})",
+                self.max_kv
+            ));
+        }
+        if lo < 1 {
+            return Err(format!("--seq-range {lo}..{hi}: lower bound must be >= 1"));
+        }
+        if hi < lo {
+            return Err(format!(
+                "--seq-range {lo}..{hi}: upper bound is below lower bound"
+            ));
+        }
+        if hi > self.max_kv {
+            return Err(format!(
+                "--seq-range {lo}..{hi}: upper bound exceeds --max-kv {}",
+                self.max_kv
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -119,9 +162,9 @@ pub struct Built {
     pub states: Vec<Feature>,
     /// Function inputs (same declarations as `inputs` + `states`).
     pub fn_inputs: Vec<NVT>,
-    /// `EnumeratedShapes` per feature name — `Some` only for
+    /// Shape flexibility (`EnumeratedShapes` or `ShapeRange`) per feature name — `Some` only for
     /// flexible-seq builds.
-    pub enum_shapes: Option<std::collections::BTreeMap<String, mil_spec::EnumeratedShapes>>,
+    pub flex: Option<std::collections::BTreeMap<String, mil_spec::Flex>>,
     /// Symbolic dims per tensor name (fn inputs + op outputs) —
     /// `Some("s")` marks a seq-bound dim; empty unless flexible.
     pub syms: std::collections::BTreeMap<String, Vec<Option<String>>>,
@@ -772,8 +815,14 @@ pub fn build(cfg: &ModelConfig, opts: &Options, em: &mut WeightEmitter) -> std::
     // runtime through a `seq` int32 input — every const that used to
     // bake `s` is replaced by shape machinery the compiler can
     // re-parameterize.
-    let flex = opts.seq_lens.len() > 1;
-    let s = if flex { opts.seq_lens[0] } else { opts.seq };
+    opts.check_seq_flex()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let flex = opts.seq_lens.len() > 1 || opts.seq_range.is_some();
+    let s = match opts.seq_range {
+        Some((lo, _)) => lo,
+        None if flex => opts.seq_lens[0],
+        None => opts.seq,
+    };
     let hd = cfg.head_dim;
     let qh = cfg.num_heads;
     let kvh = cfg.num_kv_heads;
@@ -1296,7 +1345,7 @@ pub fn build(cfg: &ModelConfig, opts: &Options, em: &mut WeightEmitter) -> std::
     // batch dim on a `matmul` operand makes the execution-plan builder
     // fail at model load.
     let mut syms = std::collections::BTreeMap::new();
-    let enum_shapes = if flex {
+    let flex_map = if flex {
         for name in ["x", "cos", "sin", "mask"] {
             syms.insert(name.to_string(), vec![None, None, Some("s".into()), None]);
         }
@@ -1507,46 +1556,35 @@ pub fn build(cfg: &ModelConfig, opts: &Options, em: &mut WeightEmitter) -> std::
                 }
             }
         }
+        // One flexibility entry per feature: `dims_at(v)` is the
+        // feature's shape at sequence length `v`. Enumerated → one
+        // candidate per `seq_lens` entry; range → the dims that differ
+        // between `lo` and `hi` vary, all others stay fixed.
+        let mk = |dims_at: &dyn Fn(i64) -> Vec<i64>| -> mil_spec::Flex {
+            match opts.seq_range {
+                Some((lo, hi)) => mil_spec::Flex::Range(mil_spec::ShapeRange {
+                    dims: dims_at(lo).into_iter().zip(dims_at(hi)).collect(),
+                }),
+                None => mil_spec::Flex::Enumerated(mil_spec::EnumeratedShapes {
+                    shapes: opts.seq_lens.iter().map(|&v| dims_at(v)).collect(),
+                }),
+            }
+        };
         let mut m = std::collections::BTreeMap::new();
-        m.insert(
-            "x".to_string(),
-            mil_spec::EnumeratedShapes {
-                shapes: opts.seq_lens.iter().map(|&v| vec![1, d, v, 1]).collect(),
-            },
-        );
-        m.insert(
-            "mask".to_string(),
-            mil_spec::EnumeratedShapes {
-                shapes: opts
-                    .seq_lens
-                    .iter()
-                    .map(|&v| vec![1, 1, v, max_kv])
-                    .collect(),
-            },
-        );
+        m.insert("x".to_string(), mk(&|v| vec![1, d, v, 1]));
+        m.insert("mask".to_string(), mk(&|v| vec![1, 1, v, max_kv]));
         for name in ["cos", "sin"] {
-            m.insert(
-                name.to_string(),
-                mil_spec::EnumeratedShapes {
-                    shapes: opts.seq_lens.iter().map(|&v| vec![1, 1, v, hd]).collect(),
-                },
-            );
+            m.insert(name.to_string(), mk(&|v| vec![1, 1, v, hd]));
         }
         m.insert(
             out_name.clone(),
-            mil_spec::EnumeratedShapes {
-                shapes: opts
-                    .seq_lens
-                    .iter()
-                    .map(|&v| {
-                        if opts.lm_head {
-                            vec![1, cfg.vocab_size, v, 1]
-                        } else {
-                            vec![1, d, v, 1]
-                        }
-                    })
-                    .collect(),
-            },
+            mk(&|v| {
+                if opts.lm_head {
+                    vec![1, cfg.vocab_size, v, 1]
+                } else {
+                    vec![1, d, v, 1]
+                }
+            }),
         );
         Some(m)
     } else {
@@ -1559,7 +1597,7 @@ pub fn build(cfg: &ModelConfig, opts: &Options, em: &mut WeightEmitter) -> std::
         outputs,
         states,
         fn_inputs,
-        enum_shapes,
+        flex: flex_map,
         syms,
     })
 }

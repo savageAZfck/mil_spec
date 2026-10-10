@@ -49,7 +49,7 @@ pub use config::ModelConfig;
 pub use gguf::Gguf;
 pub use lora::{Lora, LoraPair};
 
-use mil_spec::{encode_model_flex, write_mlpackage_stream, BlobWriter, ModelMeta};
+use mil_spec::{encode_model_flexible, write_mlpackage_stream, BlobWriter, ModelMeta};
 use std::path::Path;
 
 /// A losslessly-transcodable quantized payload for a source tensor.
@@ -309,6 +309,7 @@ fn convert_impl(
     opts: &Options,
     source_files: &[std::path::PathBuf],
 ) -> Result<ConvertReport> {
+    opts.check_seq_flex().map_err(ConvertError::Config)?;
     // Optional LoRA bake-in. Validate every adapter target against the
     // checkpoint before `weight.bin` is opened, then wrap the source so
     // emitters stream fused values through the normal fp16/int8 path.
@@ -430,16 +431,19 @@ fn convert_impl(
         meta = meta.user_meta(&k, &v);
     }
     let empty_flex = std::collections::BTreeMap::new();
-    let spec = encode_model_flex(
-        &built.inputs,
-        &built.outputs,
-        &built.states,
-        &built.block,
-        &built.fn_inputs,
-        &meta,
-        built.enum_shapes.as_ref().unwrap_or(&empty_flex),
-        &built.syms,
-    );
+    let spec = attest::encode_with_program_hash(meta, |m| {
+        encode_model_flexible(
+            &built.inputs,
+            &built.outputs,
+            &built.states,
+            &built.block,
+            &built.fn_inputs,
+            m,
+            built.flex.as_ref().unwrap_or(&empty_flex),
+            &built.syms,
+        )
+    })
+    .map_err(ConvertError::Config)?;
     write_mlpackage_stream(out_pkg, &spec, Some(&tmp_w))?;
     let weight_bytes = std::fs::metadata(tmp_w.clone())
         .map(|m| m.len())

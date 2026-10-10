@@ -250,6 +250,102 @@ fn wsize(pkg: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Provenance (weights + program) must verify after a surgery edit.
+fn assert_attests(pkg: &Path, what: &str) {
+    let r = attest::verify(pkg, None).unwrap();
+    assert!(r.has_provenance, "{what}: provenance lost");
+    assert!(r.ok, "{what}: attest failed after edit: {:?}", r.lines);
+    assert!(
+        r.lines
+            .iter()
+            .any(|l| l.contains("program") && l.contains("OK")),
+        "{what}: program hash not verified: {:?}",
+        r.lines
+    );
+}
+
+/// Replace the first occurrence of `from` with the same-length `to`
+/// in the package's `model.mlmodel` (an in-place tamper).
+fn patch_spec(pkg: &Path, from: &[u8], to: &[u8]) {
+    assert_eq!(from.len(), to.len());
+    let p = pkg.join("Data/com.apple.CoreML/model.mlmodel");
+    let mut b = std::fs::read(&p).unwrap();
+    let at = b
+        .windows(from.len())
+        .position(|w| w == from)
+        .unwrap_or_else(|| panic!("{:?} not found in spec", String::from_utf8_lossy(from)));
+    b[at..at + to.len()].copy_from_slice(to);
+    std::fs::write(&p, &b).unwrap();
+}
+
+#[test]
+fn attest_program_tamper_detected() {
+    let root = tmp("attest_prog");
+    let model = root.join("model");
+    tiny_qwen3(&model, 0.0);
+    let pkg = root.join("m.mlpackage");
+    convert(&model, &pkg, &opts(Quant::Fp16)).unwrap();
+    assert_attests(&pkg, "fresh convert");
+
+    // (c) shortDescription is covered — only userDefined is excluded
+    let c = root.join("c.mlpackage");
+    copy_dir(&pkg, &c);
+    patch_spec(&c, b"converted by mil_convert", b"converted bY mil_convert");
+    let r = attest::verify(&c, None).unwrap();
+    assert!(!r.ok, "{:?}", r.lines);
+    assert!(r.lines.iter().any(|l| l.contains("TAMPERED program")));
+
+    // (b) one op changed (softmax → sigmoid, same length)
+    let b = root.join("b.mlpackage");
+    copy_dir(&pkg, &b);
+    patch_spec(&b, b"softmax", b"sigmoid");
+    let r = attest::verify(&b, None).unwrap();
+    assert!(!r.ok, "{:?}", r.lines);
+    assert!(r.lines.iter().any(|l| l.contains("TAMPERED program")));
+
+    // editing a userDefined value is NOT a program change
+    let u = root.join("u.mlpackage");
+    copy_dir(&pkg, &u);
+    patch_spec(&u, b"mil_convert 0.", b"mil_convert 1.");
+    let r = attest::verify(&u, None).unwrap();
+    assert!(r.ok, "{:?}", r.lines);
+
+    // provenance without the program key → reported, not a failure
+    let old = root.join("old.mlpackage");
+    copy_dir(&pkg, &old);
+    {
+        let sp = old.join("Data/com.apple.CoreML/model.mlmodel");
+        let mut m = mil_spec::proto::decode(&std::fs::read(&sp).unwrap()).unwrap();
+        let mut desc = m.msg(2).unwrap();
+        let mut meta = desc.msg(100).unwrap();
+        meta.fields.retain(|f| {
+            !(f.num == 16
+                && f.val.as_msg().and_then(|e| e.str(1)).as_deref() == Some("mil.prov.program"))
+        });
+        desc.set_msg(100, &meta);
+        m.set_msg(2, &desc);
+        std::fs::write(&sp, mil_spec::proto::encode(&m)).unwrap();
+    }
+    let r = attest::verify(&old, None).unwrap();
+    assert!(r.ok, "{:?}", r.lines);
+    assert!(r
+        .lines
+        .iter()
+        .any(|l| l.contains("spec not covered (provenance predates mil.prov.program)")));
+    cleanup(&root);
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap().flatten() {
+        let (s, d) = (e.path(), to.join(e.file_name()));
+        if s.is_dir() {
+            copy_dir(&s, &d);
+        } else {
+            std::fs::copy(&s, &d).unwrap();
+        }
+    }
+}
 // ---------- attest ----------
 
 #[test]
@@ -330,6 +426,7 @@ fn requant_fp16_to_int8_shrinks_and_roundtrips() {
 
     let q8 = root.join("int8.mlpackage");
     let rep = surgery::requant(&pkg, TargetQuant::Int8, Some(&q8)).unwrap();
+    assert_attests(&q8, "requant");
     assert!(rep.written.as_ref().unwrap().weight_bytes < base_size);
     let qe = PackageEdit::open(&q8).unwrap();
     for g in qe.weight_groups().unwrap() {
@@ -415,6 +512,7 @@ fn graft_splices_donor_layers() {
 
     let out = root.join("grafted.mlpackage");
     surgery::graft(&donor, &base, (0, 0), &out).unwrap();
+    assert_attests(&out, "graft");
 
     let dpe = PackageEdit::open(&donor).unwrap();
     let gpe = PackageEdit::open(&out).unwrap();
@@ -491,6 +589,7 @@ fn reshape_rewrites_enumerated_shapes() {
 
     let out = root.join("flex2.mlpackage");
     surgery::reshape(&pkg, &[2, 8], Some(&out)).unwrap();
+    assert_attests(&out, "reshape");
 
     // read the new EnumeratedShapes out of the rewritten spec
     let spec = std::fs::read(out.join("Data/com.apple.CoreML/model.mlmodel")).unwrap();
@@ -544,6 +643,7 @@ fn reshape_compile_and_predict() {
     convert(&model, &pkg, &o).unwrap();
     let out = root.join("flex2.mlpackage");
     surgery::reshape(&pkg, &[2, 8], Some(&out)).unwrap();
+    assert_attests(&out, "reshape");
     let c = mil_compile::compile(&out, &root.join("c")).unwrap();
     // predict at the new default seq len (8) — output is vocab×seq
     // logits, so 64*8 values.
@@ -567,6 +667,7 @@ fn fuse_lora_matches_convert_lora() {
 
     let fused_pkg = root.join("fused.mlpackage");
     let rep = surgery::fuse_lora(&pkg, &adir, &fused_pkg).unwrap();
+    assert_attests(&fused_pkg, "fuse-lora");
     assert!(rep.lines.iter().any(|l| l.contains("l0_wq")));
     assert!(rep.lines.iter().any(|l| l.contains("l1_wd")));
 
@@ -597,6 +698,7 @@ fn fuse_lora_matches_convert_lora() {
     convert(&model, &pkg8, &opts(Quant::Int8)).unwrap();
     let fused8 = root.join("fused8.mlpackage");
     surgery::fuse_lora(&pkg8, &adir, &fused8).unwrap();
+    assert_attests(&fused8, "fuse-lora int8");
     let g = PackageEdit::open(&fused8).unwrap();
     assert_eq!(group(&g, "l0_wq").kind, GroupKind::Int8);
     cleanup(&root);

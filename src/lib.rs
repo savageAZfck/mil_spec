@@ -3028,27 +3028,100 @@ fn feature_desc_multi(name: &str, shape: &[i64], dt: DType) -> Vec<u8> {
 /// feature at any of `shapes`. The feature's `shape` field remains the
 /// default and must equal one of `shapes` (it is the shape the program's
 /// declared types are built against).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnumeratedShapes {
     /// Candidate shapes — each a full rank-matched shape vector.
     pub shapes: Vec<Vec<i64>>,
 }
 
-fn feature_desc_multi_enum(name: &str, shape: &[i64], dt: DType, es: &EnumeratedShapes) -> Vec<u8> {
-    // multiArrayType { shape=1, dataType=2, enumeratedShapes=21 { shapes=1 {shape=1} } }
+/// `ShapeRange` flexibility for a multi-array feature
+/// (`ArrayFeatureType.shapeRange`, field 31): each dimension varies
+/// independently inside its own `(lower, upper)` bounds. `upper == -1`
+/// means unbounded (the proto's "negative = unbound"); a fixed dim is
+/// `(d, d)`. The feature's declared `shape` is the default and must lie
+/// inside the range.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShapeRange {
+    /// Per-dimension `(lower, upper)`, one entry per dim of the feature.
+    pub dims: Vec<(i64, i64)>,
+}
+
+impl ShapeRange {
+    /// Check the range is well-formed and `shape` (the default) is in it.
+    pub fn validate(&self, feature: &str, shape: &[i64]) -> Result<(), String> {
+        if self.dims.len() != shape.len() {
+            return Err(format!(
+                "{feature}: shape range has {} dims but the feature has rank {}",
+                self.dims.len(),
+                shape.len()
+            ));
+        }
+        for (i, (&(lo, hi), &d)) in self.dims.iter().zip(shape).enumerate() {
+            if lo < 0 {
+                return Err(format!("{feature}: dim {i} lower bound {lo} is negative"));
+            }
+            if hi >= 0 && hi < lo {
+                return Err(format!(
+                    "{feature}: dim {i} upper bound {hi} is below lower bound {lo}"
+                ));
+            }
+            if d < lo || (hi >= 0 && d > hi) {
+                let hi_s = if hi < 0 {
+                    "unbounded".to_string()
+                } else {
+                    hi.to_string()
+                };
+                return Err(format!(
+                    "{feature}: default shape dim {i} = {d} is outside the range [{lo}, {hi_s}]"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Shape flexibility of one feature: a set of enumerated shapes or
+/// independent per-dim ranges.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Flex {
+    /// `ArrayFeatureType.enumeratedShapes` (field 21).
+    Enumerated(EnumeratedShapes),
+    /// `ArrayFeatureType.shapeRange` (field 31).
+    Range(ShapeRange),
+}
+
+fn feature_desc_multi_flex(name: &str, shape: &[i64], dt: DType, fx: &Flex) -> Vec<u8> {
+    // multiArrayType { shape=1, dataType=2,
+    //   enumeratedShapes=21 { shapes=1 {shape=1} }
+    //   | shapeRange=31 { sizeRanges=1 { lowerBound=1, upperBound=2 } } }
     let mut aft = Vec::new();
     for &d in shape {
         f_i64(&mut aft, 1, d);
     }
     f_varint(&mut aft, 2, dt.array() as u64);
-    let mut esm = Vec::new();
-    for s in &es.shapes {
-        let mut shp = Vec::new();
-        for &d in s {
-            f_i64(&mut shp, 1, d);
+    match fx {
+        Flex::Enumerated(es) => {
+            let mut esm = Vec::new();
+            for s in &es.shapes {
+                let mut shp = Vec::new();
+                for &d in s {
+                    f_i64(&mut shp, 1, d);
+                }
+                f_msg(&mut esm, 1, &shp);
+            }
+            f_msg(&mut aft, 21, &esm);
         }
-        f_msg(&mut esm, 1, &shp);
+        Flex::Range(sr) => {
+            let mut srm = Vec::new();
+            for &(lo, hi) in &sr.dims {
+                let mut sz = Vec::new();
+                f_varint(&mut sz, 1, lo as u64);
+                f_i64(&mut sz, 2, hi);
+                f_msg(&mut srm, 1, &sz);
+            }
+            f_msg(&mut aft, 31, &srm);
+        }
     }
-    f_msg(&mut aft, 21, &esm);
     let mut ft = Vec::new();
     f_msg(&mut ft, 5, &aft);
     let mut fd = Vec::new();
@@ -3162,6 +3235,33 @@ pub fn encode_model(
     )
 }
 
+/// [`encode_model_flex`] generalized to [`Flex`]: each feature may carry
+/// either `EnumeratedShapes` or a per-dim [`ShapeRange`].
+///
+/// Every `Flex::Range` is validated first (rank match, ordered bounds,
+/// the feature's default `shape` inside the range); a violation returns
+/// `Err` naming the feature. Everything else is as [`encode_model_flex`].
+#[allow(clippy::too_many_arguments)]
+pub fn encode_model_flexible(
+    inputs: &[Feature],
+    outputs: &[Feature],
+    states: &[Feature],
+    block: &Block,
+    fn_inputs: &[NVT],
+    meta: &ModelMeta,
+    flex: &std::collections::BTreeMap<String, Flex>,
+    syms: &std::collections::BTreeMap<String, Vec<Option<String>>>,
+) -> Result<Vec<u8>, String> {
+    for f in inputs.iter().chain(outputs) {
+        if let Some(Flex::Range(sr)) = flex.get(&f.name) {
+            sr.validate(&f.name, &f.shape)?;
+        }
+    }
+    Ok(encode_model_impl(
+        inputs, outputs, states, block, fn_inputs, meta, flex, syms,
+    ))
+}
+
 /// [`encode_model`] with per-feature `EnumeratedShapes` flexibility.
 ///
 /// `flex` maps an input or output feature name to its candidate shape
@@ -3184,6 +3284,24 @@ pub fn encode_model_flex(
     fn_inputs: &[NVT],
     meta: &ModelMeta,
     flex: &std::collections::BTreeMap<String, EnumeratedShapes>,
+    syms: &std::collections::BTreeMap<String, Vec<Option<String>>>,
+) -> Vec<u8> {
+    let flex: std::collections::BTreeMap<String, Flex> = flex
+        .iter()
+        .map(|(k, v)| (k.clone(), Flex::Enumerated(v.clone())))
+        .collect();
+    encode_model_impl(inputs, outputs, states, block, fn_inputs, meta, &flex, syms)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_model_impl(
+    inputs: &[Feature],
+    outputs: &[Feature],
+    states: &[Feature],
+    block: &Block,
+    fn_inputs: &[NVT],
+    meta: &ModelMeta,
+    flex: &std::collections::BTreeMap<String, Flex>,
     syms: &std::collections::BTreeMap<String, Vec<Option<String>>>,
 ) -> Vec<u8> {
     // Block
@@ -3217,14 +3335,14 @@ pub fn encode_model_flex(
     let mut desc = Vec::new();
     for f in inputs {
         let bytes = match flex.get(&f.name) {
-            Some(es) => feature_desc_multi_enum(&f.name, &f.shape, f.dtype, es),
+            Some(fx) => feature_desc_multi_flex(&f.name, &f.shape, f.dtype, fx),
             None => feature_desc_multi(&f.name, &f.shape, f.dtype),
         };
         f_msg(&mut desc, 1, &bytes);
     }
     for f in outputs {
         let bytes = match flex.get(&f.name) {
-            Some(es) => feature_desc_multi_enum(&f.name, &f.shape, f.dtype, es),
+            Some(fx) => feature_desc_multi_flex(&f.name, &f.shape, f.dtype, fx),
             None => feature_desc_multi(&f.name, &f.shape, f.dtype),
         };
         f_msg(&mut desc, 10, &bytes);
@@ -3675,5 +3793,174 @@ mod tests {
         assert_eq!(mem_off, file_off);
         assert_eq!(mem_bytes, file_bytes);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(test)]
+    mod flex_tests {
+        use super::*;
+        use std::collections::BTreeMap;
+
+        fn tiny() -> (Block, Vec<NVT>, Vec<Feature>, Vec<Feature>) {
+            let mut b = Block::new();
+            let y = b.add("x", "x", &[1, 4, 2, 1], "y");
+            b.outputs = vec![y];
+            let fin = vec![NVT {
+                name: "x".into(),
+                ty: ValueType::Tensor(TensorType::f16(&[1, 4, 2, 1])),
+            }];
+            let f = |n: &str| Feature {
+                name: n.into(),
+                shape: vec![1, 4, 2, 1],
+                dtype: DType::Fp16,
+                is_state: false,
+            };
+            (b, fin, vec![f("x")], vec![f("y")])
+        }
+
+        /// ArrayFeatureType of feature `name` in input (field 1) /
+        /// output (field 10) lists.
+        fn array_type(spec: &[u8], field: u32, name: &str) -> proto::PMut {
+            let m = proto::decode(spec).unwrap();
+            let desc = m.msg(2).unwrap();
+            desc.msgs(field)
+                .into_iter()
+                .find(|fd| fd.str(1).as_deref() == Some(name))
+                .unwrap()
+                .msg(3)
+                .unwrap()
+                .msg(5)
+                .unwrap()
+        }
+
+        #[test]
+        fn range_bytes_decode_back() {
+            let (b, fin, ins, outs) = tiny();
+            let mut flex = BTreeMap::new();
+            let sr = ShapeRange {
+                dims: vec![(1, 1), (4, 4), (1, 16), (1, 1)],
+            };
+            flex.insert("x".to_string(), Flex::Range(sr.clone()));
+            flex.insert("y".to_string(), Flex::Range(sr));
+            let spec = encode_model_flexible(
+                &ins,
+                &outs,
+                &[],
+                &b,
+                &fin,
+                &ModelMeta::new(10, "CoreML9"),
+                &flex,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            for (field, name) in [(1u32, "x"), (10, "y")] {
+                let aft = array_type(&spec, field, name);
+                assert!(aft.msg(21).is_none(), "no enumeratedShapes");
+                let sr = aft.msg(31).expect("shapeRange = field 31");
+                let got: Vec<(u64, i64)> = sr
+                    .msgs(1)
+                    .iter()
+                    .map(|s| (s.varint(1).unwrap_or(0), s.varint(2).unwrap_or(0) as i64))
+                    .collect();
+                assert_eq!(got, vec![(1, 1), (4, 4), (1, 16), (1, 1)]);
+                // default shape preserved (field 1 repeated varint)
+                let shape: Vec<i64> = aft
+                    .get_all(1)
+                    .iter()
+                    .map(|v| v.as_varint().unwrap() as i64)
+                    .collect();
+                assert_eq!(shape, vec![1, 4, 2, 1]);
+            }
+        }
+
+        #[test]
+        fn unbounded_upper_is_minus_one_on_the_wire() {
+            let (b, fin, ins, outs) = tiny();
+            let mut flex = BTreeMap::new();
+            flex.insert(
+                "x".to_string(),
+                Flex::Range(ShapeRange {
+                    dims: vec![(1, 1), (4, 4), (1, -1), (1, 1)],
+                }),
+            );
+            let spec = encode_model_flexible(
+                &ins,
+                &outs,
+                &[],
+                &b,
+                &fin,
+                &ModelMeta::new(10, "CoreML9"),
+                &flex,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            let sr = array_type(&spec, 1, "x").msg(31).unwrap();
+            let up = sr.msgs(1)[2].varint(2).unwrap() as i64;
+            assert_eq!(up, -1);
+        }
+
+        #[test]
+        fn enumerated_wrapper_is_byte_identical() {
+            let (b, fin, ins, outs) = tiny();
+            let es = EnumeratedShapes {
+                shapes: vec![vec![1, 4, 2, 1], vec![1, 4, 8, 1]],
+            };
+            let mut old = BTreeMap::new();
+            old.insert("x".to_string(), es.clone());
+            let mut new = BTreeMap::new();
+            new.insert("x".to_string(), Flex::Enumerated(es));
+            let meta = ModelMeta::new(10, "CoreML9");
+            let a = encode_model_flex(&ins, &outs, &[], &b, &fin, &meta, &old, &BTreeMap::new());
+            let c =
+                encode_model_flexible(&ins, &outs, &[], &b, &fin, &meta, &new, &BTreeMap::new())
+                    .unwrap();
+            assert_eq!(a, c);
+            let aft = array_type(&a, 1, "x");
+            assert_eq!(aft.msg(21).unwrap().msgs(1).len(), 2);
+        }
+
+        #[test]
+        fn default_shape_must_lie_in_range() {
+            let sr = |lo, hi| ShapeRange {
+                dims: vec![(1, 1), (4, 4), (lo, hi), (1, 1)],
+            };
+            let shape = [1, 4, 2, 1];
+            assert!(sr(1, 16).validate("x", &shape).is_ok());
+            assert!(sr(2, 2).validate("x", &shape).is_ok());
+            assert!(sr(2, -1).validate("x", &shape).is_ok());
+            assert!(sr(3, 16)
+                .validate("x", &shape)
+                .unwrap_err()
+                .contains("outside"));
+            assert!(sr(1, 1)
+                .validate("x", &shape)
+                .unwrap_err()
+                .contains("outside"));
+            assert!(sr(4, 2)
+                .validate("x", &shape)
+                .unwrap_err()
+                .contains("below"));
+            assert!(sr(-1, 2)
+                .validate("x", &shape)
+                .unwrap_err()
+                .contains("negative"));
+            let short = ShapeRange { dims: vec![(1, 2)] };
+            assert!(short.validate("x", &shape).unwrap_err().contains("rank"));
+
+            let (b, fin, ins, outs) = tiny();
+            let mut flex = BTreeMap::new();
+            flex.insert("x".to_string(), Flex::Range(sr(3, 16)));
+            let e = encode_model_flexible(
+                &ins,
+                &outs,
+                &[],
+                &b,
+                &fin,
+                &ModelMeta::new(10, "CoreML9"),
+                &flex,
+                &BTreeMap::new(),
+            )
+            .unwrap_err();
+            assert!(e.starts_with("x:"), "{e}");
+        }
     }
 }

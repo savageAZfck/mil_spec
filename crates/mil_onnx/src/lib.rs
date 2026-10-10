@@ -13,9 +13,11 @@
 //!
 //! All float tensors lower to **fp16** — the dtype the whole `mil_spec`
 //! toolchain emits and the one the ANE wants. Integer tensors lower to
-//! int32, bools to bool. Dynamic shapes (`dim_param` / unspecified dims)
-//! are rejected: MIL program specialization needs concrete dims, the
-//! same contract `encode_model` documents.
+//! int32, bools to bool. Shapes must be concrete (MIL program
+//! specialization, the same contract `encode_model` documents):
+//! symbolic `dim_param` dims are bound up front through
+//! [`ConvertOptions::dims`] (`milc onnx --dim batch=2`); unbound or
+//! unspecified dims are rejected with an actionable message.
 //!
 //! # Classical ML path
 //!
@@ -57,6 +59,9 @@ pub mod model;
 pub mod proto;
 
 pub use map::{ConvertOptions, INLINE_MAX_BYTES};
+
+/// This crate's version, for provenance (`mil.prov.tool`).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub use model::{AttributeProto, Dim, GraphProto, ModelProto, NodeProto, TensorProto, ValueInfo};
 
 use mil_spec::{Block, Feature, ModelMeta, NVT};
@@ -145,15 +150,32 @@ impl BuiltModel {
         let meta = ModelMeta::new(10, "CoreML9")
             .creator("mil_onnx")
             .description("converted by mil_onnx");
-        let spec = mil_spec::encode_model(
+        self.write_mlpackage_with_meta(dir, &meta)
+    }
+
+    /// [`write_mlpackage`](Self::write_mlpackage) with caller-supplied
+    /// [`ModelMeta`] (e.g. to embed provenance in `userDefined`).
+    pub fn write_mlpackage_with_meta(&self, dir: &Path, meta: &ModelMeta) -> std::io::Result<()> {
+        self.write_spec(dir, &self.encode_spec(meta))
+    }
+
+    /// The encoded `model.mlmodel` bytes for `meta` — lets a caller hash
+    /// the spec (provenance) and encode again with the hash in `meta`.
+    pub fn encode_spec(&self, meta: &ModelMeta) -> Vec<u8> {
+        mil_spec::encode_model(
             &self.inputs,
             &self.outputs,
             &[],
             &self.block,
             &self.fn_inputs,
-            &meta,
-        );
-        mil_spec::write_mlpackage(dir, &spec, self.weight_bin.as_deref())
+            meta,
+        )
+    }
+
+    /// Write already-encoded spec bytes plus this model's `weight.bin`
+    /// as a `.mlpackage` directory.
+    pub fn write_spec(&self, dir: &Path, spec: &[u8]) -> std::io::Result<()> {
+        mil_spec::write_mlpackage(dir, spec, self.weight_bin.as_deref())
     }
 }
 

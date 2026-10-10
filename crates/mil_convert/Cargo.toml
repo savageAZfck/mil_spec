@@ -1,6 +1,6 @@
 [package]
 name = "mil_convert"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.80"
 description = "safetensors and GGUF → MIL .mlpackage: every ggml quant type, lossless Q8_0/Q4_0 transcode, LoRA bake-in, quant planner, enumerated shapes, package surgery, provenance. No Python, no coremltools."
@@ -10,7 +10,7 @@ repository = "https://github.com/savageAZfck/mil_spec"
 keywords = ["coreml", "mil", "safetensors", "transformer", "llm"]
 
 [dependencies]
-mil_spec = { path = "../..", version = "0.4.0" }
+mil_spec = { path = "../..", version = "0.4.1" }
 mil_passes = { path = "../mil_passes", version = "0.2.0" }
 mil_lint = { path = "../mil_lint", version = "0.2.0" }
 half = "2"

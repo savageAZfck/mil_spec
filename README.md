@@ -97,7 +97,8 @@ See `examples/compile_ir.rs` for a stateful KV-cache program.
 | **`mil_lint`** | The differentiator — static **ANE-placement analysis**. Predicts per-op execution unit (ANE/GPU/CPU) with a stated rule *before* you compile, flags CPU islands and fp32 regions, and estimates dispatch count — the number that decides whether a graph lives or dies on the ANE. coremltools can't do this at all. |
 | **`mil_compile`** | `.mlpackage` → `.mlmodelc`. Two backends: in-process `MLModel compileModelAtURL:` via the Objective-C runtime (no `xcrun`, no subprocess), and an `xcrun coremlc` driver with structured errors and `.mlmodelc` discovery. |
 | **`mil_verify`** | Reads specs back: generic protobuf decoder, structural diff (`milc diff` shows why `coremlc` rejected your graph), name-resolution validation, `weight.bin` integrity, and a conformance battery — valid graphs must pass, planted-invalid controls must fail, or the verifier itself is broken. |
-| **`milc`** | The CLI over all of it: `convert`, `lint`, `inspect`, `diff`, `compile`, `verify`, `check`, plus package surgery (`fuse-lora`, `requant`, `graft`, `reshape`) and `attest`. |
+| **`mil_onnx`** | ONNX → `.mlpackage` with a hand-rolled proto2 reader (no prost, no Python): static-shape lowering of the ONNX op set onto MIL fp16 ops, `weight.bin` streaming for large initializers, symbolic dims bound at conversion time (`--dim batch=2`), and sklearn-style classical ML (GLMs, tree ensembles) via a small JSON schema or `ai.onnx.ml` nodes. |
+| **`milc`** | The CLI over all of it: `convert`, `onnx`, `gguf`, `lint`, `inspect`, `diff`, `compile`, `verify`, `check`, plus package surgery (`fuse-lora`, `requant`, `graft`, `reshape`) and `attest`. |
 
 ```bash
 cargo build --release -p milc
@@ -105,6 +106,8 @@ milc convert Qwen3-0.6B -o drafter.mlpackage --seq 1 --max-kv 2048
 milc convert model.gguf -o drafter.mlpackage   # GGUF auto-detected by magic
 milc convert Qwen3-0.6B -o tuned.mlpackage --lora adapters/dream  # LoRA bake-in (MLX/PEFT, safetensors or npz)
 milc gguf model.gguf --tokenizer tok.json     # inspect + tokenizer export
+milc onnx model.onnx -o m.mlpackage --dim batch=1   # ONNX (symbolic dims bound with --dim)
+milc onnx glm.json -o m.mlpackage                   # classical-ML JSON (or --classical)
 milc lint drafter.mlpackage     # per-op ANE/GPU/CPU + dispatch estimate
 milc compile drafter.mlpackage  # via CoreML.framework, in-process
 milc verify                     # conformance battery
@@ -127,6 +130,7 @@ milc fuse-lora drafter.mlpackage --lora adapters/dream -o tuned.mlpackage
 milc requant   drafter.mlpackage --to int8|fp16|palette4 [-o out.mlpackage]
 milc graft     donor.mlpackage --layers 0..4 --onto base.mlpackage -o out.mlpackage
 milc reshape   flex.mlpackage --seq-lens 2,8,32 [-o out.mlpackage]
+milc reshape   flex.mlpackage --seq-range 1..32 [-o out.mlpackage]   # enumerated <-> range
 ```
 
 - **fuse-lora** fuses adapter deltas into an existing package's weight
@@ -146,10 +150,31 @@ milc reshape   flex.mlpackage --seq-lens 2,8,32 [-o out.mlpackage]
   into a same-architecture base — op stream and model description must
   match exactly or it refuses, and payloads are copied losslessly
   (same encoding, same shape).
-- **reshape** rewrites `EnumeratedShapes` on a flexible-shape package
-  (the `convert --seq-lens` kind): every varying dim must track the
-  same old list, and the new set becomes the enumerated entries with
-  `seq_lens[0]` as default.
+- **reshape** rewrites the sequence flexibility of a flexible-shape package
+  in either direction (`--seq-lens a,b,c` enumerated shapes, or
+  `--seq-range LO..HI` shape range): every varying dim must track the
+  same old list/range, and the new set (or range) rebinds those dims with
+  `seq_lens[0]` / `LO` as the default. Fixed-shape packages are refused.
+
+`milc convert --seq-range LO..HI` emits the same flexible-seq program with
+a `ShapeRange` (`ArrayFeatureType.shapeRange`, field 31) instead of
+`EnumeratedShapes` (field 21): any length in `LO..=HI` (`HI <= --max-kv`,
+unbounded rejected). Apple recommends enumerated shapes for performance
+and range-flexible models may not run on the Neural Engine; measured on
+Qwen3-0.6B fp16 here, the range package runs ~19% slower than a fixed
+package on `ComputeUnits::All` (ANE placement not verified) — prefer
+`--seq-lens` for ANE workloads.
+
+**Known issue — flexible packages need a non-CPU-only compute unit.**
+Packages from `--seq-lens` (with more than one length) or `--seq-range` load and predict on
+`ComputeUnits::All`, but `CpuOnly` fails at load with CoreML error -14
+("Failed to build the model execution plan"). Fixed-shape packages are
+unaffected, and a hand-built one-op flexible program loads on CPU, so
+the trigger is specific to this converter's flexible graph: a linear
+prefix bisect fails first at the runtime-shape `reshape` in
+`seq_to_heads` (op 83 of the tiny test model), while the same reshape
+in isolation loads fine. Root cause not yet found; reproduce with
+`cargo test -p mil_convert --release --test enum_shapes_e2e -- --ignored cpu_only_flex_matrix`.
 
 ## Provenance (`milc attest`)
 
@@ -170,6 +195,36 @@ packages without provenance (older conversions, foreign tools) are
 reported, not failed. Package surgery refreshes `mil.prov.weights` so
 a legitimately-edited package still attests — that's the provenance
 describing what the package *contains*.
+
+`mil.prov.program` is the SHA-256 of the canonical spec: `model.mlmodel` with
+the `userDefined` map removed (so the op graph, inline constants and feature
+descriptions are covered, which is what protects packages with no
+`weight.bin`). A mismatch reports `TAMPERED program` and exits nonzero;
+provenance from before this key existed reports `spec not covered` and is
+not a failure. Package surgery refreshes it.
+
+`--source` takes a directory or a single file (`milc attest m.mlpackage
+--source model.onnx`); fingerprints match on file name. `milc onnx`
+packages carry the same keys minus `mil.prov.config`. When every ONNX
+weight is inlined (no `weight.bin`), `mil.prov.weights` is `none`: attest
+then checks that no blob has appeared, and the source fingerprint is the
+content anchor.
+
+## ONNX and classical ML (`milc onnx`)
+
+```bash
+milc onnx model.onnx -o m.mlpackage [--dim name=N]... [--inline-max BYTES]
+milc onnx glm.json   -o m.mlpackage          # classical-ML JSON (or --classical)
+```
+
+All float tensors lower to fp16. Shapes are static, but a symbolic
+`dim_param` (the usual torch.onnx.export batch/sequence dim) is bound at
+conversion time with `--dim batch=2` (or `ConvertOptions::dims` from the
+library). An unbound dim errors with `bind it with --dim batch=N`; a
+binding that names no dim in the graph (a typo) errors listing the real
+ones. The command prints inputs/outputs with shapes, an op histogram, the
+`weight.bin` size and the bound dims, and embeds provenance so
+`milc attest` works afterwards.
 
 ## Updatable layers — the honest answer
 

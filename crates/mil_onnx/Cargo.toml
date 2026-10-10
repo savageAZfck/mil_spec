@@ -1,6 +1,6 @@
 [package]
 name = "mil_onnx"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.80"
 description = "ONNX → MIL frontend and sklearn-style classical ML (tree ensembles, GLMs) → .mlpackage. Hand-rolled proto2 reader, no prost, no Python."
@@ -10,7 +10,7 @@ repository = "https://github.com/savageAZfck/mil_spec"
 keywords = ["coreml", "mil", "onnx", "sklearn", "apple-silicon"]
 
 [dependencies]
-mil_spec = { path = "../..", version = "0.4.0" }
+mil_spec = { path = "../..", version = "0.4.1" }
 half = "2"
 serde_json = "1"
 
