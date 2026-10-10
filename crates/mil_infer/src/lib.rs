@@ -28,6 +28,11 @@ use std::time::{Duration, Instant};
 pub mod shard;
 pub use shard::{ShardManifest, ShardedModel};
 
+/// Direct `ANECompiler.framework` validation + compilation — MIL → ANE
+/// Mach-O with no CoreML in the path.
+pub mod anec;
+pub use anec::{Anec, AnecError, Verdict, ARCHES};
+
 /// Which hardware units the model is allowed to use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComputeUnits {

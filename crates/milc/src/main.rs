@@ -41,6 +41,7 @@ fn main() -> ExitCode {
         "reshape" => cmd_reshape(&args[1..]),
         "attest" => cmd_attest(&args[1..]),
         "machine" => cmd_machine(&args[1..]),
+        "ane" => cmd_ane(&args[1..]),
         "help" | "-h" | "--help" => {
             usage();
             ExitCode::SUCCESS
@@ -82,8 +83,104 @@ fn usage() {
          \x20 milc attest   <pkg> [--source <dir|file>]                 # verify embedded provenance\n\
          \x20 milc machine dfa <patterns.txt> -o <pkg.mlpackage>   # blocklist → stateful DFA\n\
          \x20 milc machine sentinel -o <pkg.mlpackage> [--alpha A] [--eps E] [--thresh T]\n\
-         \x20 milc machine memory -o <pkg.mlpackage> [--slots N] [--dim D]\n"
+         \x20 milc machine memory -o <pkg.mlpackage> [--slots N] [--dim D]\n\
+         \x20 milc ane validate <model.mil> [--arch h16g]            # direct ANEC verdict, no CoreML\n\
+         \x20 milc ane compile  <model.mil> [-o <dir>] [--arch h16g] # direct ANE Mach-O, no CoreML\n"
     );
+}
+
+/// `milc ane` — drive `ANECompiler.framework` directly via `mil_infer::anec`.
+///
+/// The mil file must be the ANE-eligible dialect (see
+/// `ANE_FRONTEND_SPEC.md`): float compute, const indices, per-state
+/// read→slice_update→write triples, weights beside the mil.
+fn cmd_ane(args: &[String]) -> ExitCode {
+    let mut mode = "";
+    let mut mil: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut arch = "h16g".to_string();
+    let mut detail = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "validate" | "compile" => {
+                if mode.is_empty() {
+                    mode = args[i].as_str();
+                }
+            }
+            "-o" | "--out" => {
+                i += 1;
+                out = args.get(i).map(PathBuf::from);
+            }
+            "--arch" => {
+                i += 1;
+                if let Some(a) = args.get(i) {
+                    arch = a.clone();
+                }
+            }
+            "--detail" => detail = true,
+            s if !s.starts_with('-') => {
+                if mil.is_none() {
+                    mil = Some(PathBuf::from(s));
+                }
+            }
+            other => {
+                eprintln!("milc ane: unknown flag {other}");
+                return ExitCode::from(2);
+            }
+        }
+        i += 1;
+    }
+    let Some(mil) = mil else {
+        eprintln!("milc ane <validate|compile> <model.mil> [-o <dir>] [--arch h16g]");
+        return ExitCode::from(2);
+    };
+    if mode.is_empty() {
+        eprintln!("milc ane: need validate or compile");
+        return ExitCode::from(2);
+    }
+    if !mil_infer::anec::ARCHES.contains(&arch.as_str()) {
+        eprintln!("milc ane: arch {arch} not in target table {:?}", mil_infer::anec::ARCHES);
+        return ExitCode::from(2);
+    }
+    let ane = match mil_infer::Anec::open() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("milc ane: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let dir = out.unwrap_or_else(|| std::env::temp_dir().join("milc_ane"));
+    let v = match mode {
+        "validate" => ane.validate(&mil, &arch),
+        _ => ane.compile(&mil, &dir, &arch),
+    };
+    match v {
+        Ok(v) => {
+            println!("status={:#x} rc={}", v.status, v.rc);
+            if let Some(d) = v.dram_usage {
+                println!("ModelMaxDramUsage = {d}");
+            }
+            for e in &v.errors {
+                println!("error: {e}");
+            }
+            if let Some(a) = &v.artifact {
+                println!("artifact: {} ({} bytes)", a.display(), a.metadata().map(|m| m.len()).unwrap_or(0));
+            }
+            if detail {
+                println!("{}", v.detail);
+            }
+            if v.rc == 0 && v.status == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(e) => {
+            eprintln!("milc ane: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn spec_bytes(path: &Path) -> Result<Vec<u8>, String> {
