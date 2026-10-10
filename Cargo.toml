@@ -2,6 +2,7 @@
 members = [
     ".",
     "crates/mil_convert",
+    "crates/mil_onnx",
     "crates/mil_passes",
     "crates/mil_lint",
     "crates/mil_compile",

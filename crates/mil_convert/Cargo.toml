@@ -12,9 +12,11 @@ keywords = ["coreml", "mil", "safetensors", "transformer", "llm"]
 [dependencies]
 mil_spec = { path = "../..", version = "0.3.1" }
 mil_passes = { path = "../mil_passes", version = "0.1.0" }
+mil_lint = { path = "../mil_lint" }
 half = "2"
 serde_json = "1"
 
 [dev-dependencies]
 mil_compile = { path = "../mil_compile" }
 mil_infer = { path = "../mil_infer" }
+mil_verify = { path = "../mil_verify" }

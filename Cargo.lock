@@ -96,8 +96,10 @@ dependencies = [
  "half",
  "mil_compile",
  "mil_infer",
+ "mil_lint",
  "mil_passes",
  "mil_spec",
+ "mil_verify",
  "serde_json",
 ]
 
@@ -124,6 +126,17 @@ name = "mil_machines"
 version = "0.1.0"
 dependencies = [
  "mil_spec",
+]
+
+[[package]]
+name = "mil_onnx"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "mil_compile",
+ "mil_infer",
+ "mil_spec",
+ "serde_json",
 ]
 
 [[package]]

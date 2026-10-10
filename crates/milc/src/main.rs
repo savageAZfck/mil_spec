@@ -55,7 +55,8 @@ fn usage() {
         "milc — the mil_spec toolchain\n\
          \n\
          usage:\n\
-         \x20 milc convert <model_dir|model.gguf> -o <pkg.mlpackage> [--seq N] [--max-kv N] [--fp16] [--lora <adapter>]\n\
+         \x20 milc convert <model_dir|model.gguf> -o <pkg.mlpackage> [--seq N] [--seq-lens a,b,c] [--max-kv N] [--fp16] [--lora <adapter>]\n\
+         \x20                    [--plan] [--quant-policy uniform|placement|error] [--plan-file <json>]\n\
          \x20 milc gguf    <file.gguf> [--json] [--tokenizer <out.json>]   # header, metadata, tensor table\n\
          \x20 milc lint    <pkg.mlpackage|file.mlmodel>\n\
          \x20 milc inspect <pkg.mlpackage|file.mlmodel>\n\
@@ -83,6 +84,8 @@ fn cmd_convert(args: &[String]) -> ExitCode {
     let mut model_dir: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut opts = mil_convert::Options::default();
+    let mut print_plan = false;
+    let mut plan_file: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -92,6 +95,47 @@ fn cmd_convert(args: &[String]) -> ExitCode {
             }
             "--seq" => {
                 opts.seq = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(1);
+                i += 2;
+            }
+            "--seq-lens" => {
+                // EnumeratedShapes list — first entry is the default.
+                // Emits a flexible-shape program with a runtime `seq`
+                // int32 input instead of a fixed-length graph.
+                opts.seq_lens = args
+                    .get(i + 1)
+                    .map(|s| {
+                        s.split(',')
+                            .filter_map(|t| t.trim().parse::<i64>().ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if opts.seq_lens.is_empty() {
+                    eprintln!("milc convert: --seq-lens needs a,b,c");
+                    return ExitCode::from(2);
+                }
+                i += 2;
+            }
+            "--plan" => {
+                // Print the planner's decisions as JSON on stdout —
+                // no package is written.
+                print_plan = true;
+                i += 1;
+            }
+            "--quant-policy" => {
+                let v = args.get(i + 1).map(String::as_str).unwrap_or("");
+                match mil_convert::plan::QuantPolicy::parse(v) {
+                    Some(p) => opts.quant_policy = Some(p),
+                    None => {
+                        eprintln!(
+                            "milc convert: --quant-policy uniform|placement|error, got {v:?}"
+                        );
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            "--plan-file" => {
+                plan_file = args.get(i + 1).map(PathBuf::from);
                 i += 2;
             }
             "--max-kv" => {
@@ -137,10 +181,55 @@ fn cmd_convert(args: &[String]) -> ExitCode {
             }
         }
     }
-    let (model_dir, out) = match (model_dir, out) {
-        (Some(m), Some(o)) => (m, o),
-        _ => {
-            eprintln!("milc convert: needs <model_dir|model.gguf> and -o <pkg>");
+    // --plan-file loads a hand-edited plan; it wins over --quant-policy.
+    if let Some(pf) = &plan_file {
+        let json = match std::fs::read_to_string(pf) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("milc convert: cannot read {}: {e}", pf.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        match mil_convert::plan::Plan::from_json(&json) {
+            Ok(p) => opts.plan = Some(p),
+            Err(e) => {
+                eprintln!("milc convert: bad plan file {}: {e}", pf.display());
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let model_dir = match model_dir {
+        Some(m) => m,
+        None => {
+            eprintln!("milc convert: needs <model_dir|model.gguf>");
+            return ExitCode::from(2);
+        }
+    };
+    if print_plan {
+        // Dry-run: an explicit plan file is echoed back; otherwise the
+        // policy's computed plan (default `error` — the informative one).
+        let plan = match &opts.plan {
+            Some(p) => p.clone(),
+            None => {
+                let policy = opts
+                    .quant_policy
+                    .unwrap_or(mil_convert::plan::QuantPolicy::Error);
+                match mil_convert::compute_plan(&model_dir, policy) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("milc convert --plan: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+        };
+        print!("{}", plan.to_json());
+        return ExitCode::SUCCESS;
+    }
+    let out = match out {
+        Some(o) => o,
+        None => {
+            eprintln!("milc convert: needs -o <pkg>");
             return ExitCode::from(2);
         }
     };

@@ -39,6 +39,7 @@ pub mod config;
 pub mod gguf;
 pub mod lora;
 pub mod npz;
+pub mod plan;
 pub mod safetensors;
 
 pub use builder::{Options, Quant};
@@ -46,8 +47,30 @@ pub use config::ModelConfig;
 pub use gguf::Gguf;
 pub use lora::{Lora, LoraPair};
 
-use mil_spec::{encode_model, write_mlpackage_stream, BlobWriter, ModelMeta};
+use mil_spec::{encode_model_flex, write_mlpackage_stream, BlobWriter, ModelMeta};
 use std::path::Path;
+
+/// A losslessly-transcodable quantized payload for a source tensor.
+///
+/// Sources that already store a tensor in a block-quantized form MIL can
+/// express exactly (ggml Q8_0 / Q4_0 → `constexpr_blockwise_shift_scale`)
+/// hand the emitter the packed codes plus per-block scales instead of a
+/// dequantize→requantize round-trip that would double the error.
+pub struct NativeQuant {
+    /// Packed code bytes for `data_dtype` in MIL order — for uint4,
+    /// low nibble is the even element (`(lo=2m, hi=2m+1)` per byte).
+    pub data: Vec<u8>,
+    /// Blob dtype of `data` (int8 for Q8_0, uint4 for Q4_0).
+    pub data_dtype: mil_spec::DType,
+    /// fp16 LE scale bytes — one scale per `block` elements along
+    /// weight dim 1, laid out `(row, block)`.
+    pub scales: Vec<u8>,
+    /// Offset payload with the same element layout as `scales`, for
+    /// `scale * (data - offset)` formats (Q4_0 → uint4 offset 8).
+    pub offset: Option<(Vec<u8>, mil_spec::DType)>,
+    /// Elements per scale block along dim 1 (32 for Q8_0/Q4_0).
+    pub block: i64,
+}
 
 /// Any tensor store the builder can pull weights from — safetensors
 /// shards or a GGUF file. Lookups are by HF canonical name
@@ -73,6 +96,14 @@ pub trait WeightSource {
     /// Logical shape for `name` without reading tensor bytes.
     fn shape(&self, name: &str) -> std::io::Result<Vec<i64>> {
         Ok(self.tensor_f16(name)?.0)
+    }
+    /// Native quantized payload for `name` — `Some` when the source
+    /// stores the tensor in a form MIL can emit *exactly* (currently
+    /// ggml Q8_0/Q4_0 2-D weights). `None` for scalar/stored-float
+    /// tensors and for stores that have no quantized form — callers
+    /// fall back to the float path.
+    fn native_qblocks(&self, _name: &str) -> std::io::Result<Option<NativeQuant>> {
+        Ok(None)
     }
 }
 
@@ -231,6 +262,31 @@ pub fn convert_gguf(path: &Path, out_pkg: &Path, opts: &Options) -> Result<Conve
     Ok(report)
 }
 
+/// Compute the per-tensor precision plan for a model without emitting
+/// a package — the `milc convert --plan` dry-run. `path` is an HF model
+/// dir or a `.gguf` file (magic-byte detected like `milc convert`).
+pub fn compute_plan(path: &Path, policy: plan::QuantPolicy) -> Result<plan::Plan> {
+    let is_gguf = path.is_file()
+        && std::fs::File::open(path)
+            .and_then(|mut f| {
+                let mut m = [0u8; 4];
+                std::io::Read::read_exact(&mut f, &mut m).map(|_| m == *b"GGUF")
+            })
+            .unwrap_or(false);
+    if is_gguf {
+        let g = Gguf::open(path).map_err(|e| ConvertError::Config(format!("{e}")))?;
+        let cfg = gguf::config::model_config(&g).map_err(ConvertError::Config)?;
+        plan::Plan::compute(policy, &plan::conv_weight_names(&cfg), &g).map_err(ConvertError::Io)
+    } else {
+        let cfg_bytes = std::fs::read(path.join("config.json"))
+            .map_err(|e| ConvertError::Config(format!("cannot read config.json: {e}")))?;
+        let cfg = ModelConfig::from_json(&cfg_bytes).map_err(ConvertError::Config)?;
+        let shards = safetensors::open_dir(path)?;
+        plan::Plan::compute(policy, &plan::conv_weight_names(&cfg), &shards)
+            .map_err(ConvertError::Io)
+    }
+}
+
 /// Shared build path once config + weights exist.
 fn convert_impl(
     cfg: &ModelConfig,
@@ -309,6 +365,22 @@ fn convert_impl(
         return Err(ConvertError::Config("missing lm_head.weight".into()));
     }
 
+    // ---- quantization plan ----
+    // An explicit --plan-file wins; then --quant-policy; otherwise the
+    // uniform `quant` flag — byte-identical to the pre-planner path.
+    let owned_plan;
+    let plan: &plan::Plan = match &opts.plan {
+        Some(p) => p,
+        None => {
+            owned_plan = match opts.quant_policy {
+                Some(pol) => plan::Plan::compute(pol, &plan::conv_weight_names(cfg), src)
+                    .map_err(ConvertError::Io)?,
+                None => plan::Plan::uniform(opts.quant),
+            };
+            &owned_plan
+        }
+    };
+
     // ---- build ----
     std::fs::create_dir_all(out_pkg.parent().unwrap_or(Path::new(".")))?;
     let tmp_w = out_pkg.with_extension("weight.bin.tmp");
@@ -318,6 +390,7 @@ fn convert_impl(
         quant: opts.quant,
         file: "@model_path/weights/weight.bin".into(),
         src,
+        plan,
     };
     let mut built = builder::build(cfg, opts, &mut em)?;
     writer.finish()?;
@@ -330,13 +403,16 @@ fn convert_impl(
             "{} converted by mil_convert ({} layers, d={}, seq={})",
             cfg.model_type, cfg.num_layers, cfg.hidden_size, opts.seq
         ));
-    let spec = encode_model(
+    let empty_flex = std::collections::BTreeMap::new();
+    let spec = encode_model_flex(
         &built.inputs,
         &built.outputs,
         &built.states,
         &built.block,
         &built.fn_inputs,
         &meta,
+        built.enum_shapes.as_ref().unwrap_or(&empty_flex),
+        &built.syms,
     );
     write_mlpackage_stream(out_pkg, &spec, Some(&tmp_w))?;
     let weight_bytes = std::fs::metadata(tmp_w.clone())
@@ -533,6 +609,7 @@ mod tests {
             spec_version: 10,
             opset: "CoreML9".into(),
             lora: None,
+            ..Options::default()
         };
         let r = convert(&model, &pkg, &opts).unwrap();
         assert!(r.op_count > 0);

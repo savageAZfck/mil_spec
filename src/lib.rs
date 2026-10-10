@@ -217,15 +217,32 @@ impl TensorType {
         }
     }
     fn encode(&self) -> Vec<u8> {
+        self.encode_syms(None)
+    }
+
+    /// Encode with per-dim symbolic markers: `syms[i] = Some(name)` emits
+    /// `Dimension { unknown = 2 }` — an anonymous symbol — instead of a
+    /// constant. The MIL wire format has no named-symbol field (symbol
+    /// names exist only in MIL text); flexible (enumerated/range) shape
+    /// programs declare unknown dims in the function signature and op
+    /// outputs, and the validator maps each concrete input shape onto
+    /// them positionally.
+    fn encode_syms(&self, syms: Option<&[Option<String>]>) -> Vec<u8> {
         let mut b = Vec::new();
         f_varint(&mut b, 1, self.dtype.mil() as u64);
         f_i64(&mut b, 2, self.shape.len() as i64); // rank
-        for &d in &self.shape {
-            // Dimension { constant=1 {size=1} }
-            let mut cd = Vec::new();
-            f_varint(&mut cd, 1, d as u64);
+        for (i, &d) in self.shape.iter().enumerate() {
             let mut dim = Vec::new();
-            f_msg(&mut dim, 1, &cd);
+            match syms.and_then(|s| s.get(i)).and_then(|s| s.as_deref()) {
+                // Dimension { unknown = 2 {variadic omitted → false} }
+                Some(_name) => f_msg(&mut dim, 2, &[]),
+                None => {
+                    // Dimension { constant=1 {size=1} }
+                    let mut cd = Vec::new();
+                    f_varint(&mut cd, 1, d as u64);
+                    f_msg(&mut dim, 1, &cd);
+                }
+            }
             f_msg(&mut b, 3, &dim);
         }
         b
@@ -243,9 +260,13 @@ pub enum ValueType {
 
 impl ValueType {
     fn encode(&self) -> Vec<u8> {
+        self.encode_syms(None)
+    }
+
+    fn encode_syms(&self, syms: Option<&[Option<String>]>) -> Vec<u8> {
         let mut b = Vec::new();
         match self {
-            ValueType::Tensor(t) => f_msg(&mut b, 1, &t.encode()),
+            ValueType::Tensor(t) => f_msg(&mut b, 1, &t.encode_syms(syms)),
             ValueType::State(t) => {
                 let mut st = Vec::new();
                 // StateType.wrappedType is a ValueType (tensor)
@@ -266,10 +287,10 @@ pub struct NVT {
 }
 
 impl NVT {
-    fn encode(&self) -> Vec<u8> {
+    fn encode_syms(&self, syms: Option<&[Option<String>]>) -> Vec<u8> {
         let mut b = Vec::new();
         f_str(&mut b, 1, &self.name);
-        f_msg(&mut b, 2, &self.ty.encode());
+        f_msg(&mut b, 2, &self.ty.encode_syms(syms));
         b
     }
 }
@@ -507,14 +528,21 @@ pub struct Op {
 }
 
 impl Op {
-    fn encode(&self) -> Vec<u8> {
+    fn encode_syms(
+        &self,
+        syms: &std::collections::BTreeMap<String, Vec<Option<String>>>,
+    ) -> Vec<u8> {
         let mut b = Vec::new();
         f_str(&mut b, 1, &self.ty);
         for (k, a) in &self.inputs {
             map_entry_str(&mut b, 2, k, &a.encode());
         }
         for o in &self.outputs {
-            f_msg(&mut b, 3, &o.encode());
+            f_msg(
+                &mut b,
+                3,
+                &o.encode_syms(syms.get(&o.name).map(Vec::as_slice)),
+            );
         }
         for (k, v) in &self.attrs {
             map_entry_str(&mut b, 5, k, &v.encode());
@@ -749,6 +777,88 @@ impl Block {
         self.o1(
             "constexpr_blockwise_shift_scale",
             vec![("data".into(), bind(&q).1), ("scale".into(), bind(&s).1)],
+            name,
+            vt,
+        )
+    }
+
+    /// Int8 weight with one fp16 scale per `block` consecutive elements
+    /// along dim 1: `name = constexpr_blockwise_shift_scale(data, scale)`
+    /// with `scale` shape `shape[1]/block` on dim 1. This is the blockwise
+    /// scale broadcast from the iOS18 op (`block_size = shape[m] /
+    /// scale.shape[m]` per dim) — the encoding ggml Q8_0 blocks map onto
+    /// losslessly.
+    pub fn konst_q8_blocks(
+        &mut self,
+        name: &str,
+        file: &str,
+        data_off: u64,
+        scale_off: u64,
+        shape: &[i64],
+        block: i64,
+    ) -> String {
+        let mut scale_shape = shape.to_vec();
+        scale_shape[1] /= block;
+        let q = self.konst_blob(&format!("{name}_q8"), file, data_off, DType::Int8, shape);
+        let s = self.konst_blob(
+            &format!("{name}_scale"),
+            file,
+            scale_off,
+            DType::Fp16,
+            &scale_shape,
+        );
+        let vt = self.tt(DType::Fp16, shape);
+        self.o1(
+            "constexpr_blockwise_shift_scale",
+            vec![("data".into(), bind(&q).1), ("scale".into(), bind(&s).1)],
+            name,
+            vt,
+        )
+    }
+
+    /// 4-bit weight dequantized as `scale * (data - offset)` with one
+    /// fp16 scale per `block` elements along dim 1 — the lossless
+    /// `constexpr_blockwise_shift_scale` encoding of ggml Q4_0 blocks
+    /// (`(nibble - 8) * d`): packed uint4 nibbles, a constant uint4
+    /// offset of 8 with the scale's shape, and fp16 per-block scales.
+    /// `data` must already be packed MIL-order (low nibble = even
+    /// element) — ggml's `(lo=j, hi=j+16)` needs a nibble repack.
+    #[allow(clippy::too_many_arguments)]
+    pub fn konst_q4_blocks(
+        &mut self,
+        name: &str,
+        file: &str,
+        data_off: u64,
+        scale_off: u64,
+        offset_off: u64,
+        shape: &[i64],
+        block: i64,
+    ) -> String {
+        let mut scale_shape = shape.to_vec();
+        scale_shape[1] /= block;
+        let q = self.konst_blob(&format!("{name}_q4"), file, data_off, DType::Uint4, shape);
+        let s = self.konst_blob(
+            &format!("{name}_scale"),
+            file,
+            scale_off,
+            DType::Fp16,
+            &scale_shape,
+        );
+        let o = self.konst_blob(
+            &format!("{name}_off"),
+            file,
+            offset_off,
+            DType::Uint4,
+            &scale_shape,
+        );
+        let vt = self.tt(DType::Fp16, shape);
+        self.o1(
+            "constexpr_blockwise_shift_scale",
+            vec![
+                ("data".into(), bind(&q).1),
+                ("scale".into(), bind(&s).1),
+                ("offset".into(), bind(&o).1),
+            ],
             name,
             vt,
         )
@@ -2911,6 +3021,40 @@ fn feature_desc_multi(name: &str, shape: &[i64], dt: DType) -> Vec<u8> {
     fd
 }
 
+/// `EnumeratedShapes` flexibility for a multi-array feature
+/// (`ArrayFeatureType.enumeratedShapes`, field 21): the model accepts the
+/// feature at any of `shapes`. The feature's `shape` field remains the
+/// default and must equal one of `shapes` (it is the shape the program's
+/// declared types are built against).
+pub struct EnumeratedShapes {
+    /// Candidate shapes — each a full rank-matched shape vector.
+    pub shapes: Vec<Vec<i64>>,
+}
+
+fn feature_desc_multi_enum(name: &str, shape: &[i64], dt: DType, es: &EnumeratedShapes) -> Vec<u8> {
+    // multiArrayType { shape=1, dataType=2, enumeratedShapes=21 { shapes=1 {shape=1} } }
+    let mut aft = Vec::new();
+    for &d in shape {
+        f_i64(&mut aft, 1, d);
+    }
+    f_varint(&mut aft, 2, dt.array() as u64);
+    let mut esm = Vec::new();
+    for s in &es.shapes {
+        let mut shp = Vec::new();
+        for &d in s {
+            f_i64(&mut shp, 1, d);
+        }
+        f_msg(&mut esm, 1, &shp);
+    }
+    f_msg(&mut aft, 21, &esm);
+    let mut ft = Vec::new();
+    f_msg(&mut ft, 5, &aft);
+    let mut fd = Vec::new();
+    f_str(&mut fd, 1, name);
+    f_msg(&mut fd, 3, &ft);
+    fd
+}
+
 fn feature_desc_state(name: &str, shape: &[i64], dt: DType) -> Vec<u8> {
     // FeatureDescription { name=1, type=3 { stateType=8 { arrayType=1 } } }
     let mut aft = Vec::new();
@@ -2992,6 +3136,42 @@ pub fn encode_model(
     fn_inputs: &[NVT],
     meta: &ModelMeta,
 ) -> Vec<u8> {
+    encode_model_flex(
+        inputs,
+        outputs,
+        states,
+        block,
+        fn_inputs,
+        meta,
+        &std::collections::BTreeMap::new(),
+        &std::collections::BTreeMap::new(),
+    )
+}
+
+/// [`encode_model`] with per-feature `EnumeratedShapes` flexibility.
+///
+/// `flex` maps an input or output feature name to its candidate shape
+/// set; the feature's declared [`Feature::shape`] stays the default and
+/// must appear in the set. Features absent from the map emit as fixed
+/// shape.
+///
+/// `syms` maps a value name (function input or op output) to per-dim
+/// symbolic names — `Some("s")` on dim `i` emits `Dimension.symbolic`
+/// so the validator matches the flexible description against the
+/// program. The *program* is emitted exactly as given — it is the
+/// caller's job to make the block compute correctly at every enumerated
+/// shape (see `mil_convert`'s `--seq-lens` path).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_model_flex(
+    inputs: &[Feature],
+    outputs: &[Feature],
+    states: &[Feature],
+    block: &Block,
+    fn_inputs: &[NVT],
+    meta: &ModelMeta,
+    flex: &std::collections::BTreeMap<String, EnumeratedShapes>,
+    syms: &std::collections::BTreeMap<String, Vec<Option<String>>>,
+) -> Vec<u8> {
     // Block
     let mut blk = Vec::new();
     // block.inputs: not needed (no block-local names)
@@ -2999,13 +3179,17 @@ pub fn encode_model(
         f_str(&mut blk, 2, out);
     }
     for op in &block.ops {
-        f_msg(&mut blk, 3, &op.encode());
+        f_msg(&mut blk, 3, &op.encode_syms(syms));
     }
 
     // Function { inputs=1, opset=2, block_specializations=3 map<string,Block> }
     let mut fnc = Vec::new();
     for nvt in fn_inputs {
-        f_msg(&mut fnc, 1, &nvt.encode());
+        f_msg(
+            &mut fnc,
+            1,
+            &nvt.encode_syms(syms.get(&nvt.name).map(Vec::as_slice)),
+        );
     }
     f_str(&mut fnc, 2, &meta.opset);
     map_entry_str(&mut fnc, 3, &meta.opset, &blk);
@@ -3018,18 +3202,18 @@ pub fn encode_model(
     // ModelDescription { input=1, output=10, state=13, metadata=100 }
     let mut desc = Vec::new();
     for f in inputs {
-        f_msg(
-            &mut desc,
-            1,
-            &feature_desc_multi(&f.name, &f.shape, f.dtype),
-        );
+        let bytes = match flex.get(&f.name) {
+            Some(es) => feature_desc_multi_enum(&f.name, &f.shape, f.dtype, es),
+            None => feature_desc_multi(&f.name, &f.shape, f.dtype),
+        };
+        f_msg(&mut desc, 1, &bytes);
     }
     for f in outputs {
-        f_msg(
-            &mut desc,
-            10,
-            &feature_desc_multi(&f.name, &f.shape, f.dtype),
-        );
+        let bytes = match flex.get(&f.name) {
+            Some(es) => feature_desc_multi_enum(&f.name, &f.shape, f.dtype, es),
+            None => feature_desc_multi(&f.name, &f.shape, f.dtype),
+        };
+        f_msg(&mut desc, 10, &bytes);
     }
     for f in states {
         f_msg(

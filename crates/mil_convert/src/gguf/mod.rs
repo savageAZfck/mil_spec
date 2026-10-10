@@ -17,7 +17,7 @@ pub mod names;
 pub mod tables;
 pub mod tokenizer;
 
-use crate::WeightSource;
+use crate::{NativeQuant, WeightSource};
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -857,9 +857,163 @@ impl Gguf {
     }
 }
 
+/// The llama Q/K row interleave applied to a raw-quantized tensor.
+/// Blocks live inside a row (ggml requires `ne[0] % block == 0`), so the
+/// permute is a pure row reorder — the same index math as [`unpermute`]
+/// at `row_bytes` granularity. `data` and `scales`/`offset` each get
+/// reordered at their own row stride.
+fn unpermute_rows(data: &mut [u8], row_bytes: usize, n_head: usize) {
+    let rows = data.len() / row_bytes;
+    if rows == 0 || rows % n_head != 0 {
+        return;
+    }
+    let hd2 = rows / n_head / 2;
+    let src = data.to_vec();
+    for h in 0..n_head {
+        for i in 0..2 {
+            for j in 0..hd2 {
+                let d = ((h * 2 + i) * hd2 + j) * row_bytes;
+                let s = ((h * hd2 + j) * 2 + i) * row_bytes;
+                data[d..d + row_bytes].copy_from_slice(&src[s..s + row_bytes]);
+            }
+        }
+    }
+}
+
+/// Lossless ggml → MIL-quantized transcode.
+///
+/// Q8_0 stores `(fp16 d, int8 q[32])` per 32 elements and dequantizes as
+/// `y = q * d` — exactly `constexpr_blockwise_shift_scale` with a
+/// per-32-block scale and no offset. Q4_0 stores `(fp16 d, uint4
+/// nibble[32])` and dequantizes as `y = (n - 8) * d` — the same op with
+/// a constant offset of 8. Both keep the source's original code points,
+/// so the emitted tensor's dequantized value is bit-identical to ggml's
+/// (an f16 product of exact f16 operands — a single rounding).
+///
+/// `rows`/`cols` are the HF `(out, in)` shape. Row-major raw bytes are
+/// repacked into (codes | scales | offset) blobs; the llama Q/K row
+/// interleave is un-applied at row granularity.
+fn transcode_q8_0(raw: &[u8], rows: usize, cols: usize) -> NativeQuant {
+    debug_assert_eq!(raw.len(), rows * (cols / 32) * 34);
+    let nb = cols / 32;
+    let mut data = Vec::with_capacity(rows * cols);
+    let mut scales = Vec::with_capacity(rows * nb * 2);
+    for r in 0..rows {
+        for b in 0..nb {
+            let blk = &raw[(r * nb + b) * 34..(r * nb + b) * 34 + 34];
+            scales.extend_from_slice(&blk[0..2]);
+            data.extend_from_slice(&blk[2..34]);
+        }
+    }
+    NativeQuant {
+        data,
+        data_dtype: mil_spec::DType::Int8,
+        scales,
+        offset: None,
+        block: 32,
+    }
+}
+
+/// Same transcode for Q4_0: `(fp16 d, packed nibble[16])` per block.
+/// ggml nibble order is `(lo=elem j, hi=elem j+16)`; MIL packs
+/// `(lo=even, hi=odd)` — the repack below moves each nibble into place.
+/// The emitted offset is a constant 8 (uint4 `0x88` per byte pair).
+fn transcode_q4_0(raw: &[u8], rows: usize, cols: usize) -> NativeQuant {
+    debug_assert_eq!(raw.len(), rows * (cols / 32) * 18);
+    let nb = cols / 32;
+    let mut data = Vec::with_capacity(rows * cols / 2);
+    let mut scales = Vec::with_capacity(rows * nb * 2);
+    for r in 0..rows {
+        for b in 0..nb {
+            let blk = &raw[(r * nb + b) * 18..(r * nb + b) * 18 + 18];
+            scales.extend_from_slice(&blk[0..2]);
+            let nib = &blk[2..18];
+            for m in 0..8usize {
+                // MIL byte m covers elements (2m, 2m+1)
+                let lo = nib[2 * m] & 0x0F;
+                let hi = nib[2 * m + 1] & 0x0F;
+                data.push(lo | (hi << 4));
+            }
+            for m in 0..8usize {
+                let lo = nib[2 * m] >> 4;
+                let hi = nib[2 * m + 1] >> 4;
+                data.push(lo | (hi << 4));
+            }
+        }
+    }
+    // offset=8 per scale element, uint4-packed
+    let off = vec![0x88u8; rows * nb / 2];
+    NativeQuant {
+        data,
+        data_dtype: mil_spec::DType::Uint4,
+        scales,
+        offset: Some((off, mil_spec::DType::Uint4)),
+        block: 32,
+    }
+}
+
+impl Gguf {
+    /// Raw-quantized transcode for Q8_0/Q4_0 2-D tensors — see
+    /// [`WeightSource::native_qblocks`].
+    pub fn native_qblocks_hf(&self, hf_name: &str) -> Result<Option<NativeQuant>> {
+        let Some(ggml_name) = names::hf_to_ggml(hf_name) else {
+            return Ok(None);
+        };
+        let Some(t) = self.tensors.get(ggml_name.as_str()) else {
+            return Ok(None);
+        };
+        if t.gguf_type != GgufType::Q8_0 && t.gguf_type != GgufType::Q4_0 {
+            return Ok(None);
+        }
+        let shape = t.hf_shape();
+        if shape.len() != 2 {
+            return Ok(None);
+        }
+        let (rows, cols) = (shape[0] as usize, shape[1] as usize);
+        if cols % 32 != 0 {
+            return Ok(None);
+        }
+        let raw = self.tensor_bytes(&ggml_name)?;
+        let mut nq = match t.gguf_type {
+            GgufType::Q8_0 => transcode_q8_0(&raw, rows, cols),
+            _ => transcode_q4_0(&raw, rows, cols),
+        };
+        // The dequantized path un-permutes llama attn_q/attn_k rows —
+        // apply the same reorder to the quantized rows.
+        if let Some((nh, kvh)) = self.permute_heads {
+            let heads = match names::permute_kind(&ggml_name) {
+                Some(names::PermuteKind::Q) => Some(nh),
+                Some(names::PermuteKind::K) => Some(kvh),
+                None => None,
+            };
+            if let Some(h) = heads {
+                // the interleave splits each head into two halves of
+                // hd2 rows — only defined when rows == h * 2 * hd2
+                if rows % (2 * h as usize) == 0 {
+                    let data_rb = nq.data.len() / rows;
+                    let scale_rb = nq.scales.len() / rows;
+                    unpermute_rows(&mut nq.data, data_rb, h as usize);
+                    unpermute_rows(&mut nq.scales, scale_rb, h as usize);
+                    if let Some((off, _)) = &mut nq.offset {
+                        let off_rb = off.len() / rows;
+                        unpermute_rows(off, off_rb, h as usize);
+                    }
+                }
+            }
+        }
+        Ok(Some(nq))
+    }
+}
+
 impl WeightSource for Gguf {
     fn has(&self, name: &str) -> bool {
         Gguf::has(self, name)
+    }
+    fn native_qblocks(&self, name: &str) -> std::io::Result<Option<NativeQuant>> {
+        self.native_qblocks_hf(name).map_err(|e| match e {
+            GgufError::Io(e) => e,
+            GgufError::Format(m) => std::io::Error::new(std::io::ErrorKind::InvalidData, m),
+        })
     }
     fn tensor_f16(&self, name: &str) -> std::io::Result<(Vec<i64>, Vec<u8>)> {
         Gguf::tensor_f16(self, name).map_err(|e| match e {
@@ -944,5 +1098,127 @@ mod tests {
             unpermute(&mut w, nh, rows, cols);
             assert_eq!(w, orig, "nh={nh} hd2={hd2}");
         }
+    }
+
+    /// Dequantize a `NativeQuant` payload the way the emitted
+    /// `constexpr_blockwise_shift_scale` defines it — `f16(scale *
+    /// (code − offset))`, one scale per `block` elements along the row.
+    fn dequant_native(nq: &NativeQuant, rows: usize, cols: usize) -> Vec<half::f16> {
+        let nb = cols / nq.block as usize;
+        let mut out = Vec::with_capacity(rows * cols);
+        for r in 0..rows {
+            for c in 0..cols {
+                let s = half::f16::from_le_bytes([
+                    nq.scales[2 * (r * nb + c / nq.block as usize)],
+                    nq.scales[2 * (r * nb + c / nq.block as usize) + 1],
+                ])
+                .to_f32();
+                let code = match nq.data_dtype {
+                    mil_spec::DType::Int8 => nq.data[r * cols + c] as i8 as i32,
+                    mil_spec::DType::Uint4 => {
+                        let byte = nq.data[(r * cols + c) / 2];
+                        let nib = if (r * cols + c) % 2 == 0 {
+                            byte & 0x0F
+                        } else {
+                            byte >> 4
+                        };
+                        nib as i32
+                    }
+                    _ => unreachable!(),
+                };
+                let off = match &nq.offset {
+                    Some((_, mil_spec::DType::Uint4)) => 8,
+                    _ => 0,
+                };
+                out.push(half::f16::from_f32((code - off) as f32 * s));
+            }
+        }
+        out
+    }
+
+    /// Build a Q8_0 raw payload: `rows` rows × `cols`, per-32-blocks
+    /// `(fp16 d, int8 q[32])`.
+    fn raw_q8_0(rows: usize, cols: usize) -> Vec<u8> {
+        let mut raw = Vec::new();
+        for r in 0..rows {
+            for b in 0..cols / 32 {
+                let d = half::f16::from_f32(0.01 * ((r * 7 + b * 3) % 40 + 1) as f32);
+                raw.extend_from_slice(&d.to_le_bytes());
+                for j in 0..32 {
+                    raw.push((((r * 31 + b * 17 + j * 7) % 255) as i32 - 127) as i8 as u8);
+                }
+            }
+        }
+        raw
+    }
+
+    /// Build a Q4_0 raw payload: `(fp16 d, packed nibble[16])` per
+    /// block — ggml order `(lo=elem j, hi=elem j+16)`.
+    fn raw_q4_0(rows: usize, cols: usize) -> Vec<u8> {
+        let mut raw = Vec::new();
+        for r in 0..rows {
+            for b in 0..cols / 32 {
+                let d = half::f16::from_f32(0.002 * ((r * 11 + b * 5) % 60 + 1) as f32);
+                raw.extend_from_slice(&d.to_le_bytes());
+                for j in 0..16 {
+                    let lo = ((r * 13 + b * 7 + j * 3) % 16) as u8;
+                    let hi = ((r * 5 + b * 11 + j * 5) % 16) as u8;
+                    raw.push(lo | (hi << 4));
+                }
+            }
+        }
+        raw
+    }
+
+    #[test]
+    fn q8_0_transcode_is_bit_exact() {
+        let (rows, cols) = (4usize, 96usize); // 3 blocks/row
+        let raw = raw_q8_0(rows, cols);
+        let nq = transcode_q8_0(&raw, rows, cols);
+        // emitted semantic values vs ggml's own dequantizer
+        let mut want = vec![0f32; rows * cols];
+        dequant::dequant(GgufType::Q8_0, &raw, &mut want).unwrap();
+        let got = dequant_native(&nq, rows, cols);
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                half::f16::from_f32(*w).to_bits(),
+                "elem {i}: emitted {g:?} != gguf {w}"
+            );
+        }
+    }
+
+    #[test]
+    fn q4_0_transcode_is_bit_exact() {
+        let (rows, cols) = (4usize, 96usize);
+        let raw = raw_q4_0(rows, cols);
+        let nq = transcode_q4_0(&raw, rows, cols);
+        let mut want = vec![0f32; rows * cols];
+        dequant::dequant(GgufType::Q4_0, &raw, &mut want).unwrap();
+        let got = dequant_native(&nq, rows, cols);
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                half::f16::from_f32(*w).to_bits(),
+                "elem {i}: emitted {g:?} != gguf {w}"
+            );
+        }
+    }
+
+    #[test]
+    fn unpermute_rows_matches_element_permute() {
+        // Byte-level row reorder must equal the f32 `unpermute`.
+        let (nh, hd2, cols) = (3usize, 32usize, 8usize);
+        let rows = nh * 2 * hd2;
+        let orig: Vec<f32> = (0..rows * cols).map(|i| (i % 97) as f32).collect();
+        let mut bytes: Vec<u8> = orig.iter().flat_map(|v| v.to_le_bytes()).collect();
+        unpermute_rows(&mut bytes, cols * 4, nh);
+        let mut elems = orig.clone();
+        unpermute(&mut elems, nh, rows, cols);
+        let decoded: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(decoded, elems);
     }
 }

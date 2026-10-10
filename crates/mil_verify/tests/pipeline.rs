@@ -148,6 +148,7 @@ fn full_pipeline_compiles() {
             spec_version: 10,
             opset: "CoreML9".into(),
             lora: None,
+            ..Options::default()
         },
     )
     .unwrap();
@@ -209,6 +210,7 @@ fn stateful_predict_threads_kv() {
             spec_version: 10,
             opset: "CoreML9".into(),
             lora: None,
+            ..Options::default()
         },
     )
     .unwrap();
@@ -312,6 +314,7 @@ fn determinism_same_source_same_spec() {
         spec_version: 10,
         opset: "CoreML9".into(),
         lora: None,
+        ..Options::default()
     };
     let p1 = root.join("a.mlpackage");
     let p2 = root.join("b.mlpackage");

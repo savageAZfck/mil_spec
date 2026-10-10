@@ -296,6 +296,7 @@ fn opts(quant: Quant, lora: Option<PathBuf>) -> Options {
         spec_version: 10,
         opset: "CoreML9".into(),
         lora,
+        ..Options::default()
     }
 }
 
