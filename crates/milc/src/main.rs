@@ -104,10 +104,11 @@ fn cmd_ane(args: &[String]) -> ExitCode {
     let mut arch = "h16g".to_string();
     let mut pos = 0i64;
     let mut detail = false;
+    let mut tokens: Vec<u32> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "lower" | "validate" | "compile" | "run" => {
+            "lower" | "validate" | "compile" | "run" | "decode" => {
                 if mode.is_empty() {
                     mode = args[i].as_str();
                 }
@@ -122,12 +123,21 @@ fn cmd_ane(args: &[String]) -> ExitCode {
                     arch = a.clone();
                 }
             }
-            "--pos" | "--steps" => {
+            "--pos" | "--steps" | "--max-new" => {
                 i += 1;
                 pos = args
                     .get(i)
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0);
+            }
+            "--tokens" => {
+                i += 1;
+                if let Some(t) = args.get(i) {
+                    tokens = t
+                        .split(',')
+                        .filter_map(|s| s.trim().parse::<u32>().ok())
+                        .collect();
+                }
             }
             "--detail" => detail = true,
             s if !s.starts_with('-') => {
@@ -143,9 +153,41 @@ fn cmd_ane(args: &[String]) -> ExitCode {
         i += 1;
     }
     let Some(mil) = mil else {
-        eprintln!("milc ane <lower|validate|compile> <model.mil> [-o <out>] [--arch h16g] [--pos N]");
+        eprintln!("milc ane <lower|validate|compile|run> <model.mil> [-o <out>] [--arch h16g] [--pos N]\n       milc ane decode <shard_dir> --tokens <a,b,c> [--max-new N]");
         return ExitCode::from(2);
     };
+    if mode == "decode" {
+        let max_new = if pos > 0 { pos as usize } else { 8 };
+        let mut dec = match mil_infer::ane_decode::Decoder::open_dir(
+            &mil,
+            mil_infer::e5rt::DeviceMask::Ane,
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("milc ane decode: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let t = std::time::Instant::now();
+        match dec.generate(&tokens, max_new) {
+            Ok(ids) => {
+                let el = t.elapsed().as_secs_f64();
+                println!("{}", ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(","));
+                eprintln!(
+                    "[decode] {} prompt + {} new in {:.2}s ({:.1} tok/s)",
+                    tokens.len(),
+                    ids.len(),
+                    el,
+                    (tokens.len() + ids.len()) as f64 / el
+                );
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("milc ane decode: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     if mode.is_empty() {
         eprintln!("milc ane: need lower, validate, compile, or run");
         return ExitCode::from(2);

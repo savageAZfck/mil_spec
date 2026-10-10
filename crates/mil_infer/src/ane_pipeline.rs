@@ -170,6 +170,14 @@ impl Pipeline {
         Ok((self.api.ptr(self.hidden[1])?, self.hidden_elems))
     }
 
+    /// Element count of a shared live input, if bound.
+    pub fn shared_elems(&self, name: &str) -> Option<usize> {
+        self.shared_in
+            .iter()
+            .find(|(n, _, _)| n == name)
+            .map(|(_, _, e)| *e as usize)
+    }
+
     /// Write a shared live input (mask, rope) — broadcast to all ops.
     pub fn set_shared(&self, name: &str, data: &[u16]) -> Result<(), E5Error> {
         let (_, buf, elems) = self
@@ -206,6 +214,26 @@ impl Pipeline {
             }
         }
         out
+    }
+
+    /// The last body op's `hidden` output (fp16 bits) — diagnostics.
+    pub fn last_hidden(&self, n_layers: usize) -> Option<Vec<u16>> {
+        if self.hidden[0].is_null() || n_layers == 0 {
+            return None;
+        }
+        let buf = self.hidden[(n_layers - 1) % 2];
+        let p = self.api.ptr(buf).ok()?;
+        Some(unsafe { std::slice::from_raw_parts(p, self.hidden_elems as usize).to_vec() })
+    }
+
+    /// A resident state buffer's contents (fp16 bits) — diagnostics.
+    pub fn state_f16(&self, op_idx: usize, name: &str) -> Option<Vec<u16>> {
+        let (_, _, buf, elems) = self
+            .states
+            .iter()
+            .find(|(i, n, _, _)| *i == op_idx && n == name)?;
+        let p = self.api.ptr(*buf).ok()?;
+        Some(unsafe { std::slice::from_raw_parts(p, *elems as usize).to_vec() })
     }
 
     /// State buffer names per op (diagnostics).

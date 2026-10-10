@@ -38,6 +38,7 @@ pub enum E5Error {
     Missing(&'static str),
     Call(&'static str, i64),
     Io(std::io::Error),
+    Parse(String),
 }
 
 impl std::fmt::Display for E5Error {
@@ -47,6 +48,7 @@ impl std::fmt::Display for E5Error {
             E5Error::Missing(s) => write!(f, "missing e5rt symbol {s}"),
             E5Error::Call(s, rc) => write!(f, "{s} → {rc}"),
             E5Error::Io(e) => write!(f, "{e}"),
+            E5Error::Parse(s) => write!(f, "{s}"),
         }
     }
 }

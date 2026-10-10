@@ -1,0 +1,15 @@
+[package]
+name = "mil_ane_bridge"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Drop-in libBadAppleBridge replacement: the bad_apple_ane_* C ABI backed by mil_infer's direct e5rt path — no CoreML."
+license = "MIT OR Apache-2.0"
+authors = ["Adam Clark <savagetism@icloud.com>"]
+
+[lib]
+name = "BadAppleANEBridge"
+crate-type = ["cdylib"]
+
+[dependencies]
+mil_infer = { path = "../mil_infer", version = "0.3.0" }

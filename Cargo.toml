@@ -8,6 +8,7 @@ members = [
     "crates/mil_compile",
     "crates/mil_verify",
     "crates/mil_infer",
+    "crates/mil_ane_bridge",
     "crates/mil_machines",
     "crates/milc",
 ]

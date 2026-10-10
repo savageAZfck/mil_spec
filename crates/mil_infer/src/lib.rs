@@ -42,6 +42,11 @@ pub mod e5rt;
 pub mod ane_pipeline;
 pub use ane_pipeline::Pipeline;
 
+/// Greedy decode loop over a shard manifest — embedding lookup,
+/// per-step rope/masks, argmax — driving `Pipeline`.
+pub mod ane_decode;
+pub use ane_decode::Decoder;
+
 /// Which hardware units the model is allowed to use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComputeUnits {
