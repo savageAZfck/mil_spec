@@ -1,6 +1,6 @@
 [package]
 name = "mil_compile"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Compile .mlpackage specs to .mlmodelc: coremlc driver with structured errors; in-process CoreML.framework compile on macOS."
@@ -10,4 +10,4 @@ repository = "https://github.com/savageAZfck/mil_spec"
 keywords = ["coreml", "mil", "compiler", "apple-silicon"]
 
 [dependencies]
-mil_spec = { path = "../..", version = "0.3.0" }
+mil_spec = { path = "../..", version = "0.4.0" }

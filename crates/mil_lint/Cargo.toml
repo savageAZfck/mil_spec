@@ -1,6 +1,6 @@
 [package]
 name = "mil_lint"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Static ANE-placement analysis for MIL graphs: predicts per-op execution unit (ANE/GPU/CPU) before compile."
@@ -10,4 +10,4 @@ repository = "https://github.com/savageAZfck/mil_spec"
 keywords = ["coreml", "ane", "mil", "apple-silicon"]
 
 [dependencies]
-mil_spec = { path = "../..", version = "0.3.0" }
+mil_spec = { path = "../..", version = "0.4.0" }

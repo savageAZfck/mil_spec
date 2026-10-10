@@ -10,7 +10,7 @@ repository = "https://github.com/savageAZfck/mil_spec"
 keywords = ["coreml", "mil", "onnx", "sklearn", "apple-silicon"]
 
 [dependencies]
-mil_spec = { path = "../..", version = "0.3.1" }
+mil_spec = { path = "../..", version = "0.4.0" }
 half = "2"
 serde_json = "1"
 

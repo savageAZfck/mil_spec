@@ -84,14 +84,14 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "mil_compile"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "mil_spec",
 ]
 
 [[package]]
 name = "mil_convert"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "half",
  "mil_compile",
@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "mil_infer"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "half",
  "mil_compile",
@@ -116,14 +116,14 @@ dependencies = [
 
 [[package]]
 name = "mil_lint"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "mil_spec",
 ]
 
 [[package]]
 name = "mil_machines"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "mil_spec",
 ]
@@ -141,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "mil_passes"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "half",
  "mil_spec",
@@ -149,7 +149,7 @@ dependencies = [
 
 [[package]]
 name = "mil_spec"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "half",
  "tempfile",
@@ -157,7 +157,7 @@ dependencies = [
 
 [[package]]
 name = "mil_verify"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "half",
  "mil_compile",
@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "milc"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "half",
  "mil_compile",
