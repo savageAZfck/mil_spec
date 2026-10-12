@@ -50,9 +50,8 @@ impl Manifest {
                 .map(|n| n as usize)
                 .ok_or_else(|| E5Error::Parse(format!("manifest missing model.{k}")))
         };
-        let mil_of = |dir: &Path, compiled: &str| {
-            dir.join(compiled.trim_end_matches('/')).join("model.mil")
-        };
+        let mil_of =
+            |dir: &Path, compiled: &str| dir.join(compiled.trim_end_matches('/')).join("model.mil");
         let mut layers: Vec<PathBuf> = v["shards"]
             .as_array()
             .unwrap_or(&vec![])
@@ -124,8 +123,8 @@ impl Decoder {
         let inv_freq: Vec<f64> = (0..half)
             .map(|i| manifest.rope_freq_base.powf(-(i as f64) / half as f64))
             .collect();
-        let attn_rows = pipe.shared_elems("attn_mask").unwrap_or(manifest.seq_len)
-            / manifest.seq_len;
+        let attn_rows =
+            pipe.shared_elems("attn_mask").unwrap_or(manifest.seq_len) / manifest.seq_len;
         let mut d = Decoder {
             pipe,
             manifest,
@@ -173,8 +172,10 @@ impl Decoder {
             return Err(E5Error::Call("decoder: token out of vocab", -1));
         }
         let mut row = vec![0u8; self.manifest.hidden_size * 2];
-        self.embedding
-            .read_exact_at(&mut row, token as u64 * self.manifest.hidden_size as u64 * 2)?;
+        self.embedding.read_exact_at(
+            &mut row,
+            token as u64 * self.manifest.hidden_size as u64 * 2,
+        )?;
         self.push_row(&row, project)
     }
 

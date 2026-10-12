@@ -38,7 +38,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get(1)
         .map(|s| std::path::PathBuf::from(s))
         .unwrap_or_else(|| Path::new(".").to_path_buf());
-    let n_layers: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+    let n_layers: usize = args
+        .get(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
     let steps: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(2);
 
     let (mut layers, mut heads) = shard_paths(&dir)?;

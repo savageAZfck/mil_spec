@@ -140,7 +140,9 @@ fn cf_to_string(s: *const c_void) -> String {
     unsafe {
         let fast = CFStringGetCStringPtr(s, UTF8);
         if !fast.is_null() {
-            return std::ffi::CStr::from_ptr(fast).to_string_lossy().into_owned();
+            return std::ffi::CStr::from_ptr(fast)
+                .to_string_lossy()
+                .into_owned();
         }
         let len = CFStringGetLength(s);
         let mut buf = vec![0u8; (len as usize + 1) * 2];
@@ -264,8 +266,9 @@ unsafe extern "C" fn on_complete(_b: *mut c_void, status: u64, dict: *mut c_void
         let dram = dict_str(dict, "ModelMaxDramUsage");
         if !dram.is_null() && unsafe { CFGetTypeID(dram) } == unsafe { CFNumberGetTypeID() } {
             let mut v: i64 = 0;
-            if unsafe { CFNumberGetValue(dram, CF_NUMBER_SINT64, &mut v as *mut i64 as *mut c_void) }
-            {
+            if unsafe {
+                CFNumberGetValue(dram, CF_NUMBER_SINT64, &mut v as *mut i64 as *mut c_void)
+            } {
                 cb.dram = Some(v as u64);
             }
         }
@@ -300,7 +303,12 @@ impl Anec {
             if p.is_null() {
                 Err(AnecError::MissingSymbol(name))
             } else {
-                Ok(unsafe { std::mem::transmute::<_, unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void) -> i64>(p) })
+                Ok(unsafe {
+                    std::mem::transmute::<
+                        _,
+                        unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void) -> i64,
+                    >(p)
+                })
             }
         };
         Ok(Anec {
@@ -315,11 +323,7 @@ impl Anec {
     /// resolves against its containing dir). `out_dir` gets the Mach-O
     /// on compile; the dict joins path+name by literal concat, so the
     /// dir string must end in `/`.
-    fn input_dict(
-        mil: &Path,
-        out_dir: &Path,
-        arch: &str,
-    ) -> Result<*mut c_void, AnecError> {
+    fn input_dict(mil: &Path, out_dir: &Path, arch: &str) -> Result<*mut c_void, AnecError> {
         let dir = mil
             .parent()
             .ok_or_else(|| AnecError::BadPath(mil.to_path_buf()))?;
@@ -343,7 +347,11 @@ impl Anec {
         dset_str(net, "TargetArchitecture", arch);
 
         let input = mdict();
-        dset(input, "InputNetworks", carray(&[net as *const c_void]) as *const c_void);
+        dset(
+            input,
+            "InputNetworks",
+            carray(&[net as *const c_void]) as *const c_void,
+        );
         dset(input, "ExternConstants", carray(&[]) as *const c_void);
         dset(input, "FileConstants", carray(&[]) as *const c_void);
         dset_str(input, "OutputFilePath", &out_s);

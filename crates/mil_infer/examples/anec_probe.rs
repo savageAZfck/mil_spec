@@ -83,9 +83,8 @@ fn cxx_string(s: &str) -> [u8; 24] {
 }
 
 fn main() {
-    let path =
-        CString::new("/System/Library/PrivateFrameworks/ANECompiler.framework/ANECompiler")
-            .unwrap();
+    let path = CString::new("/System/Library/PrivateFrameworks/ANECompiler.framework/ANECompiler")
+        .unwrap();
     let h = unsafe { dlopen(path.as_ptr(), RTLD_NOW) };
     if h.is_null() {
         eprintln!("dlopen failed — framework not loadable from this process");
@@ -163,8 +162,8 @@ fn main() {
             unsafe { std::mem::transmute(p) };
         for arch in [
             "h11", "h12", "h13", "h13g", "h14", "h14g", "h14c", "h15", "h15g", "h15c", "h16",
-            "h16g", "h16c", "h16s", "h17", "h17a", "h17c", "h17d", "h17g", "h17s", "h18",
-            "h18g", "h19",
+            "h16g", "h16c", "h16s", "h17", "h17a", "h17c", "h17d", "h17g", "h17s", "h18", "h18g",
+            "h19",
         ] {
             let mut out: u64 = 0;
             let rc = unsafe { f(std::ptr::null_mut(), cfstr(arch), &mut out) };
@@ -299,7 +298,11 @@ fn main() {
     let params = mdict();
     dset(params, "TargetArchitecture", cfstr("h16g"));
     let params_opts = mdict();
-    dset(params_opts, "OptionsFilePath", cfstr("/tmp/anec_opts.plist"));
+    dset(
+        params_opts,
+        "OptionsFilePath",
+        cfstr("/tmp/anec_opts.plist"),
+    );
     let params_both = mdict();
     dset(params_both, "TargetArchitecture", cfstr("h16g"));
     let arch_arr = unsafe {
@@ -312,13 +315,23 @@ fn main() {
     };
     let params_arr = mdict();
     dset(params_arr, "TargetArchitecture", arch_arr);
-    dset(params_both, "OptionsFilePath", cfstr("/tmp/anec_opts.plist"));
+    dset(
+        params_both,
+        "OptionsFilePath",
+        cfstr("/tmp/anec_opts.plist"),
+    );
 
-    println!("[dict] input:"); unsafe { CFShow(input) };
-    println!("[dict] params:"); unsafe { CFShow(params) };
+    println!("[dict] input:");
+    unsafe { CFShow(input) };
+    println!("[dict] params:");
+    unsafe { CFShow(params) };
 
     // Each variant runs in a forked child: a crash isolates that case.
-    extern "C" { fn fork() -> i32; fn _exit(s: i32) -> !; fn waitpid(p: i32, s: *mut i32, o: i32) -> i32; }
+    extern "C" {
+        fn fork() -> i32;
+        fn _exit(s: i32) -> !;
+        fn waitpid(p: i32, s: *mut i32, o: i32) -> i32;
+    }
     // 6b. Canonical construction: ANECCreateCompilerInputDictionary
     //     takes a libc++ std::string& (path) -> the input dict itself.
     //     libc++ arm64 long-form: {ptr, size, cap|MSB} when byte23<0.
@@ -335,8 +348,7 @@ fn main() {
     let mut built_input: *mut c_void = std::ptr::null_mut();
     if !cd.is_null() {
         let (pb, _keep) = mkpath(&mil);
-        let f: unsafe extern "C" fn(*const u8) -> *mut c_void =
-            unsafe { std::mem::transmute(cd) };
+        let f: unsafe extern "C" fn(*const u8) -> *mut c_void = unsafe { std::mem::transmute(cd) };
         built_input = unsafe { f(pb.as_ptr()) };
         println!("[dict] CreateCompilerInputDictionary({mil}) -> {built_input:?}");
         if !built_input.is_null() {
@@ -347,7 +359,8 @@ fn main() {
     let cp = sym(h, "ANECCompile");
     let empty_i = mdict();
     let empty_p = mdict();
-    let i_nets_only = mdict(); dset(i_nets_only, "InputNetworks", nets);
+    let i_nets_only = mdict();
+    dset(i_nets_only, "InputNetworks", nets);
     let cases: Vec<(&str, *mut c_void, *mut c_void)> = vec![
         ("empty,empty", empty_i, empty_p),
         ("input,empty", input, empty_p),
@@ -366,13 +379,23 @@ fn main() {
     // ANECValidate/Compile take a completion BLOCK as arg2:
     //   block(ANECStatus status, CFDictionaryRef result)
     #[repr(C)]
-    struct Block { isa: *const c_void, flags: i32, rsvd: i32,
-                   invoke: *const c_void, desc: *const c_void }
+    struct Block {
+        isa: *const c_void,
+        flags: i32,
+        rsvd: i32,
+        invoke: *const c_void,
+        desc: *const c_void,
+    }
     #[repr(C)]
-    struct BlockDesc { rsvd: usize, size: usize }
+    struct BlockDesc {
+        rsvd: usize,
+        size: usize,
+    }
     unsafe extern "C" fn on_complete(_b: *mut c_void, status: u64, dict: *mut c_void) {
         println!("  [cb] status={status:#x} dict={dict:?}");
-        if !dict.is_null() { unsafe { CFShow(dict) }; }
+        if !dict.is_null() {
+            unsafe { CFShow(dict) };
+        }
     }
     static DESC: BlockDesc = BlockDesc { rsvd: 0, size: 32 };
     unsafe impl Sync for Block {}
@@ -384,11 +407,16 @@ fn main() {
         desc: unsafe { &raw const DESC as *const c_void },
     };
     for (tag, i, p) in cases {
-        for (fname, fp) in [("ANECCompileOnline", sym(h,"ANECCompileOnline")),
-                            ("ANECCompileOffline", sym(h,"ANECCompileOffline")),
-                            ("ANECCompileJIT", sym(h,"ANECCompileJIT")),
-                            ("ANECValidate", vp), ("ANECCompile", cp)] {
-            if fp.is_null() { continue; }
+        for (fname, fp) in [
+            ("ANECCompileOnline", sym(h, "ANECCompileOnline")),
+            ("ANECCompileOffline", sym(h, "ANECCompileOffline")),
+            ("ANECCompileJIT", sym(h, "ANECCompileJIT")),
+            ("ANECValidate", vp),
+            ("ANECCompile", cp),
+        ] {
+            if fp.is_null() {
+                continue;
+            }
             let pid = unsafe { fork() };
             if pid == 0 {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void) -> i64 =
@@ -402,10 +430,12 @@ fn main() {
             if st & 0x7f != 0 {
                 println!("[dict] {fname}({tag}): CRASH sig={}", st & 0x7f);
             }
-            for pat in ["/tmp/anec_out/probe_net.macho",
-                        "/tmp/anec_out/probe_mil.macho",
-                        "/tmp/anec_outprobe_net.macho",
-                        "/tmp/anec_outprobe_mil.macho"] {
+            for pat in [
+                "/tmp/anec_out/probe_net.macho",
+                "/tmp/anec_out/probe_mil.macho",
+                "/tmp/anec_outprobe_net.macho",
+                "/tmp/anec_outprobe_mil.macho",
+            ] {
                 if let Ok(md) = std::fs::metadata(pat) {
                     println!("    -> artifact {pat} {} bytes", md.len());
                 }

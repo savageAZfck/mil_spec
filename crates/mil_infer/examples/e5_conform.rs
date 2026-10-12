@@ -35,7 +35,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // pos-0 inputs: rope cos=1 sin=0; attn opens col0; write-mask[0]=1
     let seq = 2048usize;
-    let mut attn = vec![half::f16::from_f32(-10000.0).to_bits(); pipe.shared_elems("attn_mask").unwrap_or(seq)];
+    let mut attn = vec![
+        half::f16::from_f32(-10000.0).to_bits();
+        pipe.shared_elems("attn_mask").unwrap_or(seq)
+    ];
     let rows = attn.len() / seq;
     for r in 0..rows {
         attn[r * seq] = 0;

@@ -72,6 +72,24 @@ pub enum DeviceMask {
     Auto = 0x7,
 }
 
+/// Compiler configuration: where `aned` stages its cache bundle and
+/// whether a compile forces a fresh build or may reuse what is on disk.
+pub struct CompileCfg {
+    /// `e5rt_e5_compiler_config_options_set_cache_bundle_location` target.
+    pub cache_dir: std::path::PathBuf,
+    /// `e5rt_e5_compiler_options_set_force_recompilation`.
+    pub force_recompile: bool,
+}
+
+impl Default for CompileCfg {
+    fn default() -> Self {
+        Self {
+            cache_dir: std::path::PathBuf::from("/tmp/e5_cache"),
+            force_recompile: true,
+        }
+    }
+}
+
 macro_rules! e5sym {
     ($h:expr, $name:literal, ($($a:ty),*) -> $r:ty) => {{
         let c = CString::new($name).unwrap();
@@ -94,6 +112,7 @@ pub(crate) struct Api {
     compile: unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_void, *mut *mut c_void) -> Rc,
     lib_num_fns: unsafe extern "C" fn(*mut c_void, *mut u64) -> Rc,
     lib_fn_names: unsafe extern "C" fn(*mut c_void, u64, *mut *const c_char) -> Rc,
+    lib_create: unsafe extern "C" fn(*const c_char, *mut *mut c_void) -> Rc,
     lib_retain_fn: unsafe extern "C" fn(*mut c_void, *const c_char, *mut *mut c_void) -> Rc,
     op_opts_create: unsafe extern "C" fn(*mut *mut c_void, *mut c_void) -> Rc,
     op_opts_set_name: unsafe extern "C" fn(*mut c_void, *const c_char) -> Rc,
@@ -142,6 +161,7 @@ impl Api {
             compile: e5sym!(h, "e5rt_e5_compiler_compile", (*mut c_void, *const c_char, *mut c_void, *mut *mut c_void) -> Rc),
             lib_num_fns: e5sym!(h, "e5rt_program_library_get_num_functions", (*mut c_void, *mut u64) -> Rc),
             lib_fn_names: e5sym!(h, "e5rt_program_library_get_function_names", (*mut c_void, u64, *mut *const c_char) -> Rc),
+            lib_create: e5sym!(h, "e5rt_program_library_create", (*const c_char, *mut *mut c_void) -> Rc),
             lib_retain_fn: e5sym!(h, "e5rt_program_library_retain_program_function", (*mut c_void, *const c_char, *mut *mut c_void) -> Rc),
             op_opts_create: e5sym!(h, "e5rt_precompiled_compute_op_create_options_create_with_program_function", (*mut *mut c_void, *mut c_void) -> Rc),
             op_opts_set_name: e5sym!(h, "e5rt_precompiled_compute_op_create_options_set_operation_name", (*mut c_void, *const c_char) -> Rc),
@@ -230,7 +250,10 @@ impl Api {
     /// Allocate a CPU-type buffer of `bytes`.
     pub(crate) fn buf(&self, bytes: u64) -> Result<*mut c_void, E5Error> {
         let mut b = std::ptr::null_mut();
-        check(unsafe { (self.buf_alloc)(&mut b, bytes, 0) }, "buffer_object_alloc")?;
+        check(
+            unsafe { (self.buf_alloc)(&mut b, bytes, 0) },
+            "buffer_object_alloc",
+        )?;
         Ok(b)
     }
 
@@ -242,7 +265,10 @@ impl Api {
     /// Host data pointer for a buffer.
     pub(crate) fn ptr(&self, buf: *mut c_void) -> Result<*mut u16, E5Error> {
         let mut p = std::ptr::null_mut();
-        check(unsafe { (self.buf_ptr)(buf, &mut p) }, "buffer_get_data_ptr")?;
+        check(
+            unsafe { (self.buf_ptr)(buf, &mut p) },
+            "buffer_get_data_ptr",
+        )?;
         Ok(p as *mut u16)
     }
 
@@ -254,7 +280,10 @@ impl Api {
     }
 
     pub(crate) fn encode(&self, stream: *mut c_void, op: *mut c_void) -> Result<(), E5Error> {
-        check(unsafe { (self.stream_encode)(stream, op) }, "encode_operation")
+        check(
+            unsafe { (self.stream_encode)(stream, op) },
+            "encode_operation",
+        )
     }
 
     pub(crate) fn exec(&self, stream: *mut c_void) -> Result<(), E5Error> {
@@ -325,19 +354,38 @@ impl Program {
         mil: &Path,
         mask: DeviceMask,
     ) -> Result<(*mut c_void, Vec<String>), E5Error> {
+        Self::make_op_on_cfg(api, mil, mask, &CompileCfg::default())
+    }
+
+    /// Like `make_op_on` but with explicit cache location / recompilation.
+    pub(crate) fn make_op_on_cfg(
+        api: &Api,
+        mil: &Path,
+        mask: DeviceMask,
+        cc: &CompileCfg,
+    ) -> Result<(*mut c_void, Vec<String>), E5Error> {
         unsafe {
             let mut cfg = std::ptr::null_mut();
             check((api.cfg_create)(&mut cfg), "config_options_create")?;
-            let cache = cstr("/tmp/e5_cache");
-            let _ = std::fs::create_dir_all("/tmp/e5_cache");
-            check((api.cfg_set_cache)(cfg, cache.as_ptr()), "set_cache_bundle_location")?;
+            let _ = std::fs::create_dir_all(&cc.cache_dir);
+            let cache = cstr(&cc.cache_dir.to_string_lossy());
+            check(
+                (api.cfg_set_cache)(cfg, cache.as_ptr()),
+                "set_cache_bundle_location",
+            )?;
             let mut comp = std::ptr::null_mut();
             check((api.comp_create_cfg)(&mut comp, cfg), "e5_compiler_create")?;
 
             let mut opts = std::ptr::null_mut();
             check((api.opts_create)(&mut opts), "compiler_options_create")?;
-            check((api.opts_set_mask)(opts, mask as u64), "set_compute_device_types_mask")?;
-            check((api.opts_set_recomp)(opts, 1), "set_force_recompilation")?;
+            check(
+                (api.opts_set_mask)(opts, mask as u64),
+                "set_compute_device_types_mask",
+            )?;
+            check(
+                (api.opts_set_recomp)(opts, cc.force_recompile as i32),
+                "set_force_recompilation",
+            )?;
             check(
                 (api.opts_set_segmenter)(opts, cstr("graph").as_ptr()),
                 "set_segmenter",
@@ -345,8 +393,21 @@ impl Program {
 
             let mil_c = cstr(&mil.to_string_lossy());
             let mut lib = std::ptr::null_mut();
-            check((api.compile)(comp, mil_c.as_ptr(), opts, &mut lib), "e5_compiler_compile")?;
+            check(
+                (api.compile)(comp, mil_c.as_ptr(), opts, &mut lib),
+                "e5_compiler_compile",
+            )?;
+            Self::make_op_from_lib(api, lib)
+        }
+    }
 
+    /// Turn an already-created program library into a bound op: enumerate
+    /// functions, retain `main`, build the precompiled compute op.
+    fn make_op_from_lib(
+        api: &Api,
+        lib: *mut c_void,
+    ) -> Result<(*mut c_void, Vec<String>), E5Error> {
+        unsafe {
             // Enumerate exported functions (diagnostics).
             let mut n = 0u64;
             let _ = (api.lib_num_fns)(lib, &mut n);
@@ -372,10 +433,29 @@ impl Program {
                 (api.op_opts_set_name)(oo, cstr("main").as_ptr()),
                 "op_set_name",
             )?;
-            check((api.op_opts_set_intermed)(oo, 1), "op_set_intermediate_buffers")?;
+            check(
+                (api.op_opts_set_intermed)(oo, 1),
+                "op_set_intermediate_buffers",
+            )?;
             let mut op = std::ptr::null_mut();
             check((api.op_create)(&mut op, oo), "op_create")?;
             Ok((op, functions))
+        }
+    }
+
+    /// Build an op directly from an on-disk e5 bundle (`H16G.bundle` /
+    /// `.e5` dir) — the precompiled path, no MIL compile at all.
+    pub(crate) fn make_op_from_bundle(
+        api: &Api,
+        bundle: &Path,
+    ) -> Result<(*mut c_void, Vec<String>), E5Error> {
+        unsafe {
+            let mut lib = std::ptr::null_mut();
+            check(
+                (api.lib_create)(cstr(&bundle.to_string_lossy()).as_ptr(), &mut lib),
+                "program_library_create",
+            )?;
+            Self::make_op_from_lib(api, lib)
         }
     }
 
@@ -389,10 +469,16 @@ impl Program {
             .iter()
             .map(|(n, e)| {
                 let mut port = std::ptr::null_mut();
-                check(unsafe { port_fn(op, cstr(n).as_ptr(), &mut port) }, "retain_port")?;
+                check(
+                    unsafe { port_fn(op, cstr(n).as_ptr(), &mut port) },
+                    "retain_port",
+                )?;
                 let mut buf = std::ptr::null_mut();
                 let bytes = e * 2;
-                check(unsafe { (api.buf_alloc)(&mut buf, bytes, 0) }, "buffer_object_alloc")?;
+                check(
+                    unsafe { (api.buf_alloc)(&mut buf, bytes, 0) },
+                    "buffer_object_alloc",
+                )?;
                 check(unsafe { (api.port_bind)(port, buf) }, "io_port_bind")?;
                 Ok((n.clone(), Bound { port, buf, bytes }))
             })
@@ -420,39 +506,86 @@ impl Program {
                     .collect()
             }
         };
-        let size_of = |port_fn: unsafe extern "C" fn(*mut c_void, *const c_char, *mut *mut c_void) -> Rc,
-                       name: &str|
-         -> u64 {
-            unsafe {
-                let mut port = std::ptr::null_mut();
-                if port_fn(op, cstr(name).as_ptr(), &mut port) != 0 || port.is_null() {
-                    return 0;
+        let size_of =
+            |port_fn: unsafe extern "C" fn(*mut c_void, *const c_char, *mut *mut c_void) -> Rc,
+             name: &str|
+             -> u64 {
+                unsafe {
+                    let mut port = std::ptr::null_mut();
+                    if port_fn(op, cstr(name).as_ptr(), &mut port) != 0 || port.is_null() {
+                        return 0;
+                    }
+                    let mut td = std::ptr::null_mut();
+                    if (api.port_tensor_desc)(port, &mut td) != 0 || td.is_null() {
+                        return 0;
+                    }
+                    let mut elems = 0u64;
+                    let _ = (api.td_num_elems)(td, &mut elems);
+                    let _ = (api.td_release)(&mut td);
+                    elems
                 }
-                let mut td = std::ptr::null_mut();
-                if (api.port_tensor_desc)(port, &mut td) != 0 || td.is_null() {
-                    return 0;
-                }
-                let mut elems = 0u64;
-                let _ = (api.td_num_elems)(td, &mut elems);
-                let _ = (api.td_release)(&mut td);
-                elems
-            }
-        };
+            };
         let inputs = names(api.op_num_inputs, api.op_input_names);
         let outputs = names(api.op_num_outputs, api.op_output_names);
         let inouts = names(api.op_num_inouts, api.op_inout_names);
         PortMap {
-            inputs: inputs.iter().map(|n| (n.clone(), size_of(api.op_in_port, n))).collect(),
-            outputs: outputs.iter().map(|n| (n.clone(), size_of(api.op_out_port, n))).collect(),
-            inouts: inouts.iter().map(|n| (n.clone(), size_of(api.op_inout_port, n))).collect(),
+            inputs: inputs
+                .iter()
+                .map(|n| (n.clone(), size_of(api.op_in_port, n)))
+                .collect(),
+            outputs: outputs
+                .iter()
+                .map(|n| (n.clone(), size_of(api.op_out_port, n)))
+                .collect(),
+            inouts: inouts
+                .iter()
+                .map(|n| (n.clone(), size_of(api.op_inout_port, n)))
+                .collect(),
         }
     }
 
     /// Compile + self-configuring bind: port names and element counts
     /// are read back from the op's tensor descriptors.
     pub fn compile_auto(mil: &Path, mask: DeviceMask) -> Result<(Self, PortMap), E5Error> {
+        Self::compile_auto_cfg(mil, mask, &CompileCfg::default())
+    }
+
+    /// Load a precompiled e5 bundle directory (`H16G.bundle` or the `.e5`
+    /// bundle dir) and bind it for execution — no compilation.
+    pub fn from_e5_bundle(bundle: &Path) -> Result<(Self, PortMap), E5Error> {
         let api = Api::open()?;
-        let (op, functions) = Self::make_op_on(&api, mil, mask)?;
+        let (op, functions) = Self::make_op_from_bundle(&api, bundle)?;
+        let map = Self::port_map(op, &api);
+        let ins = Self::bind_ports(&api, op, api.op_in_port, &map.inputs)?;
+        let inouts = Self::bind_ports(&api, op, api.op_inout_port, &map.inouts)?;
+        let outs = Self::bind_ports(&api, op, api.op_out_port, &map.outputs)?;
+        unsafe {
+            let mut stream = std::ptr::null_mut();
+            check((api.stream_create)(&mut stream), "stream_create")?;
+            check((api.stream_encode)(stream, op), "encode_operation")?;
+            Ok((
+                Program {
+                    api,
+                    stream,
+                    inputs: ins,
+                    inouts: inouts.iter().map(|(n, _)| n.clone()).collect(),
+                    inout_bounds: inouts,
+                    outputs: outs,
+                    functions,
+                },
+                map,
+            ))
+        }
+    }
+
+    /// `compile_auto` with explicit cache location / recompilation control.
+    pub fn compile_auto_cfg(
+        mil: &Path,
+        mask: DeviceMask,
+        cc: &CompileCfg,
+    ) -> Result<(Self, PortMap), E5Error> {
+        let api = Api::open()?;
+        let (op, functions) = Self::make_op_on_cfg(&api, mil, mask, cc)?;
         let map = Self::port_map(op, &api);
         let ins = Self::bind_ports(&api, op, api.op_in_port, &map.inputs)?;
         let inouts = Self::bind_ports(&api, op, api.op_inout_port, &map.inouts)?;
@@ -483,8 +616,20 @@ impl Program {
         outputs: &[(&str, u64)],
         inouts: &[(&str, u64)],
     ) -> Result<Self, E5Error> {
+        Self::compile_cfg(mil, mask, inputs, outputs, inouts, &CompileCfg::default())
+    }
+
+    /// `compile` with explicit cache location / recompilation control.
+    pub fn compile_cfg(
+        mil: &Path,
+        mask: DeviceMask,
+        inputs: &[(&str, u64)],
+        outputs: &[(&str, u64)],
+        inouts: &[(&str, u64)],
+        cc: &CompileCfg,
+    ) -> Result<Self, E5Error> {
         let api = Api::open()?;
-        let (op, functions) = Self::make_op_on(&api, mil, mask)?;
+        let (op, functions) = Self::make_op_on_cfg(&api, mil, mask, cc)?;
         unsafe {
             let ins = Self::bind_ports(
                 &api,
@@ -531,7 +676,10 @@ impl Program {
 
     fn data_ptr(&self, b: &Bound) -> Result<*mut u16, E5Error> {
         let mut p = std::ptr::null_mut();
-        check(unsafe { (self.api.buf_ptr)(b.buf, &mut p) }, "buffer_get_data_ptr")?;
+        check(
+            unsafe { (self.api.buf_ptr)(b.buf, &mut p) },
+            "buffer_get_data_ptr",
+        )?;
         Ok(p as *mut u16)
     }
 
@@ -568,7 +716,10 @@ impl Program {
 
     /// Run the encoded stream synchronously on the hardware lane.
     pub fn execute(&self) -> Result<(), E5Error> {
-        check(unsafe { (self.api.stream_exec)(self.stream) }, "execute_sync")
+        check(
+            unsafe { (self.api.stream_exec)(self.stream) },
+            "execute_sync",
+        )
     }
 }
 

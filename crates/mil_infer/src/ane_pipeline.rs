@@ -238,7 +238,10 @@ impl Pipeline {
 
     /// State buffer names per op (diagnostics).
     pub fn state_names(&self) -> Vec<(usize, String)> {
-        self.states.iter().map(|(i, n, _, _)| (*i, n.clone())).collect()
+        self.states
+            .iter()
+            .map(|(i, n, _, _)| (*i, n.clone()))
+            .collect()
     }
 }
 

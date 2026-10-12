@@ -37,6 +37,13 @@ pub use anec::{Anec, AnecError, Verdict, ARCHES};
 /// compile once, eval many, no entitlement required.
 pub mod e5rt;
 
+/// Precompiled-package execution through `aned`'s deployment path:
+/// `_ANEModel` on an Espresso package directory + `_ANEClient`
+/// `loadModel`/`evaluateRealTimeWithModel` over IOSurface buffers.
+/// This is the path that runs our own `anec`-compiled ANE Mach-O.
+pub mod espresso;
+pub use espresso::EspressoProgram;
+
 /// Chained multi-shard decode on the ANE — layer shards ping-pong
 /// through shared `hidden` buffers in one execution stream.
 pub mod ane_pipeline;

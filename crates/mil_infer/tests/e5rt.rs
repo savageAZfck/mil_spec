@@ -39,10 +39,15 @@ fn ane_executes_add() {
         }
     };
     eprintln!("functions: {:?}", prog.functions);
-    prog.set_input_f16("x", &[f16(1.0), f16(2.0), f16(3.0), f16(4.0)]).unwrap();
-    prog.set_input_f16("y", &[f16(10.0), f16(20.0), f16(30.0), f16(40.0)]).unwrap();
+    prog.set_input_f16("x", &[f16(1.0), f16(2.0), f16(3.0), f16(4.0)])
+        .unwrap();
+    prog.set_input_f16("y", &[f16(10.0), f16(20.0), f16(30.0), f16(40.0)])
+        .unwrap();
     prog.execute().unwrap();
     let out = prog.output_f16("z").unwrap();
-    let got: Vec<f32> = out.iter().map(|b| half::f16::from_bits(*b).to_f32()).collect();
+    let got: Vec<f32> = out
+        .iter()
+        .map(|b| half::f16::from_bits(*b).to_f32())
+        .collect();
     assert_eq!(got, vec![11.0, 22.0, 33.0, 44.0], "ANE computed {got:?}");
 }
