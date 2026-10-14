@@ -61,6 +61,36 @@ fn matmul_mil(n: u32) -> String {
     )
 }
 
+/// `(conv1x1 -> sigmoid)` repeated `k` times. `n_blobs` distinct
+/// weight files (`weight.bin`, `weight2.bin`, ...) are referenced
+/// round-robin across layers — `n_blobs=1` yields the shared-weight
+/// (deduplicated) chain, `n_blobs=k` the fully distinct one.
+fn conv_sig_chain_mil(k: usize, n_blobs: usize) -> String {
+    const NAMES: [&str; 26] = [
+        "t", "u", "v", "p", "q", "r", "s", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "l",
+        "m", "n", "o", "w1", "w3", "w4", "w5", "w6",
+    ];
+    let mut s = String::from(
+        "program(1.3)\n{\n    func main<ios18>(tensor<fp16, [1, 64, 1, 1]> x) {\n            tensor<int32, [2]> st = const()[val = tensor<int32, [2]>([1, 1])];\n            string pt = const()[val = string(\"valid\")];\n            tensor<int32, [4]> pd = const()[val = tensor<int32, [4]>([0, 0, 0, 0])];\n            tensor<int32, [2]> dl = const()[val = tensor<int32, [2]>([1, 1])];\n            int32 gr = const()[val = int32(1)];\n",
+    );
+    let mut inp = "x".to_string();
+    for i in 0..k {
+        let blob = if i % n_blobs == 0 {
+            "weight.bin".to_string()
+        } else {
+            format!("weight{}.bin", i % n_blobs + 1)
+        };
+        let (wn, cn) = (format!("w{i}"), NAMES[i].to_string());
+        s += &format!("            tensor<fp16, [64, 64, 1, 1]> {wn} = const()[val = tensor<fp16, [64, 64, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/{blob}\"), offset = uint64(64)))];\n");
+        s += &format!("            tensor<fp16, [1, 64, 1, 1]> {cn} = conv(x = {inp}, weight = {wn}, strides = st, pad_type = pt, pad = pd, dilations = dl, groups = gr)[name = string(\"{cn}\")];\n");
+        let sn = if i + 1 == k { "z".into() } else { format!("s{i}") };
+        s += &format!("            tensor<fp16, [1, 64, 1, 1]> {sn} = sigmoid(x = {cn})[name = string(\"{sn}\")];\n");
+        inp = sn;
+    }
+    s += "    } -> (z);\n}\n";
+    s
+}
+
 fn one(anec: &Anec, root: &Path, name: &str, mil: &str, weights: Option<Vec<u8>>) {
     let dir = root.join(name);
     let out = dir.join("out");
@@ -199,4 +229,56 @@ fn main() {
         "program(1.3)\n{\n    func main<ios18>(tensor<fp16, [1, 64, 1, 1]> x) {\n            tensor<fp16, [64, 64, 1, 1]> w = const()[val = tensor<fp16, [64, 64, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/weight.bin\"), offset = uint64(64)))];\n            tensor<int32, [2]> st = const()[val = tensor<int32, [2]>([1, 1])];\n            string pt = const()[val = string(\"valid\")];\n            tensor<int32, [4]> pd = const()[val = tensor<int32, [4]>([0, 0, 0, 0])];\n            tensor<int32, [2]> dl = const()[val = tensor<int32, [2]>([1, 1])];\n            int32 gr = const()[val = int32(1)];\n            tensor<fp16, [1, 64, 1, 1]> t = conv(x = x, weight = w, strides = st, pad_type = pt, pad = pd, dilations = dl, groups = gr)[name = string(\"t\")];\n            tensor<fp16, [1, 64, 1, 1]> u = sigmoid(x = t)[name = string(\"u\")];\n            tensor<fp16, [64, 64, 1, 1]> w2 = const()[val = tensor<fp16, [64, 64, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/weight.bin\"), offset = uint64(64)))];\n            tensor<fp16, [1, 64, 1, 1]> v = conv(x = u, weight = w2, strides = st, pad_type = pt, pad = pd, dilations = dl, groups = gr)[name = string(\"v\")];\n            tensor<fp16, [1, 64, 1, 1]> z = sigmoid(x = v)[name = string(\"z\")];\n    } -> (z);\n}\n",
         Some(ones_blob(64 * 64)),
     );
+    // third repetition: fields that scale with op position become
+    // linear functions of layer index — the wiring rule equations.
+    one(
+        &anec,
+        &root,
+        "chain_conv3_sig3",
+        "program(1.3)\n{\n    func main<ios18>(tensor<fp16, [1, 64, 1, 1]> x) {\n            tensor<fp16, [64, 64, 1, 1]> w = const()[val = tensor<fp16, [64, 64, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/weight.bin\"), offset = uint64(64)))];\n            tensor<int32, [2]> st = const()[val = tensor<int32, [2]>([1, 1])];\n            string pt = const()[val = string(\"valid\")];\n            tensor<int32, [4]> pd = const()[val = tensor<int32, [4]>([0, 0, 0, 0])];\n            tensor<int32, [2]> dl = const()[val = tensor<int32, [2]>([1, 1])];\n            int32 gr = const()[val = int32(1)];\n            tensor<fp16, [1, 64, 1, 1]> t = conv(x = x, weight = w, strides = st, pad_type = pt, pad = pd, dilations = dl, groups = gr)[name = string(\"t\")];\n            tensor<fp16, [1, 64, 1, 1]> u = sigmoid(x = t)[name = string(\"u\")];\n            tensor<fp16, [64, 64, 1, 1]> w2 = const()[val = tensor<fp16, [64, 64, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/weight.bin\"), offset = uint64(64)))];\n            tensor<fp16, [1, 64, 1, 1]> v = conv(x = u, weight = w2, strides = st, pad_type = pt, pad = pd, dilations = dl, groups = gr)[name = string(\"v\")];\n            tensor<fp16, [1, 64, 1, 1]> p = sigmoid(x = v)[name = string(\"p\")];\n            tensor<fp16, [64, 64, 1, 1]> w3 = const()[val = tensor<fp16, [64, 64, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/weight.bin\"), offset = uint64(64)))];\n            tensor<fp16, [1, 64, 1, 1]> q = conv(x = p, weight = w3, strides = st, pad_type = pt, pad = pd, dilations = dl, groups = gr)[name = string(\"q\")];\n            tensor<fp16, [1, 64, 1, 1]> z = sigmoid(x = q)[name = string(\"z\")];\n    } -> (z);\n}\n",
+        Some(ones_blob(64 * 64)),
+    );
+
+    // deeper chains pin the per-position wiring formulas; the
+    // distinct-weight variants isolate the __KERN_0 weight-stream
+    // concatenation and per-record source ordinals.
+    for (tag, k, n_blobs) in [
+        ("chain4", 4usize, 1usize),
+        ("chain5", 5, 1),
+        ("chain2_dw", 2, 2),
+        ("chain3_dw", 3, 3),
+    ] {
+        let dir = root.join(tag);
+        fs::create_dir_all(dir.join("out")).unwrap();
+        fs::create_dir_all(dir.join("weights")).unwrap();
+        for j in 0..n_blobs {
+            let name = if j == 0 {
+                "weight.bin".to_string()
+            } else {
+                format!("weight{}.bin", j + 1)
+            };
+            // shared chains use the ones blob (same bytes as the
+            // captured skeletons); distinct blobs carry perm-offset
+            // patterns so each __KERN_0 stream self-identifies
+            let blob = if n_blobs == 1 {
+                ones_blob(64 * 64)
+            } else {
+                let mut d = Vec::with_capacity(64 * 64 * 2);
+                for i in 0..64 * 64u32 {
+                    d.extend_from_slice(&((i + j as u32 * 0x5555) as u16).to_le_bytes());
+                }
+                weight_blob(&d)
+            };
+            fs::write(dir.join("weights").join(name), blob).unwrap();
+        }
+        fs::write(dir.join("net.mil"), conv_sig_chain_mil(k, n_blobs)).unwrap();
+        let v = anec
+            .compile(&dir.join("net.mil"), &dir.join("out"), "h16")
+            .unwrap();
+        if v.status == 0 {
+            println!("{tag}: OK (dram={:?})", v.dram_usage);
+        } else {
+            println!("{tag}: FAIL {:?}", v.errors);
+        }
+    }
 }
