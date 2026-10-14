@@ -777,6 +777,246 @@ pub fn emit_conv_sig(weights: &[u16], mil_path: &str, out_path: &str) -> Result<
     Ok(img)
 }
 
+/// k=2 fused conv+sigmoid chain skeleton — provides the `i=1` form
+/// of the terminal record (the only depth where position 1 is last).
+const SKELETON_CONV_SIG2: &[u8] = include_bytes!("../assets/conv_sig2_reference.hwx");
+/// k=5 fused conv+sigmoid chain skeleton — provides the `i>=2`
+/// interior and terminal record forms plus the program header.
+const SKELETON_CONV_SIG5: &[u8] = include_bytes!("../assets/conv_sig5_skeleton.hwx");
+
+// Record-stream geometry inside `__TEXT` section content (file
+// offsets — the section maps verbatim at 0x4000).
+/// Program header preceding the per-layer records.
+const REC_HDR: (usize, usize) = (0x4000, 0x30);
+/// Layer-0 record (prologue + first fused task).
+const REC_FIRST: (usize, usize) = (0x4030, 0x190);
+/// Interior record, position-1 form — positions `i>=2` insert an
+/// extra release-buffer element into the sigmoid wiring, eating into
+/// the record's trailing pad so the record stays `0x160` bytes.
+const REC_INT: (usize, usize) = (0x41c0, 0x160);
+/// Terminal record at position `i>=2` (`0x170` bytes incl. epilogue).
+const REC_LAST: (usize, usize) = (0x45e0, 0x170);
+/// Terminal record at position `i==1` (k=2 only; `0x16c` bytes).
+const REC_LAST1: (usize, usize) = (0x41c0, 0x16c);
+
+/// Patch the sixteen `21 00 |<i16>| 00` lane-index fields of a
+/// conv+sig record to layer index `i` (u16 at +0x0e, stride 4).
+/// The +0x30 slot is a different descriptor (`15 51`/`00 03`) and is
+/// left alone — the table is +0x0e..+0x2e and +0x36..+0x4e.
+fn patch_lane_idx(rec: &mut [u8], i: usize) {
+    let v = (i as u16).to_le_bytes();
+    for o in (0x0e..=0x4e).step_by(4) {
+        if o == 0x32 {
+            continue;
+        }
+        rec[o..o + 2].copy_from_slice(&v);
+    }
+}
+
+/// Emit a complete HWX image for the k-layer fused chain
+/// `x -> (conv1x1 -> sigmoid)^k -> z` sharing one `C=64` weight blob —
+/// the transformer-FFN stacking pattern. Records are spliced
+/// per-position: first (`0x190`), interior (`0x160`), terminal
+/// (`0x16c`/`0x170` with epilogue). `__KERN_0` carries the same
+/// banded `[LUT][weights]` payload as the single-layer emitter —
+/// identical weights are deduplicated into one stream by the ANE
+/// allocator, so the payload is independent of `k`.
+///
+/// Record-field model (decoded from ANEC k=1..5 references):
+/// - `+0x00` position flag: `01` first/interior, `09` last
+/// - `+0x08` output descriptor: `40 00` interior, `c0 02` last
+/// - `+0x0e..+0x4e` lane indices = layer index `i`
+/// - `+0x100` fused-sigmoid wiring: buffer release/alloc pairs
+///   `(4(i-1), 0x10)` / `(4i, 0x10)` around a `52 10/90` gate word,
+///   `41 10 04 80` header at `i==1`, `41 10 06 80` at `i>=2`
+/// - `+0x140`/`+0x150`/`+0x158` (interior) and `+0x170`/`+0x180`/
+///   `+0x188` (first): next-record-is-terminal markers
+///   (`0x56/0x64`, `0x20/0x60`, `1/0`)
+/// - terminal epilogue at `+0x128` with layer index at the
+///   `e0 00 <i>` and `31 00 <i> 01` slots
+///
+/// FVMLIB scalars: `0x378` = `0x8000 + align(stream_len, 0x40)`,
+/// `0xb88` = k, `0xbb8` = `0xe*k + 3` (k>=2), `0xb7c` per lookup
+/// (byte-length of a payload descriptor list).
+pub fn emit_conv_sig_n(
+    layers: usize,
+    weights: &[u16],
+    mil_path: &str,
+    out_path: &str,
+) -> Result<Vec<u8>, String> {
+    if layers == 1 {
+        return emit_conv_sig(weights, mil_path, out_path);
+    }
+    const C: usize = 64;
+    if layers == 0 {
+        return Err("layers must be >= 1".into());
+    }
+    if weights.len() != C * C {
+        return Err(format!("expected {} weights, got {}", C * C, weights.len()));
+    }
+    let stream_len = REC_HDR.1
+        + REC_FIRST.1
+        + REC_INT.1 * (layers - 2)
+        + if layers == 2 { REC_LAST1.1 } else { REC_LAST.1 };
+    if 0x4000 + stream_len > CONV_WEIGHTS_OFF {
+        return Err(format!("chain of {layers} layers overflows the record plane"));
+    }
+
+    let skel = SKELETON_CONV_SIG5;
+    let (entries, reloc) = tail_meta(skel);
+    let mut img = rebuild_tail_at(skel, CONV_TAIL_OFF, &entries, reloc, mil_path, out_path);
+
+    let mut rec = Vec::with_capacity(stream_len);
+    rec.extend_from_slice(&skel[REC_HDR.0..REC_HDR.0 + REC_HDR.1]);
+
+    // layer 0 — first record; its tail carries the next-terminal markers
+    {
+        let mut r = skel[REC_FIRST.0..REC_FIRST.0 + REC_FIRST.1].to_vec();
+        let next_last = layers == 2;
+        r[0x172..0x174].copy_from_slice(&(if next_last { 0x63u16 } else { 0x55u16 }).to_le_bytes());
+        r[0x17b] = if next_last { 4 } else { 0 };
+        r[0x180] = if next_last { 0x60 } else { 0x20 };
+        r[0x18c..0x190].copy_from_slice(&(if next_last { 0u32 } else { 1 }).to_le_bytes());
+        rec.extend_from_slice(&r);
+    }
+
+    // interior layers 1..layers-1 — sigmoid wiring is rebuilt per
+    // position: [release (4(i-1),0x10)] [alloc (4i,0x10)] buffer pairs
+    // around the `52 10 01 00` gate, marker at +0x11c (i==1) or +0x120.
+    const SIG_MARK: [u8; 20] = [
+        0x41, 0x12, 0x02, 0x80, 0x00, 0x3c, 0x12, 0x00, 0x00, 0x3c, 0x00, 0x00, 0x44, 0x95, 0x80,
+        0x23, 0x00, 0x00, 0x00, 0x00,
+    ];
+    for i in 1..layers - 1 {
+        let mut r = skel[REC_INT.0..REC_INT.0 + REC_INT.1].to_vec();
+        patch_lane_idx(&mut r, i);
+        let mut w = Vec::with_capacity(0x34);
+        if i == 1 {
+            w.extend_from_slice(&[
+                0x41, 0x10, 0x04, 0x80, 0x20, 0x01, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x52, 0x10,
+                0x01, 0x00, 0x40, 0x01, 0x00, 0x00,
+            ]);
+        } else {
+            w.extend_from_slice(&[
+                0x41, 0x10, 0x06, 0x80, 0x04, 0x01, 0x00, 0x00, 0x00, 4 * (i as u8 - 1), 0x00,
+                0x00, 0x10, 0x00, 0x00, 0x00, 0x52, 0x10, 0x01, 0x00, 0x40, 0x01, 0x00, 0x00,
+            ]);
+        }
+        w.extend_from_slice(&[0x00, 4 * i as u8, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00]);
+        w.extend_from_slice(&SIG_MARK);
+        r[0x100..0x100 + w.len()].copy_from_slice(&w);
+        for b in &mut r[0x100 + w.len()..0x140] {
+            *b = 0;
+        }
+        let next_last = i + 1 == layers - 1;
+        r[0x140..0x142].copy_from_slice(&(i as u16 + 1).to_le_bytes());
+        r[0x142..0x144].copy_from_slice(&(if next_last { 0x64u16 } else { 0x56u16 }).to_le_bytes());
+        for b in &mut r[0x144..0x150] {
+            *b = 0;
+        }
+        r[0x14b] = if next_last { 4 } else { 0 };
+        r[0x150] = if next_last { 0x60 } else { 0x20 };
+        r[0x151] = 0xf8;
+        r[0x152] = 0xff;
+        for b in &mut r[0x153..0x15c] {
+            *b = 0;
+        }
+        r[0x15c..0x160].copy_from_slice(&(if next_last { 0u32 } else { 1 }).to_le_bytes());
+        rec.extend_from_slice(&r);
+    }
+
+    // terminal layer — record ends in the output/epilogue section;
+    // layer index sits at `e0 00 <i>` (+0x142) and `31 00 <i> 01`.
+    {
+        let i = layers - 1;
+        let mut r = if i == 1 {
+            let mut r = SKELETON_CONV_SIG2[REC_LAST1.0..REC_LAST1.0 + REC_LAST1.1].to_vec();
+            r[0x13e] = i as u8; // e0 00 <i>
+            r[0x16a] = i as u8; // 31 00 <i> 01
+            r
+        } else {
+            let mut r = skel[REC_LAST.0..REC_LAST.0 + REC_LAST.1].to_vec();
+            // buffer pair slots: `00 <v> 00 00` — value at byte +1
+            r[0x109] = 4 * (i as u8 - 1);
+            r[0x119] = 4 * i as u8;
+            r[0x142] = i as u8; // e0 00 <i>
+            r[0x16e] = i as u8; // 31 00 <i> 01
+            r
+        };
+        patch_lane_idx(&mut r, i);
+        rec.extend_from_slice(&r);
+    }
+
+    let stream_end = 0x4000 + rec.len();
+    debug_assert_eq!(stream_end, 0x4000 + stream_len);
+    img[0x4000..stream_end].copy_from_slice(&rec);
+    for b in &mut img[stream_end..CONV_WEIGHTS_OFF] {
+        *b = 0;
+    }
+    splice_conv_sig_weights(&mut img, weights);
+    patch_chain_scalars(&mut img, layers, stream_len);
+    Ok(img)
+}
+
+fn splice_conv_sig_weights(img: &mut [u8], weights: &[u16]) {
+    let stream = weight_interleave(weights, 64);
+    for b in 0..16usize {
+        let dst = CONV_WEIGHTS_OFF + b * 0x280 + 0x80;
+        for (i, v) in stream[b * 256..b * 256 + 256].iter().enumerate() {
+            img[dst + i * 2..dst + i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+}
+
+/// Layer-count FVMLIB/section scalars for fused conv+sigmoid chains,
+/// plus the per-layer `__text` relocation table: one entry per record
+/// at the u32 immediately after each `44 95 80 23` kernel-descriptor
+/// marker (the __KERN_0 LUT pointer, patched by the loader).
+fn patch_chain_scalars(img: &mut [u8], layers: usize, stream_len: usize) {
+    let align = |n: usize| (n + 0x3f) & !0x3f;
+    let aligned = align(stream_len) as u16;
+    img[0x208..0x20c].copy_from_slice(&(stream_len as u32).to_le_bytes());
+    img[0x21c..0x220].copy_from_slice(&(layers as u32).to_le_bytes());
+    img[0x250..0x252].copy_from_slice(&(0x8000u16 + aligned).to_le_bytes());
+    img[0x260..0x262].copy_from_slice(&(0x4000u16 + aligned).to_le_bytes());
+    img[0x378..0x37a].copy_from_slice(&(0x8000u16 + aligned).to_le_bytes());
+    img[0xb7c..0xb7e].copy_from_slice(&chain_b7c(layers).to_le_bytes());
+    img[0xb88..0xb8c].copy_from_slice(&(layers as u32).to_le_bytes());
+    img[0xbb8..0xbba].copy_from_slice(&((0xe * layers + 3) as u16).to_le_bytes());
+
+    // reloc table: rebuild_tail_at wrote the skeleton's single entry;
+    // overwrite with `layers` entries — one per record.
+    let reloff = u32::from_le_bytes(img[0x218..0x21c].try_into().unwrap()) as usize;
+    let flag = &img[reloff + 4..reloff + 8].to_vec();
+    let mut addrs = vec![0x180u32]; // first record's descriptor field
+    for i in 1..layers {
+        let rec_rel = 0x1c0 + (i - 1) * 0x160; // section-relative record start
+        let off = if i == layers - 1 {
+            if i == 1 { 0x150 } else { 0x154 } // terminal epilogue field
+        } else if i == 1 {
+            0x12c
+        } else {
+            0x130
+        };
+        addrs.push((rec_rel + off) as u32);
+    }
+    for (j, a) in addrs.iter().enumerate() {
+        img[reloff + j * 8..reloff + j * 8 + 4].copy_from_slice(&a.to_le_bytes());
+        img[reloff + j * 8 + 4..reloff + j * 8 + 8].copy_from_slice(flag);
+    }
+}
+
+/// `0xb7c` — byte-length of the fused-op payload descriptor list.
+/// Decoded from ANEC k=1..5 references; `0x1c + 0x58k` holds for
+/// `k>=3`, the k=2 record set is one byte shorter.
+fn chain_b7c(layers: usize) -> u16 {
+    match layers {
+        1 => 0x74,
+        2 => 0xcb,
+        k => (0x1c + 0x58 * k) as u16,
+    }
+}
+
 /// Matmul shape families with a captured skeleton.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MmShape {
@@ -846,6 +1086,11 @@ pub fn emit_matmul(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes tests that toggle the process-global
+    /// `HWX_SIG_ANEC` env flag.
+    static SIG_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn emits_image_with_magic() {
@@ -896,6 +1141,7 @@ mod tests {
     /// perm weights must reproduce the ANEC artifact byte-for-byte.
     #[test]
     fn conv1x1_byte_identical() {
+        let _g = SIG_LOCK.lock().unwrap();
         for (shape, case) in [
             (ConvShape::C32W1, "conv32p"),
             (ConvShape::C64W1, "conv64p"),
@@ -935,6 +1181,7 @@ mod tests {
     /// byte-for-byte — weights land in the `[LUT|weights]` bands.
     #[test]
     fn conv_sig_byte_identical() {
+        let _g = SIG_LOCK.lock().unwrap();
         let weights: Vec<u16> = (0..(64 * 64) as u16).collect();
         std::env::set_var("HWX_SIG_ANEC", "1");
         let img = emit_conv_sig(
@@ -960,10 +1207,63 @@ mod tests {
         );
     }
 
+    /// The general k-layer fused conv+sigmoid splicer must reproduce
+    /// the ANEC artifacts byte-for-byte for every captured depth —
+    /// records, wiring, FVMLIB scalars, and the per-layer reloc table.
+    /// Weights are recovered from each reference by inverting the
+    /// `__KERN_0` band transform (`weight_interleave` is a bijection).
+    #[test]
+    fn conv_sig_chain_byte_identical() {
+        let _g = SIG_LOCK.lock().unwrap();
+        for (layers, asset, case) in [
+            (2usize, "conv_sig2_reference.hwx", "chain_conv2_sig2"),
+            (3, "conv_sig3_skeleton.hwx", "chain_conv3_sig3"),
+            (4, "conv_sig4_reference.hwx", "chain4"),
+            (5, "conv_sig5_skeleton.hwx", "chain5"),
+        ] {
+            let expect = std::fs::read(format!(
+                "{}/assets/{asset}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap();
+            // invert dst[g*C*B + ic*B + m] = src[(g*B+m)*C + ic];
+            // band b holds group g=b, so j = ic*B + m
+            const C: usize = 64;
+            const B: usize = C / 16;
+            let mut weights = vec![0u16; C * C];
+            for b in 0..16usize {
+                let base = 0xc000 + b * 0x280 + 0x80;
+                for j in 0..256usize {
+                    let d = u16::from_le_bytes([expect[base + 2 * j], expect[base + 2 * j + 1]]);
+                    weights[(b * B + j % B) * C + j / B] = d;
+                }
+            }
+            std::env::set_var("HWX_SIG_ANEC", "1");
+            let img = emit_conv_sig_n(
+                layers,
+                &weights,
+                &format!("/tmp/ane_corpus/{case}/net.mil"),
+                &format!("/tmp/ane_corpus/{case}/out/net.macho"),
+            )
+            .unwrap();
+            std::env::remove_var("HWX_SIG_ANEC");
+            let diffs: Vec<usize> = (0..expect.len().min(img.len()))
+                .filter(|&i| img[i] != expect[i])
+                .collect();
+            assert!(
+                diffs.is_empty() && img.len() == expect.len(),
+                "{case}: {} diffs, first at {:#x}",
+                diffs.len(),
+                diffs.first().copied().unwrap_or(0)
+            );
+        }
+    }
+
     /// Matmul emission must likewise reproduce the ANEC artifact
     /// byte-for-byte on the perm-weight probes.
     #[test]
     fn matmul_byte_identical() {
+        let _g = SIG_LOCK.lock().unwrap();
         for (shape, case) in [(MmShape::N32, "mm32p"), (MmShape::N64, "mm64p")] {
             let n = shape.n();
             let weights: Vec<u16> = (0..(n * n) as u16).collect();

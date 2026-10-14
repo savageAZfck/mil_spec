@@ -10,7 +10,7 @@
 
 use mil_infer::espresso::EspressoProgram;
 use mil_infer::hwx::{
-    emit_conv1x1, emit_conv_sig, emit_elementwise2, emit_matmul, emit_unary_lut, ConvShape, EwOp,
+    emit_conv1x1, emit_conv_sig, emit_conv_sig_n, emit_elementwise2, emit_matmul, emit_unary_lut, ConvShape, EwOp,
     LutOp, MmShape,
 };
 use std::path::{Path, PathBuf};
@@ -180,6 +180,16 @@ fn main() {
             std::fs::write(&out, &img).unwrap();
             println!("emitted {} ({} bytes)", out.display(), img.len());
         }
+        Some("emit-csn") => {
+            // emit-csn <layers> <weights.bin> <out.macho>  (conv->sig)^k
+            let k: usize = a[2].parse().unwrap();
+            let w = load_weights(&a[3]);
+            let out = PathBuf::from(&a[4]);
+            let mil = format!("{}.mil", out.display());
+            let img = emit_conv_sig_n(k, &w, &mil, &out.display().to_string()).unwrap();
+            std::fs::write(&out, &img).unwrap();
+            println!("emitted {} ({} bytes)", out.display(), img.len());
+        }
         Some("verify") => {
             // verify <dir>: for each net.macho reference at <dir>/*/out,
             // re-emit with the recorded inputs and compare.
@@ -245,6 +255,24 @@ fn main() {
                     let ours = emit_conv_sig(&w, &mil, &out).unwrap();
                     total += diff_report(&ours, &std::fs::read(&reff).unwrap(), "chain_conv_sigp");
                 }
+            }
+            // k-layer fused conv->sigmoid chains, shared weights
+            for (name, k) in [
+                ("chain_conv2_sig2", 2usize),
+                ("chain_conv3_sig3", 3),
+                ("chain4", 4),
+                ("chain5", 5),
+            ] {
+                let reff = dir.join(name).join("out").join("net.macho");
+                if !reff.exists() {
+                    println!("  {name}: no reference, skipped");
+                    continue;
+                }
+                let w = load_weights(&dir.join(name).join("weights/weight.bin").display().to_string());
+                let mil = format!("{}/{name}/net.mil", dir.display());
+                let out = format!("{}/{name}/out/net.macho", dir.display());
+                let ours = emit_conv_sig_n(k, &w, &mil, &out).unwrap();
+                total += diff_report(&ours, &std::fs::read(&reff).unwrap(), name);
             }
             for (name, shape) in [("mm32p", MmShape::N32), ("mm64p", MmShape::N64)] {
                 let reff = dir.join(name).join("out").join("net.macho");
