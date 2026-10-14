@@ -2100,6 +2100,421 @@ pub fn emit_conv_ln_n_dw(
     Ok(img)
 }
 
+/// Rms-norm skeletons — `conv_rms1` k=1 task set, `conv_rms2` aux3
+/// i=1-terminal, `conv_rms4` aux1 odd-terminal, `conv_rms5` main
+/// template source (interior/even-terminal forms + tail + symtab).
+/// `rms_norm` decomposes into four task descriptors per layer: a
+/// conv task (managing ids `12i+1..12i+4`) and three aux tasks
+/// binding the shared div/recip LUT streams.
+const SKELETON_CONV_RMS1: &[u8] = include_bytes!("../assets/conv_rms1_skeleton.hwx");
+const SKELETON_CONV_RMS2: &[u8] = include_bytes!("../assets/conv_rms2_skeleton.hwx");
+const SKELETON_CONV_RMS4: &[u8] = include_bytes!("../assets/conv_rms4_skeleton.hwx");
+const SKELETON_CONV_RMS5: &[u8] = include_bytes!("../assets/conv_rms5_skeleton.hwx");
+
+/// Program header + record prologue.
+const RMS_PROG: (usize, usize) = (0x4000, 0x34);
+/// Layer-0 conv task — `0x340` with the input-DMA insert.
+const RMS_CONV_FIRST: (usize, usize) = (0x4034, 0x340);
+/// Interior conv task at odd layer index — `0x2d0`.
+const RMS_CONV_INT: (usize, usize) = (0x48b4, 0x2d0);
+/// Aux1 interior form A — `0x1f0` (odd layers and i<2).
+const RMS_A1_F1: (usize, usize) = (0x4b84, 0x1f0);
+/// Aux1 terminal form A — `0x1f0` (rms4 layer-3 terminal).
+const RMS_A1_F1_TERM: (usize, usize) = (0x5b94, 0x1f0);
+/// Aux1 interior form B — `0x1e0` (even layers i>=2; aux2-style
+/// field layout).
+const RMS_A1_F2: (usize, usize) = (0x5394, 0x1e0);
+/// Aux1 terminal form B — `0x1e0` (rms5 layer-4 terminal).
+const RMS_A1_F2_TERM: (usize, usize) = (0x63a4, 0x1e0);
+/// Aux2 task — `0x1e0`, single form at all positions.
+const RMS_A2: (usize, usize) = (0x4d74, 0x1e0);
+/// Aux3 interior — `0x170`.
+const RMS_A3_INT: (usize, usize) = (0x4f54, 0x170);
+/// Aux3 terminal at i=1 — `0x17c` (rms2).
+const RMS_A3_T1: (usize, usize) = (0x4f54, 0x17c);
+/// Aux3 terminal at i>=2 — `0x18c` (rms5).
+const RMS_A3_T2: (usize, usize) = (0x6764, 0x18c);
+/// k=1 tasks — conv `0x210`, mini-aux `0xf0`, two `0x1e0` aux tasks,
+/// `0x18c` output task. Tight id packing (1..10) and a third LUT
+/// block in the kern tail make this a separate family.
+const RMS_K1: [(usize, usize); 5] = [
+    (0x4034, 0x210),
+    (0x4244, 0xf0),
+    (0x4334, 0x1e0),
+    (0x4514, 0x1e0),
+    (0x46f4, 0x18c),
+];
+/// k=1 task reloc field offsets (mark+4 per task).
+const RMS_K1_RELOC: [usize; 5] = [0x14c, 0xc0, 0xb4, 0xac, 0xb8];
+
+/// Emit a complete HWX image for `(conv1x1 -> rms_norm)^k` sharing
+/// one `C=64` weight blob. The `rms_norm` decomp emits four tasks
+/// per layer on the same task-DAG grammar as softmax but with a
+/// 12-task-id stride: conv (`12i+1..12i+4`), aux1 (`12i+5..12i+7`,
+/// producer `12i+4`), aux2 (`12i+8..12i+10`, producer `12i+7`),
+/// aux3 (`12i+11`, producer `12i+10`, emits next-input `12(i+1)`).
+///
+/// Aux1 alternates two layouts: `0x1f0` (odd i and i<2) with id
+/// slots at +0xcc/+0x14c/+0x1cc, `0x1e0` (even i>=2) with slots at
+/// +0xbc/+0x13c/+0x1bc. Aux3 grows a writeback epilogue terminal
+/// (`0x17c` at i=1, `0x18c` at i>=2). Each task carries one
+/// relocation at mark+4: conv binds the weight stream, aux1/aux2
+/// the div LUT (`+0x2000`), aux3 the rsqrt LUT (`+0x2080`).
+///
+/// `__KERN_0` = `0x100 + n_streams*0x2000`: stream 0 owns
+/// `0x0..0x2100` (weights + the shared LUT tail), streams j>0 at
+/// `0x100 + j*0x2000`. `__text` floats to `0x8000` multi-stream;
+/// `__KERN_0` lands at `text_off + 0x4000` for chains (`+0x8000`
+/// k=1, whose payload is `0x2180` with a third LUT block).
+pub fn emit_conv_rms_n(
+    layers: usize,
+    weights: &[u16],
+    mil_path: &str,
+    out_path: &str,
+) -> Result<Vec<u8>, String> {
+    emit_conv_rms_n_dw(layers, &vec![weights; layers], mil_path, out_path)
+}
+
+/// `emit_conv_rms_n` with per-layer weight blobs — conv tasks carry
+/// the stream's last-use release flag (+0x05), deduplicated kernel
+/// id `12*first_use(ord)+1` (+0x06), and the stream offset u32.
+pub fn emit_conv_rms_n_dw(
+    layers: usize,
+    weights: &[&[u16]],
+    mil_path: &str,
+    out_path: &str,
+) -> Result<Vec<u8>, String> {
+    const C: usize = 64;
+    if layers == 0 || weights.len() != layers {
+        return Err(format!("expected {layers} weight blobs, got {}", weights.len()));
+    }
+    for w in weights {
+        if w.len() != C * C {
+            return Err(format!("expected {} weights, got {}", C * C, w.len()));
+        }
+    }
+    let mut streams: Vec<&[u16]> = Vec::new();
+    let mut ords = Vec::with_capacity(layers);
+    for w in weights {
+        match streams.iter().position(|s| *s == *w) {
+            Some(o) => ords.push(o),
+            None => {
+                ords.push(streams.len());
+                streams.push(w);
+            }
+        }
+    }
+    if streams.len() > KNAME_SM_DW.len() {
+        return Err(format!(
+            "{} distinct weight streams exceeds the mined kernel-name table ({})",
+            streams.len(),
+            KNAME_SM_DW.len()
+        ));
+    }
+    let n_streams = streams.len();
+    let stream_off = |o: usize| if o == 0 { 0 } else { 0x100 + 0x2000 * o };
+    let mut first_use = vec![usize::MAX; n_streams];
+    let mut last_use = vec![0usize; n_streams];
+    for (i, &o) in ords.iter().enumerate() {
+        first_use[o] = first_use[o].min(i);
+        last_use[o] = i;
+    }
+
+    // k=1 is a distinct compact family — five tasks, tight ids, an
+    // extra LUT block, a 0x4000 second-__TEXT and different header
+    // scalars; use its own skeleton for the header/tail template.
+    let skel = if layers == 1 {
+        SKELETON_CONV_RMS1
+    } else {
+        SKELETON_CONV_RMS5
+    };
+    let (rms_entries, rms_relocs) = tail_meta(skel);
+    let rflag: [u8; 4] = rms_relocs[0][4..8].try_into().unwrap();
+
+    let mut stream = skel[RMS_PROG.0..RMS_PROG.0 + RMS_PROG.1].to_vec();
+    let mut reloc_offs = Vec::with_capacity(4 * layers + 1);
+
+    if layers == 1 {
+        // compact k=1 family — five tasks verbatim, tight ids
+        for (t, &(off, len)) in RMS_K1.iter().enumerate() {
+            let co = stream.len() - RMS_PROG.1 + 4;
+            let mut task = skel[off..off + len].to_vec();
+            if t == 0 {
+                task[0x05] = 0x02;
+                put_u16(&mut task, 0x06, 1);
+                task[0x14c..0x150].copy_from_slice(&0u32.to_le_bytes());
+            }
+            stream.extend_from_slice(&task);
+            reloc_offs.push(co + RMS_K1_RELOC[t]);
+        }
+    } else {
+        for i in 0..layers {
+            let last = i + 1 == layers;
+            // conv task — first-layer form carries the input-DMA insert
+            let co = stream.len() - RMS_PROG.1 + 4;
+            let (ru32, mut t) = if i == 0 {
+                (
+                    0x14cusize,
+                    skel[RMS_CONV_FIRST.0..RMS_CONV_FIRST.0 + RMS_CONV_FIRST.1].to_vec(),
+                )
+            } else {
+                let mut t = skel[RMS_CONV_INT.0..RMS_CONV_INT.0 + RMS_CONV_INT.1].to_vec();
+                patch_task_column(&mut t, (12 * i) as u16, 16);
+                put_u16(&mut t, 0x12c, (12 * i + 1) as u16);
+                put_u16(&mut t, 0x1ac, (12 * i + 2) as u16);
+                put_u16(&mut t, 0x22c, (12 * i + 3) as u16);
+                put_u16(&mut t, 0x2ac, (12 * i + 4) as u16);
+                // bank-descriptor counters alternate by layer parity
+                if i % 2 == 0 {
+                    put_u16(&mut t, 0x278, 0x04);
+                    put_u16(&mut t, 0x2ae, 0x38);
+                } else {
+                    put_u16(&mut t, 0x278, 0x44);
+                    put_u16(&mut t, 0x2ae, 0x39);
+                }
+                (0x124, t)
+            };
+            t[0x05] = if last_use[ords[i]] == i { 0x02 } else { 0x00 };
+            put_u16(&mut t, 0x06, (12 * first_use[ords[i]] + 1) as u16);
+            t[ru32..ru32 + 4].copy_from_slice(&(stream_off(ords[i]) as u32).to_le_bytes());
+            stream.extend_from_slice(&t);
+            reloc_offs.push(co + ru32);
+
+            // aux1 — two layouts: 0x1f0 at odd i and i<2, 0x1e0 at
+            // even i>=2; terminal forms swap the writeback block
+            let co = stream.len() - RMS_PROG.1 + 4;
+            let f2 = i >= 2 && i % 2 == 0;
+            let ((off, len), isrc) = match (f2, last) {
+                (true, true) => (RMS_A1_F2_TERM, skel),
+                (true, false) => (RMS_A1_F2, skel),
+                (false, true) => (RMS_A1_F1_TERM, SKELETON_CONV_RMS4),
+                (false, false) => (RMS_A1_F1, skel),
+            };
+            let mut t = isrc[off..off + len].to_vec();
+            patch_task_column(&mut t, (12 * i + 4) as u16, 17);
+            put_u16(&mut t, 0x06, (12 * i + 5) as u16);
+            if f2 {
+                put_u16(&mut t, 0xbc, (12 * i + 5) as u16);
+                put_u16(&mut t, 0x13c, (12 * i + 6) as u16);
+                put_u16(&mut t, 0x1bc, (12 * i + 7) as u16);
+                reloc_offs.push(co + 0xb4);
+            } else {
+                put_u16(&mut t, 0xcc, (12 * i + 5) as u16);
+                put_u16(&mut t, 0x14c, (12 * i + 6) as u16);
+                put_u16(&mut t, 0x1cc, (12 * i + 7) as u16);
+                reloc_offs.push(co + 0xb8);
+            }
+            stream.extend_from_slice(&t);
+
+            // aux2 — single 0x1e0 form everywhere
+            let co = stream.len() - RMS_PROG.1 + 4;
+            let mut t = skel[RMS_A2.0..RMS_A2.0 + RMS_A2.1].to_vec();
+            patch_task_column(&mut t, (12 * i + 7) as u16, 17);
+            put_u16(&mut t, 0x06, (12 * i + 8) as u16);
+            put_u16(&mut t, 0xbc, (12 * i + 8) as u16);
+            put_u16(&mut t, 0x13c, (12 * i + 9) as u16);
+            put_u16(&mut t, 0x1bc, (12 * i + 10) as u16);
+            if last && i == 1 {
+                // layer-1 terminal aux2 — release descriptors
+                t[0x188] = 0x04;
+                t[0x1be] = 0x38;
+            }
+            stream.extend_from_slice(&t);
+            reloc_offs.push(co + 0xac);
+
+            // aux3 — interior or terminal (writeback) form
+            let co = stream.len() - RMS_PROG.1 + 4;
+            let (toff, tlen, isrc) = if last {
+                if i == 1 {
+                    (RMS_A3_T1.0, RMS_A3_T1.1, SKELETON_CONV_RMS2)
+                } else {
+                    (RMS_A3_T2.0, RMS_A3_T2.1, skel)
+                }
+            } else {
+                (RMS_A3_INT.0, RMS_A3_INT.1, skel)
+            };
+            let mut t = isrc[toff..toff + tlen].to_vec();
+            patch_task_column(&mut t, (12 * i + 10) as u16, 17);
+            put_u16(&mut t, 0x06, (12 * i + 11) as u16);
+            if !(last && i == 1) {
+                // T1 terminal has a fixed `60 f8` field at +0xcc
+                put_u16(&mut t, 0xcc, (12 * i + 11) as u16);
+            }
+            if last && i >= 2 {
+                put_u16(&mut t, 0x16a, (12 * i + 11) as u16);
+                // `31 00 <id> 01` writeback slot — the id is one byte
+                t[0x18a] = (12 * i + 11) as u8;
+            }
+            if !last {
+                put_u16(&mut t, 0x14c, (12 * (i + 1)) as u16);
+            }
+            stream.extend_from_slice(&t);
+            reloc_offs.push(co + if last && i == 1 { 0xb4 } else { 0xb8 });
+        }
+    }
+
+    let relocs: Vec<[u8; 8]> = reloc_offs
+        .iter()
+        .map(|&o| {
+            let mut e = [0u8; 8];
+            e[..4].copy_from_slice(&(o as u32 + 0x30).to_le_bytes());
+            e[4..].copy_from_slice(&rflag);
+            e
+        })
+        .collect();
+
+    // The second `__TEXT` section (`0x40` bytes of `00 1c` + zeros on
+    // chains, a `0x4000` zero block on k=1) starts at the `0x80`-
+    // aligned text end; symtab[0] binds its vmaddr and `__KERN_0`'s
+    // vmaddr is the next `0x4000` boundary past it.
+    let section_size = stream.len();
+    let aligned = (section_size + 0x7f) & !0x7f;
+    let sec2_addr = 0x3000_8000u64 + aligned as u64;
+    let sec2_size = if layers == 1 { 0x4000u32 } else { 0x40 };
+    let kern_addr = (sec2_addr + sec2_size as u64 + 0x3fff) & !0x3fff;
+
+    // symtab — [fl, x, z] + [s0_ne_0, div/recip _actlut, s1..sn_ne_0]
+    // + per-stream lane groups (the bare div/recip LUT syms trail
+    // stream 0's lanes) + the scalar tail. n_values are `__KERN_0`
+    // vmaddrs: ne_0 at stream_off, lanes at +0x200·b.
+    let entries = if n_streams == 1 {
+        let mut v = rms_entries.clone();
+        if layers != 1 {
+            v[0].4 = sec2_addr;
+            let d = kern_addr.wrapping_sub(0x3000_c000);
+            for e in v[3..23].iter_mut() {
+                e.4 = e.4.wrapping_add(d);
+            }
+            if layers >= 6 {
+                // deep shared chains bind the multi-stream ord-0
+                // kernel name instead of the shared K9419 — the
+                // _actlut entries at [4]/[5] are untouched
+                v[3].0 = format!("{}_ne_0", KNAME_SM_DW[0]);
+                for b in 1..16 {
+                    v[5 + b].0 = format!("{}_ne_{b}", KNAME_SM_DW[0]);
+                }
+            }
+        }
+        v
+    } else {
+        let mut e = Vec::with_capacity(rms_entries.len() + 16 * (n_streams - 1));
+        e.push(rms_entries[0].clone()); // fl
+        e.push(rms_entries[1].clone()); // x
+        e.push(rms_entries[2].clone()); // z
+        e[0].4 = sec2_addr;
+        let tpl0 = rms_entries[3].clone();
+        let tpln = rms_entries[6].clone();
+        for j in 0..n_streams {
+            e.push((
+                format!("{}_ne_0", KNAME_SM_DW[j]),
+                tpl0.1,
+                tpl0.2,
+                tpl0.3,
+                kern_addr + stream_off(j) as u64,
+            ));
+            if j == 0 {
+                e.push((rms_entries[4].0.clone(), tpl0.1, tpl0.2, tpl0.3, kern_addr + 0x2000));
+                e.push((rms_entries[5].0.clone(), tpl0.1, tpl0.2, tpl0.3, kern_addr + 0x2080));
+            }
+        }
+        for j in 0..n_streams {
+            for b in 1..16u64 {
+                e.push((
+                    format!("{}_ne_{b}", KNAME_SM_DW[j]),
+                    tpln.1,
+                    tpln.2,
+                    tpln.3,
+                    kern_addr + stream_off(j) as u64 + 0x200 * b,
+                ));
+            }
+            if j == 0 {
+                e.push((rms_entries[21].0.clone(), tpln.1, tpln.2, tpln.3, kern_addr + 0x2080));
+                e.push((rms_entries[22].0.clone(), tpln.1, tpln.2, tpln.3, kern_addr + 0x2100));
+            }
+        }
+        e.extend_from_slice(&rms_entries[23..]); // scalar descriptors
+        e
+    };
+
+    let (mut img, text_off) = build_tail_at(
+        skel,
+        CONV_TAIL_OFF,
+        &entries,
+        &relocs,
+        mil_path,
+        out_path,
+    );
+
+    img.extend_from_slice(&stream);
+
+    // __KERN_0 = weight streams + the shared div/recip LUT tail on
+    // stream 0. Chains place it one 0x4000 page past __text; k=1
+    // carries a third LUT block (payload 0x2180) and sits +0x8000.
+    let (kern_off, kern_payload) = if layers == 1 {
+        (text_off + 0x8000, 0x2180usize)
+    } else {
+        (text_off + 0x4000, 0x100 + 0x2000 * n_streams)
+    };
+    let kern_vsz = (kern_payload + 0x3fff) & !0x3fff;
+    img.resize(kern_off + kern_vsz, 0);
+    if layers != 1 {
+        img[text_off + aligned + 1] = 0x1c;
+    }
+    for (j, w) in streams.iter().enumerate() {
+        let inter = weight_interleave(w, C);
+        for b in 0..16usize {
+            let base = kern_off + stream_off(j) + b * 0x200;
+            for (i, v) in inter[b * 256..b * 256 + 256].iter().enumerate() {
+                img[base + i * 2..base + i * 2 + 2]
+                    .copy_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
+    // LUT tail — 0x180 k=1 (three blocks) / 0x100 chains (two)
+    if layers == 1 {
+        img[kern_off + 0x2000..kern_off + 0x2180]
+            .copy_from_slice(&SKELETON_CONV_RMS1[0xe000..0xe180][..]);
+    } else {
+        img[kern_off + 0x2000..kern_off + 0x2100]
+            .copy_from_slice(&skel[0xa000..0xa100][..]);
+    }
+
+    // scalars
+    let ntasks = if layers == 1 { 5 } else { 4 * layers };
+    put_u32(&mut img, 0x1c0, text_off as u32);
+    put_u32(&mut img, 0x208, section_size as u32);
+    put_u32(&mut img, 0x210, text_off as u32);
+    put_u32(&mut img, 0x21c, ntasks as u32);
+    put_u32(&mut img, 0x250, sec2_addr as u32);
+    put_u32(&mut img, 0x258, sec2_size);
+    put_u32(&mut img, 0x260, (text_off + aligned) as u32);
+    put_u32(&mut img, 0x298, kern_addr as u32);
+    put_u32(&mut img, 0x2a0, kern_vsz as u32);
+    put_u32(&mut img, 0x2a8, kern_off as u32);
+    put_u32(&mut img, 0x2b0, kern_vsz as u32);
+    put_u32(&mut img, 0x2e8, kern_addr as u32);
+    img[0x2f0..0x2f8].copy_from_slice(&(kern_payload as u64).to_le_bytes());
+    put_u32(&mut img, 0x2f8, kern_off as u32);
+    put_u32(&mut img, 0x378, sec2_addr as u32);
+    put_u32(&mut img, 0x3d8, kern_addr as u32);
+    put_u32(
+        &mut img,
+        0xb7c,
+        0x220 + (section_size as u32 - 0x880) / 4,
+    );
+    put_u32(&mut img, 0xb88, if layers == 1 { 0xb } else { 12 * layers as u32 });
+    put_u32(
+        &mut img,
+        0xbb8,
+        if layers == 1 {
+            0x9d
+        } else {
+            0x153 + 0xa8 * (layers as u32 - 2)
+        },
+    );
+    Ok(img)
+}
+
 /// Matmul shape families with a captured skeleton.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MmShape {
@@ -2557,6 +2972,75 @@ mod tests {
                 &wrefs,
                 &format!("/tmp/ane_ln/{case}/net.mil"),
                 &format!("/tmp/ane_ln/{case}/out/net.macho"),
+            )
+            .unwrap();
+            std::env::remove_var("HWX_SIG_ANEC");
+            let diffs: Vec<usize> = (0..expect.len().min(img.len()))
+                .filter(|&i| img[i] != expect[i])
+                .collect();
+            assert!(
+                diffs.is_empty() && img.len() == expect.len(),
+                "{case}: {} diffs, first at {:#x}",
+                diffs.len(),
+                diffs.first().copied().unwrap_or(0)
+            );
+        }
+    }
+
+    /// Rms-norm multi-task chains — `(conv -> rms_norm)^k` decomposes
+    /// into four task descriptors per layer on a 12-task-id stride
+    /// (conv + div-max + square-mean + rsqrt-mul auxes), with the
+    /// compact five-task k=1 family as a separate case. dw uses
+    /// `w[i] = i + j*0x5555`; the pdw case reuses blob 0 at layer 2.
+    #[test]
+    fn conv_rms_chain_byte_identical() {
+        let _g = SIG_LOCK.lock().unwrap();
+        for (layers, n_blobs, asset, case, nested) in [
+            (1usize, 1usize, "conv_rms1_skeleton.hwx", "rms1", false),
+            (2, 1, "conv_rms2_skeleton.hwx", "rms2", false),
+            (3, 1, "conv_rms3_reference.hwx", "rms3", false),
+            (4, 1, "conv_rms4_skeleton.hwx", "rms4", false),
+            (5, 1, "conv_rms5_skeleton.hwx", "rms5", false),
+            (6, 1, "conv_rms6_reference.hwx", "rms6", true),
+            (2, 2, "conv_rmsdw2_reference.hwx", "rmsdw2", false),
+            (3, 3, "conv_rmsdw3_reference.hwx", "rmsdw3", true),
+            (4, 4, "conv_rmsdw4_reference.hwx", "rmsdw4", true),
+            (3, 2, "conv_rmspdw3_reference.hwx", "rmspdw3", true),
+        ] {
+            let expect = std::fs::read(format!(
+                "{}/assets/{asset}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap();
+            const SEEDS: [u32; 4] = [0, 0x5555, 0xaaaa, 0x3333];
+            let weights: Vec<Vec<u16>> = (0..layers)
+                .map(|i| {
+                    let j = i % n_blobs;
+                    if n_blobs != 1 {
+                        (0..64u32 * 64)
+                            .map(|e| (e + SEEDS[j]) as u16)
+                            .collect()
+                    } else if case == "rms6" {
+                        // the rms6 probe's weight.bin is the `w[i]=i`
+                        // ramp, not ones
+                        (0..64u32 * 64).map(|e| e as u16).collect()
+                    } else {
+                        vec![0x3c00u16; 64 * 64]
+                    }
+                })
+                .collect();
+            let wrefs: Vec<&[u16]> = weights.iter().map(|w| w.as_slice()).collect();
+            let out = if nested {
+                format!("/tmp/ane_rms/{case}/out/net.macho/net.macho")
+            } else {
+                format!("/tmp/ane_rms/{case}/out/net.macho")
+            };
+            std::env::set_var("HWX_SIG_ANEC", "1");
+            let img = emit_conv_rms_n_dw(
+                layers,
+                &wrefs,
+                &format!("/tmp/ane_rms/{case}/net.mil"),
+                &out,
             )
             .unwrap();
             std::env::remove_var("HWX_SIG_ANEC");
