@@ -1007,11 +1007,11 @@ pub enum FusedAct {
     /// same fused LUT kernel, so record geometry is sigmoid-identical
     /// and only the LUT bytes and kernel names differ.
     Silu,
-    /// `softmax` — a multi-task record family, not a fused LUT. The
+    /// `softmax` — the multi-task record family: each layer emits
+    /// three task descriptors (conv + sm-reduce + sm-final). The
     /// conv task uses `0x200` weight-only bands (contiguous in
-    /// `__KERN_0`, plus a `0x100` aux tail); only k=1 skeleton
-    /// emission is supported until the multi-task record format is
-    /// decoded.
+    /// `__KERN_0`, plus a `0x100` exp/reciprocal LUT tail); shared
+    /// chains emit via [`emit_conv_sm_n`], k=1 via `emit_conv_act`.
     Softmax,
 }
 
@@ -1229,10 +1229,7 @@ pub fn emit_conv_act_n_dw(
         return emit_conv_act(act, weights[0], mil_path, out_path);
     }
     if act == FusedAct::Softmax {
-        return Err(
-            "softmax chains need the multi-task record format — only k=1 emission is supported"
-                .into(),
-        );
+        return emit_conv_sm_n_dw(layers, weights, mil_path, out_path);
     }
     let stream_sz = act.stream_size();
     let band = act.band_stride();
@@ -1497,6 +1494,240 @@ fn chain_b7c(layers: usize) -> u16 {
         2 => 0xcb,
         k => (0x1c + 0x58 * k) as u16,
     }
+}
+
+/// k=3 conv+softmax chain skeleton — provides every multi-task
+/// template: first-layer conv (`0x290`, carrying the input-DMA
+/// prologue), interior conv (`0x270`), the `0xf0` softmax reduce
+/// task, the `0x170` interior softmax-final task, and the `0x190`
+/// terminal form with the output-writeback epilogue.
+const SKELETON_CONV_SM3: &[u8] = include_bytes!("../assets/conv_sm3_skeleton.hwx");
+
+// Multi-task templates inside the sm3 `__text` section — section
+// coordinates; the record stream is a 4-byte `01 00 05 00` prologue
+// then per-layer task blocks (file offsets in the skeleton).
+/// Program header + record prologue (`0x30` header, `01 00 05 00`).
+const SM_PROG: (usize, usize) = (0x4000, 0x34);
+/// Layer-0 conv task — `0x290` with the input-DMA prologue.
+const SM_CONV_FIRST: (usize, usize) = (0x4034, 0x290);
+/// Interior/terminal conv task — `0x270`.
+const SM_CONV_INT: (usize, usize) = (0x4524, 0x270);
+/// Softmax reduce task — `0xf0` (interior form; the layer-0 flag
+/// differs at +0x95).
+const SM_SMA: (usize, usize) = (0x4794, 0xf0);
+/// Softmax-final task, interior form — `0x170`.
+const SM_SMB_INT: (usize, usize) = (0x4884, 0x170);
+/// Softmax-final task, terminal form — `0x190` with the
+/// output-writeback epilogue.
+const SM_SMB_TERM: (usize, usize) = (0x4d54, 0x190);
+
+fn put_u16(b: &mut [u8], off: usize, v: u16) {
+    b[off..off + 2].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Producer-task-id column slots — u16 fields at +0x0a..+0x2a and
+/// +0x32..+0x4a stride 4 (skipping the descriptor at +0x2e). The
+/// softmax tasks carry a 17th slot at +0x52; in the conv task that
+/// slot is a different descriptor and stays zero.
+const TASK_COL: [usize; 17] = [
+    0x0a, 0x0e, 0x12, 0x16, 0x1a, 0x1e, 0x22, 0x26, 0x2a, 0x32, 0x36, 0x3a, 0x3e, 0x42, 0x46,
+    0x4a, 0x52,
+];
+
+/// Patch the producer-task-id slots of a task descriptor — the 16
+/// shared column slots plus +0x52 for softmax (non-conv) tasks.
+fn patch_task_column(t: &mut [u8], v: u16, n: usize) {
+    for &o in &TASK_COL[..n] {
+        put_u16(t, o, v);
+    }
+}
+
+/// Emit a complete HWX image for `(conv1x1 -> softmax)^k` sharing one
+/// `C=64` weight blob — the multi-task record family. Each layer
+/// emits three task descriptors: the conv task (which internally
+/// manages sub-task ids `6i+1..6i+3`: input DMA, compute, output),
+/// a softmax reduce task (id `6i+4` consuming `6i+3`), and a
+/// softmax-final task (id `6i+5` consuming `6i+4`). The next layer's
+/// conv reads the previous layer's output task `6(i+1)`; the last
+/// layer's final task grows an output-writeback epilogue.
+///
+/// Task-id model decoded from ANEC sm1..sm3 references:
+/// - producer ids ride in a 17-slot u16 column (+0x0a..+0x52)
+/// - task ids at header +0x06 and +0xcc
+/// - conv flag +0x05: `02` on the last layer's conv, else `00`
+/// - sm-a +0x95: `04` at layer 0 (no predecessor), else `08`
+/// - sm-b +0xa1: `08` interior, `04` terminal; +0x14c = next layer's
+///   conv-input task `6(i+1)` interior, `0x1140` output DMA terminal
+/// - three relocations per layer: conv weight-stream u32, sm-a's
+///   exp-LUT (`+0x2000`) and sm-b's recip-LUT (`+0x2080`) targets
+///
+/// `__KERN_0` = 16 contiguous `0x200` weight chunks (`0x2000`) plus
+/// the `0x100` shared exp/reciprocal LUT tail — one stream total for
+/// shared weights.
+pub fn emit_conv_sm_n(
+    layers: usize,
+    weights: &[u16],
+    mil_path: &str,
+    out_path: &str,
+) -> Result<Vec<u8>, String> {
+    emit_conv_sm_n_dw(layers, &vec![weights; layers], mil_path, out_path)
+}
+
+/// `emit_conv_sm_n` with per-layer weight blobs. Blobs are
+/// deduplicated by content into weight streams; distinct-weight
+/// chains are not yet supported (per-stream kernel names for this
+/// family have only been mined for ordinal 0).
+pub fn emit_conv_sm_n_dw(
+    layers: usize,
+    weights: &[&[u16]],
+    mil_path: &str,
+    out_path: &str,
+) -> Result<Vec<u8>, String> {
+    const C: usize = 64;
+    if layers == 0 || weights.len() != layers {
+        return Err(format!("expected {layers} weight blobs, got {}", weights.len()));
+    }
+    for w in weights {
+        if w.len() != C * C {
+            return Err(format!("expected {} weights, got {}", C * C, w.len()));
+        }
+    }
+    let mut streams: Vec<&[u16]> = Vec::new();
+    for w in weights {
+        if !streams.iter().any(|s| *s == *w) {
+            streams.push(w);
+        }
+    }
+    if streams.len() > 1 {
+        return Err(format!(
+            "{} distinct softmax weight streams exceeds the mined kernel-name table (1)",
+            streams.len()
+        ));
+    }
+
+    let skel3 = SKELETON_CONV_SM3;
+    // shared weights → the k=1 symtab (K9419_ne_* + the two actlut
+    // symbols + scalar descriptors) is k-invariant
+    let (entries, sm_relocs) = tail_meta(SKELETON_CONV64_SM);
+    let rflag: [u8; 4] = sm_relocs[0][4..8].try_into().unwrap();
+
+    // record stream: prologue + per-layer [conv][sm-reduce][sm-final]
+    let mut stream = skel3[SM_PROG.0..SM_PROG.0 + SM_PROG.1].to_vec();
+    let mut reloc_offs = Vec::with_capacity(3 * layers);
+    for i in 0..layers {
+        // conv task — first-layer form carries the input-DMA prologue
+        let co = stream.len() - SM_PROG.1 + 4;
+        if i == 0 {
+            let mut t = skel3[SM_CONV_FIRST.0..SM_CONV_FIRST.0 + SM_CONV_FIRST.1].to_vec();
+            if layers == 1 {
+                t[0x05] = 0x02;
+            }
+            stream.extend_from_slice(&t);
+        } else {
+            let mut t = skel3[SM_CONV_INT.0..SM_CONV_INT.0 + SM_CONV_INT.1].to_vec();
+            t[0x05] = if i + 1 == layers { 0x02 } else { 0x00 };
+            patch_task_column(&mut t, (6 * i) as u16, 16);
+            put_u16(&mut t, 0x13c, (6 * i + 1) as u16);
+            put_u16(&mut t, 0x1bc, (6 * i + 2) as u16);
+            put_u16(&mut t, 0x24c, (6 * i + 3) as u16);
+            stream.extend_from_slice(&t);
+        }
+        reloc_offs.push(co + if i == 0 { 0x14c } else { 0x128 });
+
+        // softmax reduce task
+        let co = stream.len() - SM_PROG.1 + 4;
+        let mut t = skel3[SM_SMA.0..SM_SMA.0 + SM_SMA.1].to_vec();
+        put_u16(&mut t, 0x06, (4 + 6 * i) as u16);
+        patch_task_column(&mut t, (3 + 6 * i) as u16, 17);
+        t[0x95] = if i == 0 { 0x04 } else { 0x08 };
+        put_u16(&mut t, 0xcc, (4 + 6 * i) as u16);
+        stream.extend_from_slice(&t);
+        reloc_offs.push(co + 0xb8);
+
+        // softmax-final task — interior or terminal (writeback) form
+        let co = stream.len() - SM_PROG.1 + 4;
+        let last = i + 1 == layers;
+        let (off, len) = if last { SM_SMB_TERM } else { SM_SMB_INT };
+        let mut t = skel3[off..off + len].to_vec();
+        put_u16(&mut t, 0x06, (5 + 6 * i) as u16);
+        patch_task_column(&mut t, (4 + 6 * i) as u16, 17);
+        put_u16(&mut t, 0xcc, (5 + 6 * i) as u16);
+        if last {
+            t[0xa1] = 0x04;
+            // `31 00 <id> 01` epilogue slots — single bytes
+            t[0x16e] = (5 + 6 * i) as u8;
+            t[0x18e] = (5 + 6 * i) as u8;
+        } else {
+            t[0xa1] = 0x08;
+            put_u16(&mut t, 0x14c, (6 * (i + 1)) as u16);
+        }
+        stream.extend_from_slice(&t);
+        reloc_offs.push(co + 0xb8);
+    }
+
+    let relocs: Vec<[u8; 8]> = reloc_offs
+        .iter()
+        .map(|&o| {
+            let mut e = [0u8; 8];
+            // r_address is section-relative: prologue (0x30) + stream
+            e[..4].copy_from_slice(&(o as u32 + 0x30).to_le_bytes());
+            e[4..].copy_from_slice(&rflag);
+            e
+        })
+        .collect();
+
+    let (mut img, text_off) = build_tail_at(
+        skel3,
+        CONV_TAIL_OFF,
+        &entries,
+        &relocs,
+        mil_path,
+        out_path,
+    );
+
+    let section_size = stream.len();
+    img.extend_from_slice(&stream);
+
+    // __const gap then __KERN_0: 16 contiguous 0x200 weight chunks
+    // plus the shared 0x100 exp/recip LUT tail
+    let aligned = (section_size + 0x3f) / 0x40 * 0x40;
+    let const_end = text_off + aligned + 0x4000;
+    img.resize(const_end, 0);
+    let kern_off = (const_end + 0x3fff) & !0x3fff;
+    img.resize(kern_off + 0x2100, 0);
+    let inter = weight_interleave(streams[0], C);
+    for b in 0..16usize {
+        let base = kern_off + b * 0x200;
+        for (i, v) in inter[b * 256..b * 256 + 256].iter().enumerate() {
+            img[base + i * 2..base + i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+    // exp/reciprocal LUTs from the k=1 skeleton's aux tail
+    // (kern fileoff 0xc000 + 0x2000)
+    img[kern_off + 0x2000..kern_off + 0x2100]
+        .copy_from_slice(&SKELETON_CONV64_SM[0xe000..0xe100][..]);
+    img.resize(kern_off + 0x4000, 0);
+
+    // layer-count scalars for the multi-task family
+    let kern_vsz = 0x4000usize;
+    put_u32(&mut img, 0x1c0, text_off as u32);
+    put_u32(&mut img, 0x208, section_size as u32);
+    put_u32(&mut img, 0x210, text_off as u32);
+    put_u32(&mut img, 0x21c, (3 * layers) as u32);
+    img[0x250..0x252].copy_from_slice(&(0x8000u16 + aligned as u16).to_le_bytes());
+    put_u32(&mut img, 0x260, (text_off + aligned) as u32);
+    put_u32(&mut img, 0x2a0, kern_vsz as u32);
+    put_u32(&mut img, 0x2a8, kern_off as u32);
+    put_u32(&mut img, 0x2b0, kern_vsz as u32);
+    img[0x2f0..0x2f8].copy_from_slice(&0x2100u64.to_le_bytes());
+    put_u32(&mut img, 0x2f8, kern_off as u32);
+    img[0x378..0x37a].copy_from_slice(&(0x8000u16 + aligned as u16).to_le_bytes());
+    img[0xb7c..0xb7e]
+        .copy_from_slice(&((0x151 + 0x134 * (layers - 1)) as u16).to_le_bytes());
+    img[0xb88..0xb8c].copy_from_slice(&((6 * layers) as u32).to_le_bytes());
+    img[0xbb8..0xbba]
+        .copy_from_slice(&((0x57 + 0x54 * (layers - 1)) as u16).to_le_bytes());
+    Ok(img)
 }
 
 /// Matmul shape families with a captured skeleton.
@@ -1845,6 +2076,46 @@ mod tests {
                 &wrefs,
                 &format!("/tmp/ane_act/{case}/net.mil"),
                 &format!("/tmp/ane_act/{case}/out/net.macho"),
+            )
+            .unwrap();
+            std::env::remove_var("HWX_SIG_ANEC");
+            let diffs: Vec<usize> = (0..expect.len().min(img.len()))
+                .filter(|&i| img[i] != expect[i])
+                .collect();
+            assert!(
+                diffs.is_empty() && img.len() == expect.len(),
+                "{case}: {} diffs, first at {:#x}",
+                diffs.len(),
+                diffs.first().copied().unwrap_or(0)
+            );
+        }
+    }
+
+    /// Softmax multi-task chains — `(conv -> softmax)^k` decomposes
+    /// into three task descriptors per layer (conv + sm-reduce +
+    /// sm-final with the terminal writeback epilogue). sm2/sm3
+    /// references use all-ones shared weights.
+    #[test]
+    fn conv_sm_chain_byte_identical() {
+        let _g = SIG_LOCK.lock().unwrap();
+        for (layers, asset, case) in [
+            (2usize, "conv_sm2_reference.hwx", "sm2"),
+            (3, "conv_sm3_skeleton.hwx", "sm3"),
+            (4, "conv_sm4_reference.hwx", "sm4"),
+            (5, "conv_sm5_reference.hwx", "sm5"),
+        ] {
+            let expect = std::fs::read(format!(
+                "{}/assets/{asset}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap();
+            let weights = vec![0x3c00u16; 64 * 64];
+            std::env::set_var("HWX_SIG_ANEC", "1");
+            let img = emit_conv_sm_n(
+                layers,
+                &weights,
+                &format!("/tmp/ane_sm/{case}/net.mil"),
+                &format!("/tmp/ane_sm/{case}/out/net.macho"),
             )
             .unwrap();
             std::env::remove_var("HWX_SIG_ANEC");

@@ -104,6 +104,64 @@ fn conv_act_chain_mil(k: usize, n_blobs: usize, act: &str) -> String {
     s
 }
 
+/// k-layer conv+silu chain — `mul(t, sigmoid(t))` lowered to the
+/// fused LUT kernel by ANEC (record-identical to the unary acts).
+fn conv_silu_chain_mil(k: usize, n_blobs: usize) -> String {
+    const NAMES: [&str; 26] = [
+        "t", "u", "v", "p", "q", "r", "s", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "l",
+        "m", "n", "o", "w1", "w3", "w4", "w5", "w6",
+    ];
+    let mut s = String::from(
+        "program(1.3)\n{\n    func main<ios18>(tensor<fp16, [1, 64, 1, 1]> x) {\n            tensor<int32, [2]> st = const()[val = tensor<int32, [2]>([1, 1])];\n            string pt = const()[val = string(\"valid\")];\n            tensor<int32, [4]> pd = const()[val = tensor<int32, [4]>([0, 0, 0, 0])];\n            tensor<int32, [2]> dl = const()[val = tensor<int32, [2]>([1, 1])];\n            int32 gr = const()[val = int32(1)];\n",
+    );
+    let mut inp = "x".to_string();
+    for i in 0..k {
+        let blob = if i % n_blobs == 0 {
+            "weight.bin".to_string()
+        } else {
+            format!("weight{}.bin", i % n_blobs + 1)
+        };
+        let (wn, cn) = (format!("w{i}"), NAMES[i].to_string());
+        s += &format!("            tensor<fp16, [64, 64, 1, 1]> {wn} = const()[val = tensor<fp16, [64, 64, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/{blob}\"), offset = uint64(64)))];\n");
+        s += &format!("            tensor<fp16, [1, 64, 1, 1]> {cn} = conv(x = {inp}, weight = {wn}, strides = st, pad_type = pt, pad = pd, dilations = dl, groups = gr)[name = string(\"{cn}\")];\n");
+        let sn = if i + 1 == k { "z".into() } else { format!("s{i}") };
+        s += &format!("            tensor<fp16, [1, 64, 1, 1]> g{i} = sigmoid(x = {cn})[name = string(\"g{i}\")];\n");
+        s += &format!("            tensor<fp16, [1, 64, 1, 1]> {sn} = mul(x = {cn}, y = g{i})[name = string(\"{sn}\")];\n");
+        inp = sn;
+    }
+    s += "    } -> (z);\n}\n";
+    s
+}
+
+/// k-layer conv+softmax chain — the multi-task record family: each
+/// layer decomposes into ~4 task descriptors rather than one fused
+/// kernel.
+fn conv_sm_chain_mil(k: usize, n_blobs: usize) -> String {
+    const NAMES: [&str; 26] = [
+        "t", "u", "v", "p", "q", "r", "s", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "l",
+        "m", "n", "o", "w1", "w3", "w4", "w5", "w6",
+    ];
+    let mut s = String::from(
+        "program(1.3)\n{\n    func main<ios18>(tensor<fp16, [1, 64, 1, 1]> x) {\n            tensor<int32, [2]> st = const()[val = tensor<int32, [2]>([1, 1])];\n            string pt = const()[val = string(\"valid\")];\n            tensor<int32, [4]> pd = const()[val = tensor<int32, [4]>([0, 0, 0, 0])];\n            tensor<int32, [2]> dl = const()[val = tensor<int32, [2]>([1, 1])];\n            int32 gr = const()[val = int32(1)];\n            int32 ax = const()[val = int32(1)];\n",
+    );
+    let mut inp = "x".to_string();
+    for i in 0..k {
+        let blob = if i % n_blobs == 0 {
+            "weight.bin".to_string()
+        } else {
+            format!("weight{}.bin", i % n_blobs + 1)
+        };
+        let (wn, cn) = (format!("w{i}"), NAMES[i].to_string());
+        s += &format!("            tensor<fp16, [64, 64, 1, 1]> {wn} = const()[val = tensor<fp16, [64, 64, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/{blob}\"), offset = uint64(64)))];\n");
+        s += &format!("            tensor<fp16, [1, 64, 1, 1]> {cn} = conv(x = {inp}, weight = {wn}, strides = st, pad_type = pt, pad = pd, dilations = dl, groups = gr)[name = string(\"{cn}\")];\n");
+        let sn = if i + 1 == k { "z".into() } else { format!("s{i}") };
+        s += &format!("            tensor<fp16, [1, 64, 1, 1]> {sn} = softmax(x = {cn}, axis = ax)[name = string(\"{sn}\")];\n");
+        inp = sn;
+    }
+    s += "    } -> (z);\n}\n";
+    s
+}
+
 fn one(anec: &Anec, root: &Path, name: &str, mil: &str, weights: Option<Vec<u8>>) {
     let dir = root.join(name);
     let out = dir.join("out");
@@ -315,6 +373,13 @@ fn main() {
         ("chain_conv_gelu", "gelu", 1, 1),
         ("chain5_gelu", "gelu", 5, 1),
         ("chain8_gelu_dw", "gelu", 8, 8),
+        ("chain_conv_silu", "silu", 1, 1),
+        ("chain_conv2_silu2", "silu", 2, 1),
+        ("chain5_silu", "silu", 5, 1),
+        ("chain8_silu_dw", "silu", 8, 8),
+        ("chain_conv_sm", "softmax", 1, 1),
+        ("chain_conv2_sm2", "softmax", 2, 1),
+        ("smp", "softmax", 1, 1),
     ] {
         let dir = root.join(tag);
         fs::create_dir_all(dir.join("out")).unwrap();
@@ -325,18 +390,28 @@ fn main() {
             } else {
                 format!("weight{}.bin", j + 1)
             };
-            let blob = if n_blobs == 1 {
+            let mut d = Vec::with_capacity(64 * 64 * 2);
+            for i in 0..64 * 64u32 {
+                let v = if tag == "smp" {
+                    i + 1
+                } else {
+                    i + j as u32 * 0x5555
+                };
+                d.extend_from_slice(&(v as u16).to_le_bytes());
+            }
+            let blob = if n_blobs == 1 && tag != "smp" {
                 ones_blob(64 * 64)
             } else {
-                let mut d = Vec::with_capacity(64 * 64 * 2);
-                for i in 0..64 * 64u32 {
-                    d.extend_from_slice(&((i + j as u32 * 0x5555) as u16).to_le_bytes());
-                }
                 weight_blob(&d)
             };
             fs::write(dir.join("weights").join(name), blob).unwrap();
         }
-        fs::write(dir.join("net.mil"), conv_act_chain_mil(k, n_blobs, act)).unwrap();
+        let mil = match act {
+            "silu" => conv_silu_chain_mil(k, n_blobs),
+            "softmax" => conv_sm_chain_mil(k, n_blobs),
+            _ => conv_act_chain_mil(k, n_blobs, act),
+        };
+        fs::write(dir.join("net.mil"), mil).unwrap();
         let v = anec
             .compile(&dir.join("net.mil"), &dir.join("out"), "h16")
             .unwrap();

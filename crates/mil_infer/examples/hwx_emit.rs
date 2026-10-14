@@ -192,6 +192,7 @@ fn main() {
                 Some("tanh") => FusedAct::Tanh,
                 Some("gelu") => FusedAct::Gelu,
                 Some("silu") => FusedAct::Silu,
+                Some("softmax") | Some("sm") => FusedAct::Softmax,
                 _ => FusedAct::Sigmoid,
             };
             let out = PathBuf::from(&a[4]);
