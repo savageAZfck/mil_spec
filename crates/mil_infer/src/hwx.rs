@@ -840,6 +840,22 @@ const GELU_LUT: [u8; 0x80] = {
     o
 };
 
+/// k=1 fused conv+silu skeleton — the `mul(t, sigmoid(t))` triple
+/// lowered to a single fused LUT task.
+const SKELETON_CONV64_SILU: &[u8] = include_bytes!("../assets/conv64_silu_skeleton.hwx");
+
+/// Silu band-head LUT, mined from `conv64_silu_skeleton`.
+const SILU_LUT: [u8; 0x80] = {
+    let t = SKELETON_CONV64_SILU;
+    let mut o = [0u8; 0x80];
+    let mut i = 0;
+    while i < 0x80 {
+        o[i] = t[CONV_WEIGHTS_OFF + i];
+        i += 1;
+    }
+    o
+};
+
 /// k=2 fused conv+sigmoid chain skeleton — provides the `i=1` form
 /// of the terminal record (the only depth where position 1 is last).
 const SKELETON_CONV_SIG2: &[u8] = include_bytes!("../assets/conv_sig2_reference.hwx");
@@ -964,6 +980,10 @@ pub enum FusedAct {
     Tanh,
     Relu,
     Gelu,
+    /// `mul(t, sigmoid(t))` — ANEC pattern-matches the triple into the
+    /// same fused LUT kernel, so record geometry is sigmoid-identical
+    /// and only the LUT bytes and kernel names differ.
+    Silu,
 }
 
 impl FusedAct {
@@ -992,6 +1012,7 @@ impl FusedAct {
             FusedAct::Sigmoid => Some(&SIGMOID_LUT),
             FusedAct::Tanh => Some(&TANH_LUT),
             FusedAct::Gelu => Some(&GELU_LUT),
+            FusedAct::Silu => Some(&SILU_LUT),
             FusedAct::Relu => None,
         }
     }
@@ -1002,6 +1023,7 @@ impl FusedAct {
             FusedAct::Tanh => &KNAME_TANH,
             FusedAct::Relu => &KNAME_RELU,
             FusedAct::Gelu => &KNAME_GELU,
+            FusedAct::Silu => &KNAME_SILU,
         }
     }
     /// k=1 fused-op skeleton for this family.
@@ -1011,6 +1033,7 @@ impl FusedAct {
             FusedAct::Tanh => SKELETON_CONV64_TANH,
             FusedAct::Relu => SKELETON_CONV64_RELU,
             FusedAct::Gelu => SKELETON_CONV64_GELU,
+            FusedAct::Silu => SKELETON_CONV64_SILU,
         }
     }
 }
@@ -1091,6 +1114,18 @@ const KNAME_GELU: [&str; 8] = [
     "K53233454AA2E9E748AD8A556A6BFB9C8FB61D0B2B72FF4F737C214C8EDBD1290",
     "K1FB68BF6CE04899ED637EBA1CABEC51781E671E0F6594C25A038B66CC44E11B6",
     "KD48F54858D73FDA7FBDF455FB1A66821CB9A1EDC6B71707E3FD55988DB581FB5",
+];
+
+/// Silu-family kernel names by stream ordinal (`offset / 0x2800`).
+const KNAME_SILU: [&str; 8] = [
+    "K5AF90A3CDAE04A725C406BD1F7984344F0F13AC3F9DE958B72B29E2090B191F3",
+    "K566207E1FFD51D54617A6F5F235878E0896B798C2A53901208FECC6E6C500A75",
+    "KE953D3D588EA3676297DCFF0E686EC2CEF6F5E7B6037903C793D2CE6734F6FF2",
+    "K1956C4C1B88ED8ACB22F90636DD9D29ED7D34CC3041285F43CA81AE1AAA03032",
+    "KBAC32A7AF798ED01D0FE6A85A731F9F72FB81F694B47A0A816E02DF94E1B4347",
+    "KEE80A6BDAE435FA4C685114EAC216AA4AD7BB2BF6C0551070DB9EEA348ACD022",
+    "K33DE195169E522F5DB9A50526EDE1D6C5FEB146EAAFCBF759F6E777B3FACFF8D",
+    "KDE8904E907AD78C992BAA1A7E06423DF9BA6E974A0DE9FC00317CC635992FD1F",
 ];
 
 /// Section-relative offset of each layer record's weight-stream
@@ -1740,6 +1775,10 @@ mod tests {
             (FusedAct::Gelu, 2, 1, "conv_act2_gelu_reference.hwx", "chain_conv2_gelu2"),
             (FusedAct::Gelu, 5, 1, "conv_sig5_gelu_reference.hwx", "chain5_gelu"),
             (FusedAct::Gelu, 8, 8, "conv_act8_gelu_dw_reference.hwx", "chain8_gelu_dw"),
+            (FusedAct::Silu, 1, 1, "conv64_silu_skeleton.hwx", "chain_conv_silu"),
+            (FusedAct::Silu, 2, 1, "conv_act2_silu_reference.hwx", "chain_conv2_silu2"),
+            (FusedAct::Silu, 5, 1, "conv_sig5_silu_reference.hwx", "chain5_silu"),
+            (FusedAct::Silu, 8, 8, "conv_act8_silu_dw_reference.hwx", "chain8_silu_dw"),
         ] {
             let expect = std::fs::read(format!(
                 "{}/assets/{asset}",
