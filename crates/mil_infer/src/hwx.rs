@@ -507,6 +507,44 @@ fn rebuild_tail_ulut(img: &mut Vec<u8>, op: LutOp, n: u32, mil_path: &str, out_p
     put_u32(img, 0x14, sizeofcmds);
 }
 
+/// ANE weight-layout interleave (`trc`/`trlwng` xfm in kernel names)
+/// applied to `BLOBFILE` constants for conv/matmul. Source `w[oc][ic]`
+/// is a row-major `C x C` fp16 matrix (index `oc*C + ic`); the compiler
+/// embeds a lane-interleaved stream in `__KERN_0`, not the raw blob.
+///
+/// Layout (verified byte-exact against the perm corpus for C = 32, 64,
+/// 128): the output is 16 groups of `B = C/16` lanes. Each group emits
+/// a four-element *wing* — the last four `ic` columns of output-channel
+/// window `B*g-1 ..= B*g+B-2` — followed by the *body*: all `ic < C-4`
+/// columns of output channels `B*g .. B*g+B-1`. The leading wing of
+/// group 0 reads out-of-range `oc` and emits zeros; symmetrically the
+/// final quad (`oc = C-1`, `ic = C-4..C`) belongs to a nonexistent 17th
+/// wing and is never emitted.
+pub fn weight_interleave(w: &[u16], c: usize) -> Vec<u16> {
+    debug_assert_eq!(w.len(), c * c);
+    debug_assert_eq!(c % 16, 0);
+    let b = c / 16;
+    let mut out = Vec::with_capacity(c * c);
+    for g in 0..16usize {
+        for t in 0..4 {
+            for m in 0..b {
+                let oc = b * g + m;
+                out.push(if oc == 0 {
+                    0
+                } else {
+                    w[(oc - 1) * c + c - 4 + t]
+                });
+            }
+        }
+        for ic in 0..c - 4 {
+            for m in 0..b {
+                out.push(w[(b * g + m) * c + ic]);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,5 +563,28 @@ mod tests {
         assert_eq!(&img[0..4], &0xbeef_face_u32.to_le_bytes());
         assert_eq!(img.len(), 0x10000);
         assert_eq!(&img[0xc000..0xc002], &[0xf8, 0xc8]);
+    }
+
+    /// `assets/conv_perm_vectors.json` holds the `__KERN_0` streams ANE
+    /// produced for `w[oc][ic] = oc*C + ic` at C = 32, 64, 128 — the
+    /// transform's ground truth.
+    #[test]
+    fn weight_interleave_matches_anec() {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/conv_perm_vectors.json"
+        ))
+        .unwrap();
+        let vec: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        for c in [32usize, 64, 128] {
+            let expect: Vec<u16> = vec[c.to_string()]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as u16)
+                .collect();
+            let src: Vec<u16> = (0..(c * c) as u16).collect();
+            assert_eq!(weight_interleave(&src, c), expect, "C={c}");
+        }
     }
 }
