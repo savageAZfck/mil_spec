@@ -54,6 +54,12 @@ pub use ane_pipeline::Pipeline;
 pub mod ane_decode;
 pub use ane_decode::Decoder;
 
+/// Direct HWX (ANE Mach-O) emission — the third of the compiler that
+/// replaces `ANECCompile`. Emits the task-descriptor program binary
+/// `aned`/`_ANEClient` load, for supported graph shapes.
+pub mod hwx;
+pub use hwx::EwOp;
+
 /// Which hardware units the model is allowed to use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComputeUnits {
