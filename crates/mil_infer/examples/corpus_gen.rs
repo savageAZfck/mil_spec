@@ -61,11 +61,16 @@ fn matmul_mil(n: u32) -> String {
     )
 }
 
-/// `(conv1x1 -> sigmoid)` repeated `k` times. `n_blobs` distinct
+/// `(conv1x1 -> act)` repeated `k` times. `n_blobs` distinct
 /// weight files (`weight.bin`, `weight2.bin`, ...) are referenced
 /// round-robin across layers — `n_blobs=1` yields the shared-weight
 /// (deduplicated) chain, `n_blobs=k` the fully distinct one.
 fn conv_sig_chain_mil(k: usize, n_blobs: usize) -> String {
+    conv_act_chain_mil(k, n_blobs, "sigmoid")
+}
+
+/// Same chain with a parameterized activation op.
+fn conv_act_chain_mil(k: usize, n_blobs: usize, act: &str) -> String {
     const NAMES: [&str; 26] = [
         "t", "u", "v", "p", "q", "r", "s", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "l",
         "m", "n", "o", "w1", "w3", "w4", "w5", "w6",
@@ -84,7 +89,7 @@ fn conv_sig_chain_mil(k: usize, n_blobs: usize) -> String {
         s += &format!("            tensor<fp16, [64, 64, 1, 1]> {wn} = const()[val = tensor<fp16, [64, 64, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/{blob}\"), offset = uint64(64)))];\n");
         s += &format!("            tensor<fp16, [1, 64, 1, 1]> {cn} = conv(x = {inp}, weight = {wn}, strides = st, pad_type = pt, pad = pd, dilations = dl, groups = gr)[name = string(\"{cn}\")];\n");
         let sn = if i + 1 == k { "z".into() } else { format!("s{i}") };
-        s += &format!("            tensor<fp16, [1, 64, 1, 1]> {sn} = sigmoid(x = {cn})[name = string(\"{sn}\")];\n");
+        s += &format!("            tensor<fp16, [1, 64, 1, 1]> {sn} = {act}(x = {cn})[name = string(\"{sn}\")];\n");
         inp = sn;
     }
     s += "    } -> (z);\n}\n";
@@ -277,6 +282,50 @@ fn main() {
             fs::write(dir.join("weights").join(name), blob).unwrap();
         }
         fs::write(dir.join("net.mil"), conv_sig_chain_mil(k, n_blobs)).unwrap();
+        let v = anec
+            .compile(&dir.join("net.mil"), &dir.join("out"), "h16")
+            .unwrap();
+        if v.status == 0 {
+            println!("{tag}: OK (dram={:?})", v.dram_usage);
+        } else {
+            println!("{tag}: FAIL {:?}", v.errors);
+        }
+    }
+
+    // fused conv->activation variants: each activation family gets
+    // its own LUT table, record wiring markers, and kernel-name set;
+    // shared + dw probes cover the name table per stream ordinal
+    for (tag, act, k, n_blobs) in [
+        ("chain_conv_relu", "relu", 1usize, 1usize),
+        ("chain_conv_tanh", "tanh", 1, 1),
+        ("chain_conv2_relu2", "relu", 2, 1),
+        ("chain_conv2_tanh2", "tanh", 2, 1),
+        ("chain5_relu", "relu", 5, 1),
+        ("chain5_tanh", "tanh", 5, 1),
+        ("chain8_relu_dw", "relu", 8, 8),
+        ("chain8_tanh_dw", "tanh", 8, 8),
+    ] {
+        let dir = root.join(tag);
+        fs::create_dir_all(dir.join("out")).unwrap();
+        fs::create_dir_all(dir.join("weights")).unwrap();
+        for j in 0..n_blobs {
+            let name = if j == 0 {
+                "weight.bin".to_string()
+            } else {
+                format!("weight{}.bin", j + 1)
+            };
+            let blob = if n_blobs == 1 {
+                ones_blob(64 * 64)
+            } else {
+                let mut d = Vec::with_capacity(64 * 64 * 2);
+                for i in 0..64 * 64u32 {
+                    d.extend_from_slice(&((i + j as u32 * 0x5555) as u16).to_le_bytes());
+                }
+                weight_blob(&d)
+            };
+            fs::write(dir.join("weights").join(name), blob).unwrap();
+        }
+        fs::write(dir.join("net.mil"), conv_act_chain_mil(k, n_blobs, act)).unwrap();
         let v = anec
             .compile(&dir.join("net.mil"), &dir.join("out"), "h16")
             .unwrap();

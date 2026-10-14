@@ -10,7 +10,8 @@
 
 use mil_infer::espresso::EspressoProgram;
 use mil_infer::hwx::{
-    emit_conv1x1, emit_conv_sig, emit_conv_sig_n, emit_conv_sig_n_dw, emit_elementwise2,
+    emit_conv1x1, emit_conv_act_n, emit_conv_act_n_dw, emit_conv_sig, emit_conv_sig_n,
+    emit_conv_sig_n_dw, emit_elementwise2, FusedAct,
     emit_matmul, emit_unary_lut, ConvShape, EwOp, LutOp, MmShape,
 };
 use std::path::{Path, PathBuf};
@@ -181,20 +182,26 @@ fn main() {
             println!("emitted {} ({} bytes)", out.display(), img.len());
         }
         Some("emit-csn") => {
-            // emit-csn <layers> <weights.bin[,w2.bin,...]> <out.macho>
-            //   (conv->sig)^k — comma-separated list gives per-layer
-            //   distinct weight blobs (deduplicated into streams)
+            // emit-csn <layers> <weights.bin[,w2.bin,...]> <out.macho> [act]
+            //   (conv->act)^k — comma-separated list gives per-layer
+            //   distinct weight blobs (deduplicated into streams);
+            //   act = sigmoid|tanh|relu (default sigmoid)
             let k: usize = a[2].parse().unwrap();
+            let act = match a.get(5).map(String::as_str) {
+                Some("relu") => FusedAct::Relu,
+                Some("tanh") => FusedAct::Tanh,
+                _ => FusedAct::Sigmoid,
+            };
             let out = PathBuf::from(&a[4]);
             let mil = format!("{}.mil", out.display());
             let wfiles: Vec<&str> = a[3].split(',').collect();
             let img = if wfiles.len() == 1 {
                 let w = load_weights(wfiles[0]);
-                emit_conv_sig_n(k, &w, &mil, &out.display().to_string()).unwrap()
+                emit_conv_act_n(act, k, &w, &mil, &out.display().to_string()).unwrap()
             } else {
                 let ws: Vec<Vec<u16>> = wfiles.iter().map(|f| load_weights(f)).collect();
                 let wrefs: Vec<&[u16]> = ws.iter().map(|w| w.as_slice()).collect();
-                emit_conv_sig_n_dw(k, &wrefs, &mil, &out.display().to_string()).unwrap()
+                emit_conv_act_n_dw(act, k, &wrefs, &mil, &out.display().to_string()).unwrap()
             };
             std::fs::write(&out, &img).unwrap();
             println!("emitted {} ({} bytes)", out.display(), img.len());
@@ -313,6 +320,40 @@ fn main() {
                 let mil = format!("{}/{name}/net.mil", dir.display());
                 let out = format!("{}/{name}/out/net.macho", dir.display());
                 let ours = emit_conv_sig_n_dw(k, &wrefs, &mil, &out).unwrap();
+                total += diff_report(&ours, &std::fs::read(&reff).unwrap(), name);
+            }
+            // activation families: relu (LUT-free bands) and tanh
+            // (sigmoid-layout, tanh LUT + kernel names), shared and dw
+            for (name, act, k, n_blobs) in [
+                ("chain_conv_relu", FusedAct::Relu, 1usize, 1usize),
+                ("chain_conv2_relu2", FusedAct::Relu, 2, 1),
+                ("chain5_relu", FusedAct::Relu, 5, 1),
+                ("chain8_relu_dw", FusedAct::Relu, 8, 8),
+                ("chain_conv_tanh", FusedAct::Tanh, 1, 1),
+                ("chain_conv2_tanh2", FusedAct::Tanh, 2, 1),
+                ("chain5_tanh", FusedAct::Tanh, 5, 1),
+                ("chain8_tanh_dw", FusedAct::Tanh, 8, 8),
+            ] {
+                let reff = dir.join(name).join("out").join("net.macho");
+                if !reff.exists() {
+                    println!("  {name}: no reference, skipped");
+                    continue;
+                }
+                let ws: Vec<Vec<u16>> = (0..k)
+                    .map(|i| {
+                        let j = i % n_blobs;
+                        let f = if j == 0 {
+                            "weight.bin".to_string()
+                        } else {
+                            format!("weight{}.bin", j + 1)
+                        };
+                        load_weights(&dir.join(name).join("weights").join(f).display().to_string())
+                    })
+                    .collect();
+                let wrefs: Vec<&[u16]> = ws.iter().map(|w| w.as_slice()).collect();
+                let mil = format!("{}/{name}/net.mil", dir.display());
+                let out = format!("{}/{name}/out/net.macho", dir.display());
+                let ours = emit_conv_act_n_dw(act, k, &wrefs, &mil, &out).unwrap();
                 total += diff_report(&ours, &std::fs::read(&reff).unwrap(), name);
             }
             for (name, shape) in [("mm32p", MmShape::N32), ("mm64p", MmShape::N64)] {

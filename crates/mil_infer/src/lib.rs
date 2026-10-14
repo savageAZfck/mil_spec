@@ -58,7 +58,7 @@ pub use ane_decode::Decoder;
 /// replaces `ANECCompile`. Emits the task-descriptor program binary
 /// `aned`/`_ANEClient` load, for supported graph shapes.
 pub mod hwx;
-pub use hwx::EwOp;
+pub use hwx::{EwOp, FusedAct};
 
 /// Which hardware units the model is allowed to use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

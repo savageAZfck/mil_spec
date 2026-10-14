@@ -780,25 +780,49 @@ pub fn emit_conv1x1(
 /// (fixed 128-byte table, identical in every band); only the
 /// `0x200`-byte weight tail of each band is spliced in.
 pub fn emit_conv_sig(weights: &[u16], mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> {
+    emit_conv_act(FusedAct::Sigmoid, weights, mil_path, out_path)
+}
+
+/// Emit a complete HWX image for the single fused layer
+/// `z = act(conv1x1(x, w))` for `C=64` and activation family `act`.
+///
+/// Each family has its own k=1 skeleton: sigmoid/tanh share the
+/// `[0x80 LUT][0x200 weights]` band layout (record bytes identical,
+/// differing only in LUT contents and kernel names); relu is the
+/// LUT-free form with `0x200`-byte bands and a shorter descriptor.
+pub fn emit_conv_act(
+    act: FusedAct,
+    weights: &[u16],
+    mil_path: &str,
+    out_path: &str,
+) -> Result<Vec<u8>, String> {
     const C: usize = 64;
     if weights.len() != C * C {
         return Err(format!("expected {} weights, got {}", C * C, weights.len()));
     }
-    let skel = SKELETON_CONV64_SIG;
+    let skel = act.skeleton1();
     let (entries, reloc) = tail_meta(skel);
     let mut img = rebuild_tail_at(skel, CONV_TAIL_OFF, &entries, reloc, mil_path, out_path);
 
     let stream = weight_interleave(weights, C);
-    const BAND: usize = 0x280;
-    const LUT: usize = 0x80;
+    let band = act.band_stride();
+    let head = if act.lut().is_some() { 0x80 } else { 0 };
     for b in 0..16usize {
-        let dst = CONV_WEIGHTS_OFF + b * BAND + LUT;
+        let dst = CONV_WEIGHTS_OFF + b * band + head;
         for (i, v) in stream[b * 256..b * 256 + 256].iter().enumerate() {
             img[dst + i * 2..dst + i * 2 + 2].copy_from_slice(&v.to_le_bytes());
         }
     }
     Ok(img)
 }
+
+/// k=1 fused conv+tanh skeleton (identical record geometry to the
+/// sigmoid form; carries the tanh LUT and kernel names).
+const SKELETON_CONV64_TANH: &[u8] = include_bytes!("../assets/conv64_tanh_skeleton.hwx");
+/// k=1 fused conv+relu skeleton — the LUT-free family: `0x200`
+/// weight bands, `0x2000` `__KERN_0` payload, `0x11` descriptor
+/// element count.
+const SKELETON_CONV64_RELU: &[u8] = include_bytes!("../assets/conv64_relu_skeleton.hwx");
 
 /// k=2 fused conv+sigmoid chain skeleton — provides the `i=1` form
 /// of the terminal record (the only depth where position 1 is last).
@@ -833,6 +857,30 @@ fn patch_lane_idx(rec: &mut [u8], i: usize) {
             continue;
         }
         rec[o..o + 2].copy_from_slice(&v);
+    }
+}
+
+/// Patch a conv+act record for its activation family: the
+/// band-descriptor table (`+0x54` offset ramp `stride*(b+1)`, `+0x90`
+/// sixteen stride entries) and the fused-op element count `u16` at
+/// `41 12 02 80` marker +6 (`0x12` LUT families, `0x11` relu). For
+/// sigmoid/tanh every write is a no-op against the sigmoid skeleton
+/// bytes; relu rewrites both fields.
+fn patch_record_act(rec: &mut [u8], act: FusedAct) {
+    let stride = act.band_stride() as u32;
+    for b in 0..15 {
+        rec[0x54 + 4 * b..0x58 + 4 * b]
+            .copy_from_slice(&(stride * (b as u32 + 1)).to_le_bytes());
+    }
+    for b in 0..16 {
+        rec[0x90 + 4 * b..0x94 + 4 * b].copy_from_slice(&stride.to_le_bytes());
+    }
+    let mut m = 0;
+    while m + 8 <= rec.len() {
+        if rec[m..m + 4] == [0x41, 0x12, 0x02, 0x80] {
+            rec[m + 6..m + 8].copy_from_slice(&(act.desc_count() as u16).to_le_bytes());
+        }
+        m += 1;
     }
 }
 
@@ -872,12 +920,104 @@ pub fn emit_conv_sig_n(
     mil_path: &str,
     out_path: &str,
 ) -> Result<Vec<u8>, String> {
+    emit_conv_act_n(FusedAct::Sigmoid, layers, weights, mil_path, out_path)
+}
+
+/// Shared-weight k-layer fused chain `x -> (conv1x1 -> act)^k -> z`.
+pub fn emit_conv_act_n(
+    act: FusedAct,
+    layers: usize,
+    weights: &[u16],
+    mil_path: &str,
+    out_path: &str,
+) -> Result<Vec<u8>, String> {
     if layers == 0 {
         return Err("layers must be >= 1".into());
     }
     let ws = vec![weights; layers];
-    emit_conv_sig_n_dw(layers, &ws, mil_path, out_path)
+    emit_conv_act_n_dw(act, layers, &ws, mil_path, out_path)
 }
+
+/// Fused activation families for conv+act chains — what the ANE
+/// compiler folds into the conv kernel's tail. LUT families carry a
+/// 128-byte table at the head of each weight band; relu has no table
+/// and uses a denser `0x200` band stride.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FusedAct {
+    Sigmoid,
+    Tanh,
+    Relu,
+}
+
+impl FusedAct {
+    /// Per-band stride in `__KERN_0`.
+    fn band_stride(self) -> usize {
+        match self {
+            FusedAct::Relu => 0x200,
+            _ => 0x280,
+        }
+    }
+    /// Bytes per `__KERN_0` weight stream (16 bands).
+    fn stream_size(self) -> usize {
+        16 * self.band_stride()
+    }
+    /// Element count in the fused-op descriptor (`41 12 02 80`+6):
+    /// LUT activations carry one extra buffer element.
+    fn desc_count(self) -> u8 {
+        match self {
+            FusedAct::Relu => 0x11,
+            _ => 0x12,
+        }
+    }
+    /// 128-byte activation LUT at the head of every band.
+    fn lut(self) -> Option<&'static [u8; 0x80]> {
+        match self {
+            FusedAct::Sigmoid => Some(&SIGMOID_LUT),
+            FusedAct::Tanh => Some(&TANH_LUT),
+            FusedAct::Relu => None,
+        }
+    }
+    /// Kernel names indexed by stream ordinal.
+    fn knames(self) -> &'static [&'static str; 8] {
+        match self {
+            FusedAct::Sigmoid => &KERNEL_NAME_BY_STREAM,
+            FusedAct::Tanh => &KNAME_TANH,
+            FusedAct::Relu => &KNAME_RELU,
+        }
+    }
+    /// k=1 fused-op skeleton for this family.
+    fn skeleton1(self) -> &'static [u8] {
+        match self {
+            FusedAct::Sigmoid => SKELETON_CONV64_SIG,
+            FusedAct::Tanh => SKELETON_CONV64_TANH,
+            FusedAct::Relu => SKELETON_CONV64_RELU,
+        }
+    }
+}
+
+/// Sigmoid band-head LUT (128 bytes), mined from ANEC artifacts.
+const SIGMOID_LUT: [u8; 0x80] = {
+    let skel = SKELETON_CONV64_SIG;
+    let mut t = [0u8; 0x80];
+    let mut i = 0;
+    while i < 0x80 {
+        t[i] = skel[CONV_WEIGHTS_OFF + i];
+        i += 1;
+    }
+    t
+};
+
+/// Tanh band-head LUT, mined from `chain_conv_tanh`.
+const TANH_LUT: [u8; 0x80] = {
+    let t = SKELETON_CONV64_TANH;
+    let mut o = [0u8; 0x80];
+    let mut i = 0;
+    while i < 0x80 {
+        o[i] = t[CONV_WEIGHTS_OFF + i];
+        i += 1;
+    }
+    o
+};
 
 /// `K<sha256>_ne_<lane>` kernel names for the `__KERN_0` weight-stream
 /// band groups of the C=64 fused conv+sigmoid family, indexed by
@@ -895,6 +1035,30 @@ const KERNEL_NAME_BY_STREAM: [&str; 8] = [
     "KAC5658BCDBBC20FEAD05C3C7CA32BDA57E0C1E3022DA043890A0C582AD84029C",
     "KDAB1BD6B4EE32537508DF702D04D4D97BAB62348B1164420A810790C675939CF",
     "KB03EFB6AB1251DC6329B01C8A2A5077965107E4FB519A359D1D8D708B9A76A85",
+];
+
+/// Tanh-family kernel names by stream ordinal (`offset / 0x2800`).
+const KNAME_TANH: [&str; 8] = [
+    "KCB01050CFDA60841DC78E7E6A40A87B8039DCB162F0F39BB0F715F6990F260F3",
+    "KCE028E8C30B8A99C6A4C72E60C2789515E4FF7012EC616D2787FF055B6167AFF",
+    "KAD9265DE89E606BC87E8566DEB409C831F4416893F4937B8949034A0B371558F",
+    "K5BB67FF751069E230327742FEC42A663831E4E52C2A64DC1A867B841385A731F",
+    "K8C0C3043F8A840640A1DDE5FB157E3D889B48E67C40B83D5767116C46930374E",
+    "K8948BDD324B566ABD2F26ADE90A4CFACAC888B9D7296537E3DFD533515EEEB5B",
+    "KF2FDF237B05B88C3590A3E99C97C40FDC6722FA39D7F281F11C9EF706B79B6D7",
+    "K53641C79165EDF191B443016DE9DA67CF42BB3FA6CFB06BF91651F8B6FF43006",
+];
+
+/// Relu-family kernel names by stream ordinal (`offset / 0x2000`).
+const KNAME_RELU: [&str; 8] = [
+    "K923BD8B34B9065A305AACB9E27DFF3177ED35CF5AF9CECF9DF7BB9EC94047DE2",
+    "KBEE157892D70D61D719BB7D8071948C39FD62BEDDF9F9D2E98C1B7960B123BC0",
+    "K7D06C0B1A2C4ACEBE4BA887179B991BA61D101751CEA5F5FDBF48E3516F5076B",
+    "KE38618D47393A7FF76CDEAF92E1BA1ED7E362AC0D8424AFA1503A92480D0B80D",
+    "K9E3C06093273BB1BCC5019995492143534B69A1097BDBFF43DCC65BDE487B0DA",
+    "K5303A3B852F86C1D39B8B5A057E5C08C4C08CEC0D5BFDE9D451D1CFD5E30F759",
+    "KF27D0F46516949E5A75C7C5EA6855C4DD90D1927F9D98AB0EFFFDB7D9D6F7437",
+    "KD904D046DD3308218EF464C12742276B8E854770ACF6A21091C2F20B4A87001B",
 ];
 
 /// Section-relative offset of each layer record's weight-stream
@@ -938,6 +1102,21 @@ pub fn emit_conv_sig_n_dw(
     mil_path: &str,
     out_path: &str,
 ) -> Result<Vec<u8>, String> {
+    emit_conv_act_n_dw(FusedAct::Sigmoid, layers, weights, mil_path, out_path)
+}
+
+/// Emit a complete HWX image for `(conv1x1 -> act)^k` with per-layer
+/// weight blobs — the activation-family generalization of
+/// `emit_conv_sig_n_dw`. Sigmoid and tanh share the LUT-band layout;
+/// relu uses `0x200` weight-only bands, `0x2000` streams, and an
+/// `0x11` fused-descriptor element count.
+pub fn emit_conv_act_n_dw(
+    act: FusedAct,
+    layers: usize,
+    weights: &[&[u16]],
+    mil_path: &str,
+    out_path: &str,
+) -> Result<Vec<u8>, String> {
     const C: usize = 64;
     if layers == 0 || weights.len() != layers {
         return Err(format!("expected {layers} weight blobs, got {}", weights.len()));
@@ -948,8 +1127,11 @@ pub fn emit_conv_sig_n_dw(
         }
     }
     if layers == 1 {
-        return emit_conv_sig(weights[0], mil_path, out_path);
+        return emit_conv_act(act, weights[0], mil_path, out_path);
     }
+    let stream_sz = act.stream_size();
+    let band = act.band_stride();
+    let knames = act.knames();
     // dedup blobs by content, first-use order
     let mut streams: Vec<&[u16]> = Vec::new();
     let mut ords = Vec::with_capacity(layers);
@@ -962,11 +1144,11 @@ pub fn emit_conv_sig_n_dw(
             }
         }
     }
-    if streams.len() > KERNEL_NAME_BY_STREAM.len() {
+    if streams.len() > knames.len() {
         return Err(format!(
             "{} distinct weight streams exceeds mined kernel-name table ({})",
             streams.len(),
-            KERNEL_NAME_BY_STREAM.len()
+            knames.len()
         ));
     }
     let mut last_use = vec![0usize; streams.len()];
@@ -993,23 +1175,23 @@ pub fn emit_conv_sig_n_dw(
     // the `_ne_0` band symbol carries n_desc=2; `_ne_1..15` carry 0
     let tpl0 = skel_entries[2].clone();
     let tpln = skel_entries[3].clone();
-    for (j, name) in KERNEL_NAME_BY_STREAM.iter().enumerate().take(streams.len()) {
+    for (j, name) in knames.iter().enumerate().take(streams.len()) {
         entries.push((
             format!("{name}_ne_0"),
             tpl0.1,
             tpl0.2,
             tpl0.3,
-            0x3001_0000 + 0x2800 * j as u64,
+            0x3001_0000 + stream_sz as u64 * j as u64,
         ));
     }
-    for (j, name) in KERNEL_NAME_BY_STREAM.iter().enumerate().take(streams.len()) {
+    for (j, name) in knames.iter().enumerate().take(streams.len()) {
         for b in 1..16u64 {
             entries.push((
                 format!("{name}_ne_{b}"),
                 tpln.1,
                 tpln.2,
                 tpln.3,
-                0x3001_0000 + 0x2800 * j as u64 + 0x280 * b,
+                0x3001_0000 + stream_sz as u64 * j as u64 + band as u64 * b,
             ));
         }
     }
@@ -1035,10 +1217,11 @@ pub fn emit_conv_sig_n_dw(
     // layer 0 — first record; its tail carries the next-terminal markers
     {
         let mut r = skel[REC_FIRST.0..REC_FIRST.0 + REC_FIRST.1].to_vec();
+        patch_record_act(&mut r, act);
         let next_last = layers == 2;
         r[0x09] = if last_use[ords[0]] == 0 { 2 } else { 0 };
         r[0x0a] = ords[0] as u8 + 1;
-        r[0x150..0x154].copy_from_slice(&((ords[0] * 0x2800) as u32).to_le_bytes());
+        r[0x150..0x154].copy_from_slice(&((ords[0] * stream_sz) as u32).to_le_bytes());
         r[0x172..0x174].copy_from_slice(&(if next_last { 0x63u16 } else { 0x55u16 }).to_le_bytes());
         r[0x17b] = if next_last { 4 } else { 0 };
         r[0x180] = if next_last { 0x60 } else { 0x20 };
@@ -1076,7 +1259,7 @@ pub fn emit_conv_sig_n_dw(
         }
         // stream-offset u32 follows the `44 95 80 23` marker
         let foff = if i == 1 { 0x12c } else { 0x130 };
-        r[foff..foff + 4].copy_from_slice(&((ords[i] * 0x2800) as u32).to_le_bytes());
+        r[foff..foff + 4].copy_from_slice(&((ords[i] * stream_sz) as u32).to_le_bytes());
         r[0x09] = if last_use[ords[i]] == i { 2 } else { 0 };
         r[0x0a] = ords[i] as u8 + 1;
         let next_last = i + 1 == layers - 1;
@@ -1093,6 +1276,9 @@ pub fn emit_conv_sig_n_dw(
             *b = 0;
         }
         r[0x15c..0x160].copy_from_slice(&(if next_last { 0u32 } else { 1 }).to_le_bytes());
+        // act patch last — the `41 12 02 80` marker lives inside the
+        // rebuilt `w` wiring, not the template bytes
+        patch_record_act(&mut r, act);
         rec.extend_from_slice(&r);
     }
 
@@ -1115,10 +1301,11 @@ pub fn emit_conv_sig_n_dw(
             r[0x16e] = i as u8; // 31 00 <i> 01
             r
         };
+        patch_record_act(&mut r, act);
         patch_lane_idx(&mut r, i);
         r[0x09] = 2;
         r[0x0a] = ords[i] as u8 + 1;
-        r[foff..foff + 4].copy_from_slice(&((ords[i] * 0x2800) as u32).to_le_bytes());
+        r[foff..foff + 4].copy_from_slice(&((ords[i] * stream_sz) as u32).to_le_bytes());
         rec.extend_from_slice(&r);
     }
 
@@ -1129,27 +1316,34 @@ pub fn emit_conv_sig_n_dw(
     let const_end = text_off + (stream_len + 0x3f) / 0x40 * 0x40 + 0x4000;
     img.resize(const_end, 0);
     let kern_off = (const_end + 0x3fff) & !0x3fff;
-    img.resize(kern_off + 0x2800 * streams.len(), 0);
+    img.resize(kern_off + stream_sz * streams.len(), 0);
     for (j, w) in streams.iter().enumerate() {
         let stream = weight_interleave(w, C);
         for b in 0..16usize {
-            let base = kern_off + j * 0x2800 + b * 0x280;
-            // fixed 128-byte sigmoid LUT, identical in every band
-            img[base..base + 0x80]
-                .copy_from_slice(&skel[CONV_WEIGHTS_OFF..CONV_WEIGHTS_OFF + 0x80]);
+            let base = kern_off + j * stream_sz + b * band;
+            // fixed 128-byte activation LUT, identical in every band
+            // (relu carries no LUT: band == 0x200 weight bytes)
+            let head = match act.lut() {
+                Some(lut) => {
+                    img[base..base + 0x80].copy_from_slice(lut);
+                    0x80
+                }
+                None => 0,
+            };
             for (i, v) in stream[b * 256..b * 256 + 256].iter().enumerate() {
-                img[base + 0x80 + i * 2..base + 0x82 + i * 2]
+                img[base + head + i * 2..base + head + i * 2 + 2]
                     .copy_from_slice(&v.to_le_bytes());
             }
         }
     }
-    img.resize(kern_off + (0x2800 * streams.len() + 0x3fff) & !0x3fff, 0);
+    img.resize(kern_off + (stream_sz * streams.len() + 0x3fff) & !0x3fff, 0);
 
     patch_chain_scalars(
         &mut img,
         layers,
         stream_len,
         streams.len(),
+        stream_sz,
         text_off,
         kern_off,
     );
@@ -1165,11 +1359,12 @@ fn patch_chain_scalars(
     layers: usize,
     stream_len: usize,
     n_streams: usize,
+    stream_sz: usize,
     text_off: usize,
     kern_off: usize,
 ) {
     let aligned = (stream_len + 0x3f) / 0x40 * 0x40;
-    let kern_payload = 0x2800 * n_streams;
+    let kern_payload = stream_sz * n_streams;
     let kern_vsz = (kern_payload + 0x3fff) & !0x3fff;
     put_u32(img, 0x1c0, text_off as u32); // __TEXT segment fileoff
     put_u32(img, 0x208, stream_len as u32); // __text section size
@@ -1476,6 +1671,63 @@ mod tests {
                 &wrefs,
                 &format!("/tmp/ane_corpus/{case}/net.mil"),
                 &format!("/tmp/ane_corpus/{case}/out/net.macho"),
+            )
+            .unwrap();
+            std::env::remove_var("HWX_SIG_ANEC");
+            let diffs: Vec<usize> = (0..expect.len().min(img.len()))
+                .filter(|&i| img[i] != expect[i])
+                .collect();
+            assert!(
+                diffs.is_empty() && img.len() == expect.len(),
+                "{case}: {} diffs, first at {:#x}",
+                diffs.len(),
+                diffs.first().copied().unwrap_or(0)
+            );
+        }
+    }
+
+    /// Activation-family chains — relu (LUT-free `0x200` bands,
+    /// `0x2000` streams, `0x11` descriptor count) and tanh (sigmoid
+    /// layout, tanh LUT and kernel-name table) — must reproduce the
+    /// ANEC artifacts byte-for-byte across k=1, shared chains, and
+    /// the 8-stream distinct-weight case. Shared cases use the
+    /// corpus ones blob; dw uses `w[i] = i + j*0x5555`.
+    #[test]
+    fn conv_act_chain_byte_identical() {
+        let _g = SIG_LOCK.lock().unwrap();
+        for (act, layers, n_blobs, asset, case) in [
+            (FusedAct::Relu, 1usize, 1usize, "conv64_relu_skeleton.hwx", "chain_conv_relu"),
+            (FusedAct::Relu, 2, 1, "conv_act2_relu_reference.hwx", "chain_conv2_relu2"),
+            (FusedAct::Relu, 5, 1, "conv_sig5_relu_reference.hwx", "chain5_relu"),
+            (FusedAct::Relu, 8, 8, "conv_act8_relu_dw_reference.hwx", "chain8_relu_dw"),
+            (FusedAct::Tanh, 1, 1, "conv64_tanh_skeleton.hwx", "chain_conv_tanh"),
+            (FusedAct::Tanh, 2, 1, "conv_act2_tanh_reference.hwx", "chain_conv2_tanh2"),
+            (FusedAct::Tanh, 5, 1, "conv_sig5_tanh_reference.hwx", "chain5_tanh"),
+            (FusedAct::Tanh, 8, 8, "conv_act8_tanh_dw_reference.hwx", "chain8_tanh_dw"),
+        ] {
+            let expect = std::fs::read(format!(
+                "{}/assets/{asset}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap();
+            let weights: Vec<Vec<u16>> = (0..layers)
+                .map(|i| {
+                    let j = (i % n_blobs) as u32;
+                    if n_blobs == 1 {
+                        vec![0x3c00u16; 64 * 64]
+                    } else {
+                        (0..64u32 * 64).map(|e| (e + j * 0x5555) as u16).collect()
+                    }
+                })
+                .collect();
+            let wrefs: Vec<&[u16]> = weights.iter().map(|w| w.as_slice()).collect();
+            std::env::set_var("HWX_SIG_ANEC", "1");
+            let img = emit_conv_act_n_dw(
+                act,
+                layers,
+                &wrefs,
+                &format!("/tmp/ane_act/{case}/net.mil"),
+                &format!("/tmp/ane_act/{case}/out/net.macho"),
             )
             .unwrap();
             std::env::remove_var("HWX_SIG_ANEC");
