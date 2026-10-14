@@ -609,7 +609,7 @@ const MM_TAIL_OFF: usize = 0x25f0;
 /// Symbol-table entries + optional `__text` relocation payload,
 /// extracted from a skeleton (kernel names, type table, layout strings
 /// and the reloc target are all shape-family state we carry verbatim).
-fn tail_meta(skel: &[u8]) -> (Vec<(String, u8, u8, u16, u64)>, Option<[u8; 8]>) {
+fn tail_meta(skel: &[u8]) -> (Vec<(String, u8, u8, u16, u64)>, Vec<[u8; 8]>) {
     // walk load commands for the type-2 LC_SYMTAB
     let ncmds = u32::from_le_bytes(skel[0x10..0x14].try_into().unwrap()) as usize;
     let mut off = 0x20usize;
@@ -642,11 +642,14 @@ fn tail_meta(skel: &[u8]) -> (Vec<(String, u8, u8, u16, u64)>, Option<[u8; 8]>) 
             u64::from_le_bytes(e[8..16].try_into().unwrap()),
         ));
     }
-    let reloc = {
+    let relocs = {
         let reloff = u32::from_le_bytes(skel[0x218..0x21c].try_into().unwrap()) as usize;
-        (reloff != 0).then(|| skel[reloff..reloff + 8].try_into().unwrap())
+        let n = u32::from_le_bytes(skel[0x21c..0x220].try_into().unwrap()) as usize;
+        (0..n)
+            .map(|i| skel[reloff + 8 * i..reloff + 8 * i + 8].try_into().unwrap())
+            .collect()
     };
-    (entries, reloc)
+    (entries, relocs)
 }
 
 /// Rebuild the variable tail after `tail_off` — signature command,
@@ -732,11 +735,10 @@ fn rebuild_tail_at(
     skel: &[u8],
     tail_off: usize,
     entries: &[(String, u8, u8, u16, u64)],
-    reloc: Option<[u8; 8]>,
+    relocs: &[[u8; 8]],
     mil_path: &str,
     out_path: &str,
 ) -> Vec<u8> {
-    let relocs: &[[u8; 8]] = reloc.as_ref().map(std::slice::from_ref).unwrap_or(&[]);
     let (mut img, text_off) = build_tail_at(skel, tail_off, entries, relocs, mil_path, out_path);
     debug_assert_eq!(text_off, 0x4000);
     img.extend_from_slice(&skel[0x4000..]);
@@ -760,8 +762,8 @@ pub fn emit_conv1x1(
         return Err(format!("expected {} weights, got {}", c * c, weights.len()));
     }
     let skel = shape.skeleton();
-    let (entries, reloc) = tail_meta(skel);
-    let mut img = rebuild_tail_at(skel, CONV_TAIL_OFF, &entries, reloc, mil_path, out_path);
+    let (entries, relocs) = tail_meta(skel);
+    let mut img = rebuild_tail_at(skel, CONV_TAIL_OFF, &entries, &relocs, mil_path, out_path);
 
     let stream = weight_interleave(weights, c);
     for (i, v) in stream.iter().enumerate() {
@@ -801,8 +803,8 @@ pub fn emit_conv_act(
         return Err(format!("expected {} weights, got {}", C * C, weights.len()));
     }
     let skel = act.skeleton1();
-    let (entries, reloc) = tail_meta(skel);
-    let mut img = rebuild_tail_at(skel, CONV_TAIL_OFF, &entries, reloc, mil_path, out_path);
+    let (entries, relocs) = tail_meta(skel);
+    let mut img = rebuild_tail_at(skel, CONV_TAIL_OFF, &entries, &relocs, mil_path, out_path);
 
     let stream = weight_interleave(weights, C);
     let band = act.band_stride();
@@ -855,6 +857,27 @@ const SILU_LUT: [u8; 0x80] = {
     }
     o
 };
+
+/// k=1 conv+softmax skeleton — the multi-task record family: the
+/// program decomposes into ~4 task descriptors (conv + softmax
+/// reduce/normalize/output stages), `__KERN_0` is `0x2100` = 16
+/// contiguous `0x200` weight chunks + a `0x100` aux region.
+const SKELETON_CONV64_SM: &[u8] = include_bytes!("../assets/conv64_sm_skeleton.hwx");
+
+/// Softmax-family kernel names by stream ordinal — only stream 0 is
+/// mined (the conv task). The softmax program additionally carries
+/// two `_actlut` symbols (exp/reciprocal tables) at `+0x2000`/`+0x2080`
+/// in `__KERN_0`'s aux tail — skeleton-supplied for k=1 emission.
+const KNAME_SOFTMAX: [&str; 8] = [
+    "K94191614DE4DACE8C293DBDB924D98C1ADD491137600442C695C5B04E2D79E8C",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+];
 
 /// k=2 fused conv+sigmoid chain skeleton — provides the `i=1` form
 /// of the terminal record (the only depth where position 1 is last).
@@ -984,13 +1007,19 @@ pub enum FusedAct {
     /// same fused LUT kernel, so record geometry is sigmoid-identical
     /// and only the LUT bytes and kernel names differ.
     Silu,
+    /// `softmax` — a multi-task record family, not a fused LUT. The
+    /// conv task uses `0x200` weight-only bands (contiguous in
+    /// `__KERN_0`, plus a `0x100` aux tail); only k=1 skeleton
+    /// emission is supported until the multi-task record format is
+    /// decoded.
+    Softmax,
 }
 
 impl FusedAct {
     /// Per-band stride in `__KERN_0`.
     fn band_stride(self) -> usize {
         match self {
-            FusedAct::Relu => 0x200,
+            FusedAct::Relu | FusedAct::Softmax => 0x200,
             _ => 0x280,
         }
     }
@@ -1013,7 +1042,7 @@ impl FusedAct {
             FusedAct::Tanh => Some(&TANH_LUT),
             FusedAct::Gelu => Some(&GELU_LUT),
             FusedAct::Silu => Some(&SILU_LUT),
-            FusedAct::Relu => None,
+            FusedAct::Relu | FusedAct::Softmax => None,
         }
     }
     /// Kernel names indexed by stream ordinal.
@@ -1024,6 +1053,8 @@ impl FusedAct {
             FusedAct::Relu => &KNAME_RELU,
             FusedAct::Gelu => &KNAME_GELU,
             FusedAct::Silu => &KNAME_SILU,
+            // multi-task family: no mined stream-name table yet
+            FusedAct::Softmax => &KNAME_SOFTMAX,
         }
     }
     /// k=1 fused-op skeleton for this family.
@@ -1034,6 +1065,7 @@ impl FusedAct {
             FusedAct::Relu => SKELETON_CONV64_RELU,
             FusedAct::Gelu => SKELETON_CONV64_GELU,
             FusedAct::Silu => SKELETON_CONV64_SILU,
+            FusedAct::Softmax => SKELETON_CONV64_SM,
         }
     }
 }
@@ -1196,6 +1228,12 @@ pub fn emit_conv_act_n_dw(
     if layers == 1 {
         return emit_conv_act(act, weights[0], mil_path, out_path);
     }
+    if act == FusedAct::Softmax {
+        return Err(
+            "softmax chains need the multi-task record format — only k=1 emission is supported"
+                .into(),
+        );
+    }
     let stream_sz = act.stream_size();
     let band = act.band_stride();
     let knames = act.knames();
@@ -1232,7 +1270,7 @@ pub fn emit_conv_act_n_dw(
     }
 
     let skel = SKELETON_CONV_SIG5;
-    let (skel_entries, skel_reloc) = tail_meta(skel);
+    let (skel_entries, skel_relocs) = tail_meta(skel);
 
     // symtab: [x, z] + ne_0 for each stream + per-stream ne_1..15 +
     // the scalar type-descriptor entries copied from the skeleton
@@ -1265,7 +1303,7 @@ pub fn emit_conv_act_n_dw(
     entries.extend_from_slice(&skel_entries[18..]);
 
     // one relocation per record at the weight-stream field
-    let rflag: [u8; 4] = skel_reloc.unwrap()[4..8].try_into().unwrap();
+    let rflag: [u8; 4] = skel_relocs[0][4..8].try_into().unwrap();
     let relocs: Vec<[u8; 8]> = (0..layers)
         .map(|i| {
             let mut e = [0u8; 8];
@@ -1517,8 +1555,8 @@ pub fn emit_matmul(
         return Err(format!("expected {} weights, got {}", n * n, weights.len()));
     }
     let skel = shape.skeleton();
-    let (entries, reloc) = tail_meta(skel);
-    let mut img = rebuild_tail_at(skel, MM_TAIL_OFF, &entries, reloc, mil_path, out_path);
+    let (entries, relocs) = tail_meta(skel);
+    let mut img = rebuild_tail_at(skel, MM_TAIL_OFF, &entries, &relocs, mil_path, out_path);
 
     let off = shape.weights_off();
     for (i, v) in weights.iter().enumerate() {
@@ -1779,6 +1817,7 @@ mod tests {
             (FusedAct::Silu, 2, 1, "conv_act2_silu_reference.hwx", "chain_conv2_silu2"),
             (FusedAct::Silu, 5, 1, "conv_sig5_silu_reference.hwx", "chain5_silu"),
             (FusedAct::Silu, 8, 8, "conv_act8_silu_dw_reference.hwx", "chain8_silu_dw"),
+            (FusedAct::Softmax, 1, 1, "conv_sm_perm_reference.hwx", "smp"),
         ] {
             let expect = std::fs::read(format!(
                 "{}/assets/{asset}",
@@ -1788,7 +1827,10 @@ mod tests {
             let weights: Vec<Vec<u16>> = (0..layers)
                 .map(|i| {
                     let j = (i % n_blobs) as u32;
-                    if n_blobs == 1 {
+                    if case == "smp" {
+                        // perm-weight softmax reference
+                        (0..64u32 * 64).map(|e| e as u16).collect()
+                    } else if n_blobs == 1 {
                         vec![0x3c00u16; 64 * 64]
                     } else {
                         (0..64u32 * 64).map(|e| (e + j * 0x5555) as u16).collect()
