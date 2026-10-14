@@ -9,16 +9,32 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// deadbeef-chunked weight blob; BLOBFILE offsets point at the
-/// chunk header at byte 64.
-fn weight_blob(n_elem: usize) -> Vec<u8> {
+/// chunk header at byte 64. `data` is the fp16 payload.
+fn weight_blob(data: &[u8]) -> Vec<u8> {
     let mut b = vec![0x0c, 0, 0, 0, 0x02, 0, 0, 0];
     b.resize(64, 0);
     b.extend_from_slice(&[0xef, 0xbe, 0xad, 0xde, 0x01, 0, 0, 0]);
-    b.extend_from_slice(&((n_elem * 2) as u64).to_le_bytes());
+    b.extend_from_slice(&(data.len() as u64).to_le_bytes());
     b.extend_from_slice(&128u64.to_le_bytes());
     b.resize(128, 0);
-    b.extend(std::iter::repeat([0x00u8, 0x3c]).take(n_elem).flatten());
+    b.extend_from_slice(data);
     b
+}
+
+/// All-ones fp16 payload.
+fn ones_blob(n_elem: usize) -> Vec<u8> {
+    weight_blob(&vec![0x00, 0x3c].repeat(n_elem))
+}
+
+/// Perm-pattern weights: element `i` is the raw u16 `i`, so the
+/// transformed stream in `__KERN_0` directly reads as a source-index
+/// map of the ANE weight interleave.
+fn perm_blob(n_elem: usize) -> Vec<u8> {
+    let mut d = Vec::with_capacity(n_elem * 2);
+    for i in 0..n_elem {
+        d.extend_from_slice(&(i as u16).to_le_bytes());
+    }
+    weight_blob(&d)
 }
 
 fn ew_mil(op: &str, n: u32) -> String {
@@ -102,7 +118,25 @@ fn main() {
             &root,
             tag,
             &conv1x1_mil(c, w),
-            Some(weight_blob((c * c) as usize)),
+            Some(ones_blob((c * c) as usize)),
+        );
+    }
+    // perm-weight probes: same-shape pairs isolate the transformed
+    // weight region byte-for-byte (transform ground truth lives in
+    // assets/conv_perm_vectors.json).
+    for (tag, c, w) in [
+        ("conv32p", 32u32, 1u32),
+        ("conv64p", 64, 1),
+        ("conv128p", 128, 1),
+        ("conv64s5p", 64, 5),
+        ("conv64s8p", 64, 8),
+    ] {
+        one(
+            &anec,
+            &root,
+            tag,
+            &conv1x1_mil(c, w),
+            Some(perm_blob((c * c) as usize)),
         );
     }
     for n in [32u32, 64, 128, 256] {
@@ -111,7 +145,16 @@ fn main() {
             &root,
             &format!("mm{n}"),
             &matmul_mil(n),
-            Some(weight_blob((n * n) as usize)),
+            Some(ones_blob((n * n) as usize)),
+        );
+    }
+    for (tag, n) in [("mm32p", 32u32), ("mm64p", 64)] {
+        one(
+            &anec,
+            &root,
+            tag,
+            &matmul_mil(n),
+            Some(perm_blob((n * n) as usize)),
         );
     }
 }

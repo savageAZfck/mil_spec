@@ -22,6 +22,16 @@ const SKELETON: &[u8] = include_bytes!("../assets/ew2_template.hwx");
 /// LUT segment at `0xc000`, and one `__text` relocation.
 const SKELETON_ULUT: &[u8] = include_bytes!("../assets/ulut_template.hwx");
 
+/// 1x1-conv skeletons: `z = conv1x1(x, w)` over `fp16 [1,C,W,1]` with
+/// a `[C,C,1,1]` constant weight, h16. All share the signature block
+/// at `0x2688` (capacity `0x890` bytes of text) and the transformed
+/// weight stream at `__KERN_0` file offset `0xc000`.
+const SKELETON_CONV32: &[u8] = include_bytes!("../assets/conv32_skeleton.hwx");
+const SKELETON_CONV64S1: &[u8] = include_bytes!("../assets/conv64s1_skeleton.hwx");
+const SKELETON_CONV64S5: &[u8] = include_bytes!("../assets/conv64s5_skeleton.hwx");
+const SKELETON_CONV64S8: &[u8] = include_bytes!("../assets/conv64s8p_skeleton.hwx");
+const SKELETON_CONV128: &[u8] = include_bytes!("../assets/conv128_skeleton.hwx");
+
 /// Elementwise ops sharing the two-input instruction template.
 /// Value is the u32 opcode word at `__text+0xcc`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -507,42 +517,214 @@ fn rebuild_tail_ulut(img: &mut Vec<u8>, op: LutOp, n: u32, mil_path: &str, out_p
     put_u32(img, 0x14, sizeofcmds);
 }
 
-/// ANE weight-layout interleave (`trc`/`trlwng` xfm in kernel names)
-/// applied to `BLOBFILE` constants for conv/matmul. Source `w[oc][ic]`
-/// is a row-major `C x C` fp16 matrix (index `oc*C + ic`); the compiler
-/// embeds a lane-interleaved stream in `__KERN_0`, not the raw blob.
+/// ANE weight-layout interleave applied to `BLOBFILE` constants for
+/// conv/matmul: the compiler embeds a banded transpose of the raw
+/// `[C,C]` fp16 matrix in `__KERN_0`, not the row-major blob.
 ///
-/// Layout (verified byte-exact against the perm corpus for C = 32, 64,
-/// 128): the output is 16 groups of `B = C/16` lanes. Each group emits
-/// a four-element *wing* — the last four `ic` columns of output-channel
-/// window `B*g-1 ..= B*g+B-2` — followed by the *body*: all `ic < C-4`
-/// columns of output channels `B*g .. B*g+B-1`. The leading wing of
-/// group 0 reads out-of-range `oc` and emits zeros; symmetrically the
-/// final quad (`oc = C-1`, `ic = C-4..C`) belongs to a nonexistent 17th
-/// wing and is never emitted.
+/// `w[oc][ic]` (index `oc*C + ic`) maps to
+/// `dst[g*C*B + ic*B + m] = w[(g*B + m)*C + ic]` with `B = C/16` —
+/// sixteen output-channel bands transposed independently. Verified
+/// byte-exact against perm-weight corpus artifacts for `C = 32, 64,
+/// 128` at spatial widths 1, 5, and 8.
+///
+/// (An earlier decode of this transform reported a leading pad plus a
+/// trailing "wing"; that was an artifact of a malformed perm blob with
+/// four leading pad elements, not a property of the transform.)
 pub fn weight_interleave(w: &[u16], c: usize) -> Vec<u16> {
     debug_assert_eq!(w.len(), c * c);
     debug_assert_eq!(c % 16, 0);
     let b = c / 16;
     let mut out = Vec::with_capacity(c * c);
     for g in 0..16usize {
-        for t in 0..4 {
+        for ic in 0..c {
             for m in 0..b {
-                let oc = b * g + m;
-                out.push(if oc == 0 {
-                    0
-                } else {
-                    w[(oc - 1) * c + c - 4 + t]
-                });
-            }
-        }
-        for ic in 0..c - 4 {
-            for m in 0..b {
-                out.push(w[(b * g + m) * c + ic]);
+                out.push(w[(g * b + m) * c + ic]);
             }
         }
     }
     out
+}
+
+/// Conv shape families with a captured skeleton. `(channels, spatial)`
+/// selects the reference artifact whose instruction stream and task
+/// descriptors are reused verbatim — the ANE conv kernel is generated
+/// code whose length varies with shape, so coverage is per-skeleton
+/// until the instruction encoding is fully decoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConvShape {
+    /// `[1,32,1,1]` in, `[32,32,1,1]` weight.
+    C32W1,
+    /// `[1,64,1,1]` in, `[64,64,1,1]` weight.
+    C64W1,
+    /// `[1,64,5,1]` in, `[64,64,1,1]` weight.
+    C64W5,
+    /// `[1,64,8,1]` in, `[64,64,1,1]` weight.
+    C64W8,
+    /// `[1,128,1,1]` in, `[128,128,1,1]` weight.
+    C128W1,
+}
+
+impl ConvShape {
+    /// Channel count `C` of the `[C,C,1,1]` weight.
+    pub fn channels(self) -> usize {
+        match self {
+            ConvShape::C32W1 => 32,
+            ConvShape::C64W1 | ConvShape::C64W5 | ConvShape::C64W8 => 64,
+            ConvShape::C128W1 => 128,
+        }
+    }
+
+    fn skeleton(self) -> &'static [u8] {
+        match self {
+            ConvShape::C32W1 => SKELETON_CONV32,
+            ConvShape::C64W1 => SKELETON_CONV64S1,
+            ConvShape::C64W5 => SKELETON_CONV64S5,
+            ConvShape::C64W8 => SKELETON_CONV64S8,
+            ConvShape::C128W1 => SKELETON_CONV128,
+        }
+    }
+}
+
+/// End of the z task-descriptor: everything past `0x2688` (signature,
+/// `rt.version`, `LC_SYMTAB`, strtab, the single `__text` relocation)
+/// is regenerated so signature length changes re-offset correctly.
+const CONV_TAIL_OFF: usize = 0x2688;
+/// Transformed weight stream offset inside `__KERN_0`.
+const CONV_WEIGHTS_OFF: usize = 0xc000;
+/// `__text` reloff field inside the `__TEXT` segment command.
+const CONV_RELOFF_FLD: usize = 0x218;
+
+/// Symbol-table entries + the `__text` relocation payload, extracted
+/// from a conv skeleton (kernel names, type table, layout strings and
+/// the reloc target are all shape-family state we carry verbatim).
+fn conv_tail_meta(skel: &[u8]) -> (Vec<(String, u8, u8, u16, u64)>, [u8; 8]) {
+    // walk load commands for the type-2 LC_SYMTAB
+    let ncmds = u32::from_le_bytes(skel[0x10..0x14].try_into().unwrap()) as usize;
+    let mut off = 0x20usize;
+    let (mut symoff, mut nsyms, mut stroff, mut strsize) = (0usize, 0usize, 0usize, 0usize);
+    for _ in 0..ncmds {
+        let cmd = u32::from_le_bytes(skel[off..off + 4].try_into().unwrap());
+        let csz = u32::from_le_bytes(skel[off + 4..off + 8].try_into().unwrap()) as usize;
+        if cmd == 2 {
+            symoff = u32::from_le_bytes(skel[off + 8..off + 12].try_into().unwrap()) as usize;
+            nsyms = u32::from_le_bytes(skel[off + 12..off + 16].try_into().unwrap()) as usize;
+            stroff = u32::from_le_bytes(skel[off + 16..off + 20].try_into().unwrap()) as usize;
+            strsize = u32::from_le_bytes(skel[off + 20..off + 24].try_into().unwrap()) as usize;
+        }
+        off += csz;
+    }
+    let strtab = &skel[stroff..stroff + strsize];
+    let name = |o: u32| -> String {
+        let o = o as usize;
+        let e = strtab[o..].iter().position(|&b| b == 0).unwrap();
+        String::from_utf8(strtab[o..o + e].to_vec()).unwrap()
+    };
+    let mut entries = Vec::with_capacity(nsyms);
+    for i in 0..nsyms {
+        let e = &skel[symoff + i * 16..symoff + i * 16 + 16];
+        entries.push((
+            name(u32::from_le_bytes(e[0..4].try_into().unwrap())),
+            e[4],
+            e[5],
+            u16::from_le_bytes(e[6..8].try_into().unwrap()),
+            u64::from_le_bytes(e[8..16].try_into().unwrap()),
+        ));
+    }
+    let reloff = u32::from_le_bytes(
+        skel[CONV_RELOFF_FLD..CONV_RELOFF_FLD + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let reloc: [u8; 8] = skel[reloff..reloff + 8].try_into().unwrap();
+    (entries, reloc)
+}
+
+/// Emit a complete HWX image for `z = conv1x1(x, w)` on a skeleton
+/// family. `weights` is the raw `[C,C]` fp16 matrix (row-major `u16`
+/// elements); it is interleaved per [`weight_interleave`] into
+/// `__KERN_0`. All other bytes come from the reference skeleton except
+/// the signature's `-i`/`-o` paths — the tail is rebuilt so a longer
+/// signature re-offsets symtab/strtab/relocation correctly.
+pub fn emit_conv1x1(
+    shape: ConvShape,
+    weights: &[u16],
+    mil_path: &str,
+    out_path: &str,
+) -> Result<Vec<u8>, String> {
+    let c = shape.channels();
+    if weights.len() != c * c {
+        return Err(format!("expected {} weights, got {}", c * c, weights.len()));
+    }
+    let skel = shape.skeleton();
+    let (entries, reloc) = conv_tail_meta(skel);
+    let sig = signature(mil_path, out_path);
+    let sig_pad = (8 - (sig.len() + 1) % 8) % 8 + 1;
+    let csz = 8 + sig.len() + sig_pad;
+
+    let mut tail = Vec::new();
+    tail.extend_from_slice(&8u32.to_le_bytes());
+    tail.extend_from_slice(&(csz as u32).to_le_bytes());
+    tail.extend_from_slice(sig.as_bytes());
+    tail.extend(std::iter::repeat(0u8).take(sig_pad));
+
+    tail.extend_from_slice(&[
+        0x31, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, b'r', b't', b'.', b'v', b'e', b'r', b's',
+        b'i', b'o', b'n', 0, 0, 0, 0, 0, 0, 0x28, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0x04, 0, 0, 0, 0,
+        0, 0, 0, 0x01, 0, 0x01, 0, 0, 0, 0, 0,
+    ]);
+
+    let symoff = CONV_TAIL_OFF + tail.len() + 0x18;
+    let mut strtab = vec![0u8];
+    let strxs: Vec<u32> = entries
+        .iter()
+        .map(|(n, ..)| {
+            let o = strtab.len() as u32;
+            strtab.extend_from_slice(n.as_bytes());
+            strtab.push(0);
+            o
+        })
+        .collect();
+    let stroff = symoff + entries.len() * 16;
+    tail.extend_from_slice(&0x2u32.to_le_bytes());
+    tail.extend_from_slice(&0x18u32.to_le_bytes());
+    tail.extend_from_slice(&(symoff as u32).to_le_bytes());
+    tail.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    tail.extend_from_slice(&(stroff as u32).to_le_bytes());
+    tail.extend_from_slice(&(strtab.len() as u32).to_le_bytes());
+    for ((_, ty, sec, desc, val), &sx) in entries.iter().zip(&strxs) {
+        tail.extend_from_slice(&sx.to_le_bytes());
+        tail.push(*ty);
+        tail.push(*sec);
+        tail.extend_from_slice(&desc.to_le_bytes());
+        tail.extend_from_slice(&val.to_le_bytes());
+    }
+    tail.extend_from_slice(&strtab);
+
+    // __text relocation: one entry at align8(strtab end); r_address
+    // payload is the skeleton's own.
+    let reloff = CONV_TAIL_OFF + (tail.len() + 7) / 8 * 8;
+    while CONV_TAIL_OFF + tail.len() < reloff {
+        tail.push(0);
+    }
+    tail.extend_from_slice(&reloc);
+
+    let mut img = skel[..CONV_TAIL_OFF].to_vec();
+    img.extend_from_slice(&tail);
+    img.resize(0x4000, 0);
+    img.extend_from_slice(&skel[0x4000..]);
+    put_u32(
+        &mut img,
+        0x14,
+        (CONV_TAIL_OFF + csz + 0x30 + 0x18 - 0x20) as u32,
+    );
+    put_u32(&mut img, CONV_RELOFF_FLD, reloff as u32);
+
+    let stream = weight_interleave(weights, c);
+    for (i, v) in stream.iter().enumerate() {
+        img[CONV_WEIGHTS_OFF + i * 2..CONV_WEIGHTS_OFF + i * 2 + 2]
+            .copy_from_slice(&v.to_le_bytes());
+    }
+    Ok(img)
 }
 
 #[cfg(test)]
@@ -576,15 +758,60 @@ mod tests {
         ))
         .unwrap();
         let vec: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        for c in [32usize, 64, 128] {
-            let expect: Vec<u16> = vec[c.to_string()]
+        for (c, key) in [
+            (32usize, "32w1"),
+            (64, "64w1"),
+            (64, "64w5"),
+            (64, "64w8"),
+            (128, "128w1"),
+        ] {
+            let expect: Vec<u16> = vec[key]
                 .as_array()
                 .unwrap()
                 .iter()
                 .map(|v| v.as_u64().unwrap() as u16)
                 .collect();
             let src: Vec<u16> = (0..(c * c) as u16).collect();
-            assert_eq!(weight_interleave(&src, c), expect, "C={c}");
+            assert_eq!(weight_interleave(&src, c), expect, "{key}");
+        }
+    }
+
+    /// Emitting a skeleton family with the corpus compile paths and
+    /// perm weights must reproduce the ANEC artifact byte-for-byte.
+    #[test]
+    fn conv1x1_byte_identical() {
+        for (shape, case) in [
+            (ConvShape::C32W1, "conv32p"),
+            (ConvShape::C64W1, "conv64p"),
+            (ConvShape::C64W5, "conv64s5p"),
+            (ConvShape::C64W8, "conv64s8p"),
+            (ConvShape::C128W1, "conv128p"),
+        ] {
+            let c = shape.channels();
+            let weights: Vec<u16> = (0..(c * c) as u16).collect();
+            std::env::set_var("HWX_SIG_ANEC", "1");
+            let img = emit_conv1x1(
+                shape,
+                &weights,
+                &format!("/tmp/ane_corpus/{case}/net.mil"),
+                &format!("/tmp/ane_corpus/{case}/out/net.macho"),
+            )
+            .unwrap();
+            std::env::remove_var("HWX_SIG_ANEC");
+            let expect = std::fs::read(format!(
+                "{}/assets/{case}_reference.hwx",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap();
+            let diffs: Vec<usize> = (0..expect.len().min(img.len()))
+                .filter(|&i| img[i] != expect[i])
+                .collect();
+            assert!(
+                diffs.is_empty() && img.len() == expect.len(),
+                "{case}: {} diffs, first at {:#x}",
+                diffs.len(),
+                diffs.first().copied().unwrap_or(0)
+            );
         }
     }
 }
