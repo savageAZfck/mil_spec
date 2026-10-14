@@ -36,6 +36,9 @@ const SKELETON_CONV128: &[u8] = include_bytes!("../assets/conv128_skeleton.hwx")
 /// `[1,N,1,N]` with a `[1,N,1,N]` constant weight, h16. Unlike conv,
 /// weights are stored verbatim inside `__TEXT`'s const pool — no
 /// `__KERN_0` segment and no `__text` relocations.
+/// `conv64s1` + `sigmoid` chain reference (ones weights): `__KERN_0`
+/// carries sixteen `0x280`-byte bands of `[0x80 LUT][0x200 weights]`.
+const SKELETON_CONV64_SIG: &[u8] = include_bytes!("../assets/conv64_sig_skeleton.hwx");
 const SKELETON_MM32: &[u8] = include_bytes!("../assets/mm32_skeleton.hwx");
 const SKELETON_MM64: &[u8] = include_bytes!("../assets/mm64_skeleton.hwx");
 const SKELETON_MM128: &[u8] = include_bytes!("../assets/mm128_skeleton.hwx");
@@ -745,6 +748,35 @@ pub fn emit_conv1x1(
     Ok(img)
 }
 
+/// Emit a complete HWX image for the fused chain
+/// `z = sigmoid(conv1x1(x, w))` — the real-model pattern — for `C=64`.
+///
+/// `__KERN_0` layout differs from bare conv: sixteen bands of
+/// `0x280` bytes each, `[0x80 sigmoid LUT][0x200 band weights]`
+/// spanning `0xc000..0xe800`. The LUT bytes come from the skeleton
+/// (fixed 128-byte table, identical in every band); only the
+/// `0x200`-byte weight tail of each band is spliced in.
+pub fn emit_conv_sig(weights: &[u16], mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> {
+    const C: usize = 64;
+    if weights.len() != C * C {
+        return Err(format!("expected {} weights, got {}", C * C, weights.len()));
+    }
+    let skel = SKELETON_CONV64_SIG;
+    let (entries, reloc) = tail_meta(skel);
+    let mut img = rebuild_tail_at(skel, CONV_TAIL_OFF, &entries, reloc, mil_path, out_path);
+
+    let stream = weight_interleave(weights, C);
+    const BAND: usize = 0x280;
+    const LUT: usize = 0x80;
+    for b in 0..16usize {
+        let dst = CONV_WEIGHTS_OFF + b * BAND + LUT;
+        for (i, v) in stream[b * 256..b * 256 + 256].iter().enumerate() {
+            img[dst + i * 2..dst + i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+    Ok(img)
+}
+
 /// Matmul shape families with a captured skeleton.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MmShape {
@@ -897,6 +929,35 @@ mod tests {
                 diffs.first().copied().unwrap_or(0)
             );
         }
+    }
+
+    /// The fused conv+sigmoid chain must reproduce the ANEC artifact
+    /// byte-for-byte — weights land in the `[LUT|weights]` bands.
+    #[test]
+    fn conv_sig_byte_identical() {
+        let weights: Vec<u16> = (0..(64 * 64) as u16).collect();
+        std::env::set_var("HWX_SIG_ANEC", "1");
+        let img = emit_conv_sig(
+            &weights,
+            "/tmp/ane_corpus/chain_conv_sigp/net.mil",
+            "/tmp/ane_corpus/chain_conv_sigp/out/net.macho",
+        )
+        .unwrap();
+        std::env::remove_var("HWX_SIG_ANEC");
+        let expect = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/conv64_sigp_reference.hwx"
+        ))
+        .unwrap();
+        let diffs: Vec<usize> = (0..expect.len().min(img.len()))
+            .filter(|&i| img[i] != expect[i])
+            .collect();
+        assert!(
+            diffs.is_empty() && img.len() == expect.len(),
+            "conv64_sigp: {} diffs, first at {:#x}",
+            diffs.len(),
+            diffs.first().copied().unwrap_or(0)
+        );
     }
 
     /// Matmul emission must likewise reproduce the ANEC artifact

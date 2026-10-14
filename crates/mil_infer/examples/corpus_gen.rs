@@ -157,4 +157,46 @@ fn main() {
             Some(perm_blob((n * n) as usize)),
         );
     }
+
+    // multi-op chains: probe how op composition maps into the artifact
+    // (kernel count, intermediate TDs, instruction-stream layout).
+    one(
+        &anec,
+        &root,
+        "chain_add_mul",
+        "program(1.3)\n{\n    func main<ios18>(tensor<fp16, [1, 64, 1, 1]> x, tensor<fp16, [1, 64, 1, 1]> y) {\n        tensor<fp16, [1, 64, 1, 1]> t = add(x = x, y = y)[name = string(\"t\")];\n        tensor<fp16, [1, 64, 1, 1]> z = mul(x = t, y = x)[name = string(\"z\")];\n    } -> (z);\n}\n",
+        None,
+    );
+    one(
+        &anec,
+        &root,
+        "chain_add_add",
+        "program(1.3)\n{\n    func main<ios18>(tensor<fp16, [1, 64, 1, 1]> x, tensor<fp16, [1, 64, 1, 1]> y) {\n        tensor<fp16, [1, 64, 1, 1]> t = add(x = x, y = y)[name = string(\"t\")];\n        tensor<fp16, [1, 64, 1, 1]> z = add(x = t, y = y)[name = string(\"z\")];\n    } -> (z);\n}\n",
+        None,
+    );
+    // conv feeding a unary activation — the real-model pattern.
+    one(
+        &anec,
+        &root,
+        "chain_conv_sig",
+        "program(1.3)\n{\n    func main<ios18>(tensor<fp16, [1, 64, 1, 1]> x) {\n            tensor<fp16, [64, 64, 1, 1]> w = const()[val = tensor<fp16, [64, 64, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/weight.bin\"), offset = uint64(64)))];\n            tensor<int32, [2]> st = const()[val = tensor<int32, [2]>([1, 1])];\n            string pt = const()[val = string(\"valid\")];\n            tensor<int32, [4]> pd = const()[val = tensor<int32, [4]>([0, 0, 0, 0])];\n            tensor<int32, [2]> dl = const()[val = tensor<int32, [2]>([1, 1])];\n            int32 gr = const()[val = int32(1)];\n            tensor<fp16, [1, 64, 1, 1]> t = conv(x = x, weight = w, strides = st, pad_type = pt, pad = pd, dilations = dl, groups = gr)[name = string(\"t\")];\n            tensor<fp16, [1, 64, 1, 1]> z = sigmoid(x = t)[name = string(\"z\")];\n    } -> (z);\n}\n",
+        Some(ones_blob(64 * 64)),
+    );
+    // perm-weight twin: isolates the weight bytes inside the chained
+    // LUT|weight band layout for byte-identity testing.
+    one(
+        &anec,
+        &root,
+        "chain_conv_sigp",
+        "program(1.3)\n{\n    func main<ios18>(tensor<fp16, [1, 64, 1, 1]> x) {\n            tensor<fp16, [64, 64, 1, 1]> w = const()[val = tensor<fp16, [64, 64, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/weight.bin\"), offset = uint64(64)))];\n            tensor<int32, [2]> st = const()[val = tensor<int32, [2]>([1, 1])];\n            string pt = const()[val = string(\"valid\")];\n            tensor<int32, [4]> pd = const()[val = tensor<int32, [4]>([0, 0, 0, 0])];\n            tensor<int32, [2]> dl = const()[val = tensor<int32, [2]>([1, 1])];\n            int32 gr = const()[val = int32(1)];\n            tensor<fp16, [1, 64, 1, 1]> t = conv(x = x, weight = w, strides = st, pad_type = pt, pad = pd, dilations = dl, groups = gr)[name = string(\"t\")];\n            tensor<fp16, [1, 64, 1, 1]> z = sigmoid(x = t)[name = string(\"z\")];\n    } -> (z);\n}\n",
+        Some(perm_blob(64 * 64)),
+    );
+    // conv->sig->conv->sig: does composition repeat additively?
+    one(
+        &anec,
+        &root,
+        "chain_conv2_sig2",
+        "program(1.3)\n{\n    func main<ios18>(tensor<fp16, [1, 64, 1, 1]> x) {\n            tensor<fp16, [64, 64, 1, 1]> w = const()[val = tensor<fp16, [64, 64, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/weight.bin\"), offset = uint64(64)))];\n            tensor<int32, [2]> st = const()[val = tensor<int32, [2]>([1, 1])];\n            string pt = const()[val = string(\"valid\")];\n            tensor<int32, [4]> pd = const()[val = tensor<int32, [4]>([0, 0, 0, 0])];\n            tensor<int32, [2]> dl = const()[val = tensor<int32, [2]>([1, 1])];\n            int32 gr = const()[val = int32(1)];\n            tensor<fp16, [1, 64, 1, 1]> t = conv(x = x, weight = w, strides = st, pad_type = pt, pad = pd, dilations = dl, groups = gr)[name = string(\"t\")];\n            tensor<fp16, [1, 64, 1, 1]> u = sigmoid(x = t)[name = string(\"u\")];\n            tensor<fp16, [64, 64, 1, 1]> w2 = const()[val = tensor<fp16, [64, 64, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/weight.bin\"), offset = uint64(64)))];\n            tensor<fp16, [1, 64, 1, 1]> v = conv(x = u, weight = w2, strides = st, pad_type = pt, pad = pd, dilations = dl, groups = gr)[name = string(\"v\")];\n            tensor<fp16, [1, 64, 1, 1]> z = sigmoid(x = v)[name = string(\"z\")];\n    } -> (z);\n}\n",
+        Some(ones_blob(64 * 64)),
+    );
 }

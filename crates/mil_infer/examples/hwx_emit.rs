@@ -10,7 +10,8 @@
 
 use mil_infer::espresso::EspressoProgram;
 use mil_infer::hwx::{
-    emit_conv1x1, emit_elementwise2, emit_matmul, emit_unary_lut, ConvShape, EwOp, LutOp, MmShape,
+    emit_conv1x1, emit_conv_sig, emit_elementwise2, emit_matmul, emit_unary_lut, ConvShape, EwOp,
+    LutOp, MmShape,
 };
 use std::path::{Path, PathBuf};
 
@@ -170,6 +171,15 @@ fn main() {
             std::fs::write(&out, &img).unwrap();
             println!("emitted {} ({} bytes)", out.display(), img.len());
         }
+        Some("emit-cs") => {
+            // emit-cs <weights.bin> <out.macho>  (conv64 1x1 -> sigmoid)
+            let w = load_weights(&a[2]);
+            let out = PathBuf::from(&a[3]);
+            let mil = format!("{}.mil", out.display());
+            let img = emit_conv_sig(&w, &mil, &out.display().to_string()).unwrap();
+            std::fs::write(&out, &img).unwrap();
+            println!("emitted {} ({} bytes)", out.display(), img.len());
+        }
         Some("verify") => {
             // verify <dir>: for each net.macho reference at <dir>/*/out,
             // re-emit with the recorded inputs and compare.
@@ -224,6 +234,17 @@ fn main() {
                 let out = format!("{}/{name}/out/net.macho", dir.display());
                 let ours = emit_conv1x1(shape, &w, &mil, &out).unwrap();
                 total += diff_report(&ours, &std::fs::read(&reff).unwrap(), name);
+            }
+            // fused conv->sigmoid chain (the FFN pattern)
+            {
+                let reff = dir.join("chain_conv_sigp").join("out").join("net.macho");
+                if reff.exists() {
+                    let w: Vec<u16> = (0..(64 * 64) as u16).collect();
+                    let mil = format!("{}/chain_conv_sigp/net.mil", dir.display());
+                    let out = format!("{}/chain_conv_sigp/out/net.macho", dir.display());
+                    let ours = emit_conv_sig(&w, &mil, &out).unwrap();
+                    total += diff_report(&ours, &std::fs::read(&reff).unwrap(), "chain_conv_sigp");
+                }
             }
             for (name, shape) in [("mm32p", MmShape::N32), ("mm64p", MmShape::N64)] {
                 let reff = dir.join(name).join("out").join("net.macho");
