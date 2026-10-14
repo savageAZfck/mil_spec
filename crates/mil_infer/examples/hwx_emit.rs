@@ -9,7 +9,9 @@
 //!   hwx_emit exec <pkg-dir>                  run via EspressoProgram
 
 use mil_infer::espresso::EspressoProgram;
-use mil_infer::hwx::{emit_elementwise2, emit_unary_lut, EwOp, LutOp};
+use mil_infer::hwx::{
+    emit_conv1x1, emit_elementwise2, emit_matmul, emit_unary_lut, ConvShape, EwOp, LutOp, MmShape,
+};
 use std::path::{Path, PathBuf};
 
 fn f16(v: f32) -> u16 {
@@ -68,6 +70,48 @@ fn emit(op: Op, n: u32, mil: &str, out: &str) -> Vec<u8> {
     }
 }
 
+fn conv_shape(s: &str) -> ConvShape {
+    match s {
+        "c32w1" => ConvShape::C32W1,
+        "c64w1" => ConvShape::C64W1,
+        "c64w5" => ConvShape::C64W5,
+        "c64w8" => ConvShape::C64W8,
+        "c128w1" => ConvShape::C128W1,
+        other => {
+            eprintln!("unknown conv shape {other} (c32w1|c64w1|c64w5|c64w8|c128w1)");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn mm_shape(s: &str) -> MmShape {
+    match s {
+        "32" => MmShape::N32,
+        "64" => MmShape::N64,
+        "128" => MmShape::N128,
+        "256" => MmShape::N256,
+        other => {
+            eprintln!("unknown matmul size {other} (32|64|128|256)");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Raw `u16` weights file, either bare fp16 data or a deadbeef blob
+/// (data starts at byte 128).
+fn load_weights(p: &str) -> Vec<u16> {
+    let b = std::fs::read(p).unwrap();
+    let off = if b.len() > 132 && &b[64..68] == b"\xef\xbe\xad\xde" {
+        128
+    } else {
+        0
+    };
+    b[off..]
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect()
+}
+
 fn diff_report(a: &[u8], b: &[u8], label: &str) -> usize {
     let mut first = usize::MAX;
     let mut count = 0usize;
@@ -106,10 +150,31 @@ fn main() {
             std::fs::write(&out, &img).unwrap();
             println!("emitted {} ({} bytes)", out.display(), img.len());
         }
+        Some("emit-conv") => {
+            // emit-conv <shape> <weights.bin> <out.macho>
+            let shape = conv_shape(&a[2]);
+            let w = load_weights(&a[3]);
+            let out = PathBuf::from(&a[4]);
+            let mil = format!("{}.mil", out.display());
+            let img = emit_conv1x1(shape, &w, &mil, &out.display().to_string()).unwrap();
+            std::fs::write(&out, &img).unwrap();
+            println!("emitted {} ({} bytes)", out.display(), img.len());
+        }
+        Some("emit-mm") => {
+            // emit-mm <n> <weights.bin> <out.macho>
+            let shape = mm_shape(&a[2]);
+            let w = load_weights(&a[3]);
+            let out = PathBuf::from(&a[4]);
+            let mil = format!("{}.mil", out.display());
+            let img = emit_matmul(shape, &w, &mil, &out.display().to_string()).unwrap();
+            std::fs::write(&out, &img).unwrap();
+            println!("emitted {} ({} bytes)", out.display(), img.len());
+        }
         Some("verify") => {
             // verify <dir>: for each net.macho reference at <dir>/*/out,
             // re-emit with the recorded inputs and compare.
             let dir = Path::new(&a[2]);
+            std::env::set_var("HWX_SIG_ANEC", "1");
             let mut total = 0usize;
             let cases: Vec<(String, u32, &str)> = vec![
                 ("n32".into(), 32, "add"),
@@ -139,6 +204,39 @@ fn main() {
                 let out = format!("{}/{name}/out/net.macho", dir.display());
                 let ours = emit(op_of(op), n, &mil, &out);
                 total += diff_report(&ours, &reff_bytes, &format!("{name} ({op}@{n})"));
+            }
+            // weight-bearing families: perm-weight probes are the refs.
+            for (name, shape) in [
+                ("conv32p", ConvShape::C32W1),
+                ("conv64p", ConvShape::C64W1),
+                ("conv64s5p", ConvShape::C64W5),
+                ("conv64s8p", ConvShape::C64W8),
+                ("conv128p", ConvShape::C128W1),
+            ] {
+                let reff = dir.join(name).join("out").join("net.macho");
+                if !reff.exists() {
+                    println!("  {name}: no reference, skipped");
+                    continue;
+                }
+                let c = shape.channels();
+                let w: Vec<u16> = (0..(c * c) as u16).collect();
+                let mil = format!("{}/{name}/net.mil", dir.display());
+                let out = format!("{}/{name}/out/net.macho", dir.display());
+                let ours = emit_conv1x1(shape, &w, &mil, &out).unwrap();
+                total += diff_report(&ours, &std::fs::read(&reff).unwrap(), name);
+            }
+            for (name, shape) in [("mm32p", MmShape::N32), ("mm64p", MmShape::N64)] {
+                let reff = dir.join(name).join("out").join("net.macho");
+                if !reff.exists() {
+                    println!("  {name}: no reference, skipped");
+                    continue;
+                }
+                let n = shape.n();
+                let w: Vec<u16> = (0..(n * n) as u16).collect();
+                let mil = format!("{}/{name}/net.mil", dir.display());
+                let out = format!("{}/{name}/out/net.macho", dir.display());
+                let ours = emit_matmul(shape, &w, &mil, &out).unwrap();
+                total += diff_report(&ours, &std::fs::read(&reff).unwrap(), name);
             }
             println!("total diffs: {total}");
         }
