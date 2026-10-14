@@ -1,0 +1,10 @@
+program(1.3)
+{
+    func main<ios18>(tensor<fp16, [1, 8, 64, 64]> bb, tensor<fp16, [1, 8, 64, 64]> cc) {
+        bool txx = const()[val = bool(false)];
+        bool tyy = const()[val = bool(true)];
+        int32 ax = const()[val = int32(3)];
+        tensor<fp16, [1, 8, 64, 64]> s = matmul(x = bb, y = cc, transpose_x = txx, transpose_y = tyy)[name = string("s")];
+        tensor<fp16, [1, 8, 64, 64]> aa = softmax(x = s, axis = ax)[name = string("aa")];
+    } -> (aa);
+}

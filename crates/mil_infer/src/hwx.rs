@@ -2970,12 +2970,27 @@ fn emit_conv_rms_xdw(
             e.push((x_entries[5].0.clone(), tpl0.1, tpl0.2, tpl0.3, kern_addr + 0x2080));
         }
     }
-    for j in 0..layers {
-        let nm = if j + 1 == layers {
-            "z".to_string()
-        } else {
-            format!("s{}", j + 2)
-        };
+    // per-layer output names from the MIL: each following conv's `x`
+    // operand, then the function output
+    let layer_out: Vec<String> = std::fs::read_to_string(mil_path)
+        .ok()
+        .and_then(|t| {
+            let io = mil_io_sig(&t)?;
+            let xs: Vec<String> = mil_ops(&t)
+                .0
+                .iter()
+                .filter(|o| o.op == "conv")
+                .skip(1)
+                .filter_map(|o| o.args.iter().find(|(k, _)| k == "x").map(|(_, v)| v.clone()))
+                .collect();
+            (xs.len() + 1 == layers).then(|| xs.into_iter().chain([io.out]).collect())
+        })
+        .unwrap_or_else(|| {
+            (0..layers)
+                .map(|j| if j + 1 == layers { "z".into() } else { format!("s{}", j + 2) })
+                .collect()
+        });
+    for (j, nm) in layer_out.iter().enumerate() {
         e.push((
             format!("TT{nm}_ew_to_goc_xfm_1_fuse_goc_const_xfm_0"),
             ttt.1,
@@ -3437,10 +3452,26 @@ fn mil_scalar_f16(text: &str, name: &str) -> Option<u16> {
 pub fn emit_from_mil(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> {
     let img = emit_from_mil_inner(mil_path, out_path)?;
     let text = std::fs::read_to_string(mil_path).map_err(|e| format!("{mil_path}: {e}"))?;
-    let Some(io) = mil_io_sig(&text) else {
+    let Some(mut io) = mil_io_sig(&text) else {
         return Ok(img);
     };
     let (ops, _) = mil_ops(&text);
+    for o in &ops {
+        let keys: &[&str] = match o.op.as_str() {
+            "matmul" => &["x", "y"],
+            "conv" => &["x"],
+            _ => continue,
+        };
+        for (k, v) in &o.args {
+            let Some(i) = io.ins.iter().position(|n| n == v) else {
+                continue;
+            };
+            let spatial = io.in_dims[i].iter().skip(2).product::<usize>() > 1;
+            if keys.contains(&k.as_str()) && (o.op == "matmul" || spatial) {
+                io.relaid.push(v.clone());
+            }
+        }
+    }
     // skeleton-name -> MIL-name role convention: skeletons were captured
     // from MILs whose io names were x/y/m/p/z/sc; each name's role is a
     // fixed DAG operand slot shared by every family using it.
@@ -3464,7 +3495,7 @@ pub fn emit_from_mil(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> 
     let resolve = move |skel: &str| -> Option<String> {
         match skel {
             "x" => first_arg("x"),
-            "y" => first_arg("y"),
+            "y" => first_arg("y").or_else(|| arg_of("matmul", "y")),
             "m" => arg_of("add", "y"),
             "sc" => arg_of("mul", "y"),
             "z" | "p" => Some(out_name.clone()),
@@ -3699,10 +3730,16 @@ fn emit_from_mil_inner(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String
 
 /// Real io names parsed from a MIL `func main` signature: inputs in
 /// declaration order plus the single output.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct IoSig {
     ins: Vec<String>,
     out: String,
+    /// Declared shape of each input (parallel to `ins`).
+    in_dims: Vec<Vec<usize>>,
+    /// Inputs ANEC re-lays out internally — direct `matmul` operands
+    /// and spatial (`H*W > 1`) `conv` inputs. Their symtab heads trail
+    /// the rest (see [`apply_io_names`]).
+    relaid: Vec<String>,
 }
 
 /// Parse `func main<…>(tensor<..> a, tensor<..> b) { .. } -> (out)` —
@@ -3740,18 +3777,28 @@ fn mil_io_sig(text: &str) -> Option<IoSig> {
         cur.push(c);
     }
     ins.push(cur);
-    let ins: Vec<String> = ins
+    let (ins, in_dims): (Vec<String>, Vec<Vec<usize>>) = ins
         .iter()
         .filter_map(|p| {
             let p = p.trim();
             if p.is_empty() {
                 return None;
             }
+            let dims = p
+                .find('[')
+                .zip(p.find(']'))
+                .map(|(a, b)| {
+                    p[a + 1..b]
+                        .split(',')
+                        .filter_map(|d| d.trim().parse().ok())
+                        .collect()
+                })
+                .unwrap_or_default();
             p.rsplit(|c: char| c == ' ' || c == '>')
                 .next()
-                .map(str::to_string)
+                .map(|n| (n.to_string(), dims))
         })
-        .collect();
+        .unzip();
     let arrow = text[close..].find("->")? + close;
     let open = text[arrow + 2..].find('(')? + arrow + 2;
     let shut = text[open..].find(')')? + open;
@@ -3759,7 +3806,12 @@ fn mil_io_sig(text: &str) -> Option<IoSig> {
     if out.is_empty() {
         return None;
     }
-    Some(IoSig { ins, out })
+    Some(IoSig {
+        ins,
+        out,
+        in_dims,
+        relaid: Vec::new(),
+    })
 }
 
 /// Shift position-derived field ids inside a layout-descriptor body:
@@ -3803,16 +3855,18 @@ fn rebase_desc(body: &str, lo: u32, delta: i32) -> String {
 /// * cmd-`0x4` name blocks resize (`main\0name[@output]\0name\0` in an
 ///   `align8` region, capacity `>= 0x10`) and re-sort — inputs
 ///   alphabetical, output last,
-/// * symtab heads keep the skeleton's nlist slot order; layout
-///   descriptors re-sort alphabetically with type bases `t24+5i` and
-///   `n_desc = (0x18+5i)&0x1f`,
+/// * symtab io heads fill the skeleton's io slots as two alphabetical
+///   runs — everything else, then the inputs ANEC re-lays out
+///   (`IoSig::relaid`); layout descriptors re-sort alphabetically with
+///   type bases `t24+5i` and `n_desc = (0x18+5i)&0x1f`,
 /// * task-record `4_9_` binding fields re-key to
 ///   `0x2200 + (sec-1)*0x80` (`0x2080` scalar bindings untouched),
 /// * `sizeofcmds`/`symoff`/`stroff`/`reloff` recompute as resized
 ///   commands shift the whole prefix.
 ///
-/// Byte-identical to ANEC whenever the family's nlist order is
-/// role-stable under renaming — verified for the conv family.
+/// Byte-identical to ANEC for arbitrary renames — the head grouping
+/// rule is verified over every rank permutation of 13 families (conv
+/// 1x1/spatial, activation and norm chains, mm/mmsm/mm4d/mmaddsm/smmm).
 fn apply_io_names(
     img: &[u8],
     io: &IoSig,
@@ -4145,10 +4199,14 @@ fn apply_io_names(
         t.push(0);
         o
     };
+    // io head slots fill in ANEC's order: two alphabetical runs, inputs
+    // ANEC re-lays out (matmul operands, spatial conv inputs) trailing.
+    let mut head_order: Vec<String> = new_all.clone();
+    head_order.sort_by_key(|n| (io.relaid.contains(n), n.clone()));
+    let mut head_order = head_order.into_iter();
     for (name, ty, sect, desc, val) in &syms {
-        if let Some(pos) = io_names.iter().position(|n| n == name) {
-            // io head — substitute role's new name, re-rank sec
-            let nn = new_all[pos].clone();
+        if io_names.contains(name) {
+            let nn = head_order.next().unwrap();
             let sec = new_sec(&nn);
             let val = vbase + vstride * (sec as u64 - 1);
             let sx = strx(&nn, &mut strtab_new);
@@ -4170,8 +4228,18 @@ fn apply_io_names(
             entries.push((sx, *ty, *sect, *desc, *val));
         } else {
             // non-io heads (const scalars like sc/fl) and kernel/type
-            // syms: rename only if the resolver knows the role
-            let nn = new_name(name).unwrap_or_else(|| name.clone());
+            // syms: rename only if the resolver knows the role. Layout-
+            // convert symbols embed the skeleton output name
+            // (`TOOO<out>__@convert_input…`).
+            let embedded = name.strip_prefix("TOOO").and_then(|rest| {
+                io_names.iter().zip(&new_all).find_map(|(sk, nw)| {
+                    let tail = rest.strip_prefix(sk.as_str())?;
+                    tail.starts_with("__@").then(|| format!("TOOO{nw}{tail}"))
+                })
+            });
+            let nn = embedded
+                .or_else(|| new_name(name))
+                .unwrap_or_else(|| name.clone());
             let sx = strx(&nn, &mut strtab_new);
             entries.push((sx, *ty, *sect, *desc, *val));
         }
@@ -4238,8 +4306,9 @@ fn apply_io_names(
                     Some((_, soff, ssz)) if ssz == csz => {
                         let mut seg = img[soff..soff + ssz].to_vec();
                         // position-bound: seg addrs/sizes + nsects/flags +
-                        // the section's segname..nreloc fields
-                        for (a, b) in [(0x18, 0x38), (0x40, 0x48), (0x58, 0x88)] {
+                        // the section's segname/addr and offset..nreloc;
+                        // the section size (+0x70) is the tensor's own
+                        for (a, b) in [(0x18, 0x38), (0x40, 0x48), (0x58, 0x70), (0x78, 0x88)] {
                             seg[a..b].copy_from_slice(&img[coff + a..coff + b]);
                         }
                         new_cmds.extend_from_slice(&seg);
@@ -4308,7 +4377,8 @@ fn apply_io_names(
     out.resize(text_off, 0);
 
     // ---- patch task-record binding fields in __text ----------------------
-    // `4_ 9_ <u16>` entries bind tensors by sec: 0x2200+(sec-1)*0x80.
+    // `4_ 9_ <u16>` entries bind tensors by io rank (sec minus the
+    // family's hidden-section offset): 0x2200 + rank*0x80.
     let mut text = img[text_off..].to_vec();
     let end = text_sz.min(text.len());
     for i in 2..end.saturating_sub(1) {
@@ -4319,13 +4389,13 @@ fn apply_io_names(
         if v < 0x2200 || (v - 0x2200) % 0x80 != 0 || v == 0x2200 {
             continue;
         }
-        let sec = ((v - 0x2200) / 0x80) as u8;
+        let sec = ((v - 0x2200) / 0x80) as u8 + io_off as u8;
         let Some(skel) = sec_name.iter().find(|(s, _)| *s == sec).map(|(_, n)| n) else {
             continue;
         };
         let pos = io_names.iter().position(|n| n == skel).unwrap();
-        let ns = new_sec(&new_all[pos]);
-        let nv = 0x2200u16 + ns as u16 * 0x80;
+        let rank = new_sec(&new_all[pos]) - io_off as u8;
+        let nv = 0x2200u16 + rank as u16 * 0x80;
         text[i..i + 2].copy_from_slice(&nv.to_le_bytes());
     }
     out.extend_from_slice(&text);
@@ -4476,9 +4546,12 @@ mod tests {
             let mil = format!("/tmp/ioname/{probe}/net.mil");
             let out = format!("/tmp/ioname/{probe}/out/net.macho");
             let img = emit_conv1x1(ConvShape::C64W8, &weights, &mil, &out).unwrap();
+            // conv64s8 input is spatial ([1,64,8,1]) — relaid
             let io = IoSig {
                 ins: vec![i_name.to_string()],
                 out: o_name.to_string(),
+                in_dims: vec![vec![1, 64, 8, 1]],
+                relaid: vec![i_name.to_string()],
             };
             let (inn, outn) = (i_name.to_string(), o_name.to_string());
             let img = apply_io_names(
@@ -4895,6 +4968,45 @@ mod tests {
             )
             .unwrap();
             std::env::remove_var("HWX_SIG_ANEC");
+            let diffs: Vec<usize> = (0..expect.len().min(img.len()))
+                .filter(|&i| img[i] != expect[i])
+                .collect();
+            assert!(
+                diffs.is_empty() && img.len() == expect.len(),
+                "{case}: {} diffs, first at {:#x}",
+                diffs.len(),
+                diffs.first().copied().unwrap_or(0)
+            );
+        }
+    }
+
+    /// Rank-changing renames on multi-io families, end to end through
+    /// `emit_from_mil`: io symtab heads form two alphabetical runs
+    /// (relaid matmul operands trail), section sizes follow their
+    /// tensor, bindings key on io rank past hidden sections (mm4d),
+    /// and the matmul `y` role resolves past a leading softmax (smmm).
+    /// The MIL is staged at the path ANEC's signature embeds.
+    #[test]
+    fn io_name_head_grouping_byte_identical() {
+        let _g = SIG_LOCK.lock().unwrap();
+        let assets = format!("{}/assets/ioperm", env!("CARGO_MANIFEST_DIR"));
+        for case in [
+            "p_dcba",
+            "p_adbc",
+            "mmsm_cab",
+            "mm4d_cab",
+            "y_smmm_cab",
+            "y_mmsm4d_bca",
+            "y_mm_act_cba",
+        ] {
+            let dir = format!("/tmp/nlperm/{case}");
+            std::fs::create_dir_all(format!("{dir}/out")).unwrap();
+            std::fs::copy(format!("{assets}/{case}.mil"), format!("{dir}/net.mil")).unwrap();
+            let expect = std::fs::read(format!("{assets}/{case}_reference.hwx")).unwrap();
+            std::env::set_var("HWX_SIG_ANEC", "1");
+            let img = emit_from_mil(&format!("{dir}/net.mil"), &format!("{dir}/out/net.macho"));
+            std::env::remove_var("HWX_SIG_ANEC");
+            let img = img.unwrap();
             let diffs: Vec<usize> = (0..expect.len().min(img.len()))
                 .filter(|&i| img[i] != expect[i])
                 .collect();
