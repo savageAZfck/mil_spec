@@ -78,6 +78,9 @@ fn conv_act_chain_mil(k: usize, n_blobs: usize, act: &str) -> String {
     let mut s = String::from(
         "program(1.3)\n{\n    func main<ios18>(tensor<fp16, [1, 64, 1, 1]> x) {\n            tensor<int32, [2]> st = const()[val = tensor<int32, [2]>([1, 1])];\n            string pt = const()[val = string(\"valid\")];\n            tensor<int32, [4]> pd = const()[val = tensor<int32, [4]>([0, 0, 0, 0])];\n            tensor<int32, [2]> dl = const()[val = tensor<int32, [2]>([1, 1])];\n            int32 gr = const()[val = int32(1)];\n",
     );
+    if act == "gelu" {
+        s += "            string gmode = const()[val = string(\"EXACT\")];\n";
+    }
     let mut inp = "x".to_string();
     for i in 0..k {
         let blob = if i % n_blobs == 0 {
@@ -89,7 +92,12 @@ fn conv_act_chain_mil(k: usize, n_blobs: usize, act: &str) -> String {
         s += &format!("            tensor<fp16, [64, 64, 1, 1]> {wn} = const()[val = tensor<fp16, [64, 64, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/{blob}\"), offset = uint64(64)))];\n");
         s += &format!("            tensor<fp16, [1, 64, 1, 1]> {cn} = conv(x = {inp}, weight = {wn}, strides = st, pad_type = pt, pad = pd, dilations = dl, groups = gr)[name = string(\"{cn}\")];\n");
         let sn = if i + 1 == k { "z".into() } else { format!("s{i}") };
-        s += &format!("            tensor<fp16, [1, 64, 1, 1]> {sn} = {act}(x = {cn})[name = string(\"{sn}\")];\n");
+        let call = if act == "gelu" {
+            format!("gelu(x = {cn}, mode = gmode)")
+        } else {
+            format!("{act}(x = {cn})")
+        };
+        s += &format!("            tensor<fp16, [1, 64, 1, 1]> {sn} = {call}[name = string(\"{sn}\")];\n");
         inp = sn;
     }
     s += "    } -> (z);\n}\n";
@@ -304,6 +312,9 @@ fn main() {
         ("chain5_tanh", "tanh", 5, 1),
         ("chain8_relu_dw", "relu", 8, 8),
         ("chain8_tanh_dw", "tanh", 8, 8),
+        ("chain_conv_gelu", "gelu", 1, 1),
+        ("chain5_gelu", "gelu", 5, 1),
+        ("chain8_gelu_dw", "gelu", 8, 8),
     ] {
         let dir = root.join(tag);
         fs::create_dir_all(dir.join("out")).unwrap();

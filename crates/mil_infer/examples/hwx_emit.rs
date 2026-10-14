@@ -190,6 +190,7 @@ fn main() {
             let act = match a.get(5).map(String::as_str) {
                 Some("relu") => FusedAct::Relu,
                 Some("tanh") => FusedAct::Tanh,
+                Some("gelu") => FusedAct::Gelu,
                 _ => FusedAct::Sigmoid,
             };
             let out = PathBuf::from(&a[4]);
@@ -333,6 +334,10 @@ fn main() {
                 ("chain_conv2_tanh2", FusedAct::Tanh, 2, 1),
                 ("chain5_tanh", FusedAct::Tanh, 5, 1),
                 ("chain8_tanh_dw", FusedAct::Tanh, 8, 8),
+                ("chain_conv_gelu", FusedAct::Gelu, 1, 1),
+                ("chain_conv2_gelu2", FusedAct::Gelu, 2, 1),
+                ("chain5_gelu", FusedAct::Gelu, 5, 1),
+                ("chain8_gelu_dw", FusedAct::Gelu, 8, 8),
             ] {
                 let reff = dir.join(name).join("out").join("net.macho");
                 if !reff.exists() {

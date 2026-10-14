@@ -824,6 +824,22 @@ const SKELETON_CONV64_TANH: &[u8] = include_bytes!("../assets/conv64_tanh_skelet
 /// element count.
 const SKELETON_CONV64_RELU: &[u8] = include_bytes!("../assets/conv64_relu_skeleton.hwx");
 
+/// k=1 fused conv+gelu skeleton — sigmoid-layout family member
+/// (gelu `EXACT` mode; `TANH_APPROXIMATION` not yet mined).
+const SKELETON_CONV64_GELU: &[u8] = include_bytes!("../assets/conv64_gelu_skeleton.hwx");
+
+/// Gelu band-head LUT, mined from `chain_conv_gelu`.
+const GELU_LUT: [u8; 0x80] = {
+    let t = SKELETON_CONV64_GELU;
+    let mut o = [0u8; 0x80];
+    let mut i = 0;
+    while i < 0x80 {
+        o[i] = t[CONV_WEIGHTS_OFF + i];
+        i += 1;
+    }
+    o
+};
+
 /// k=2 fused conv+sigmoid chain skeleton — provides the `i=1` form
 /// of the terminal record (the only depth where position 1 is last).
 const SKELETON_CONV_SIG2: &[u8] = include_bytes!("../assets/conv_sig2_reference.hwx");
@@ -947,6 +963,7 @@ pub enum FusedAct {
     Sigmoid,
     Tanh,
     Relu,
+    Gelu,
 }
 
 impl FusedAct {
@@ -974,6 +991,7 @@ impl FusedAct {
         match self {
             FusedAct::Sigmoid => Some(&SIGMOID_LUT),
             FusedAct::Tanh => Some(&TANH_LUT),
+            FusedAct::Gelu => Some(&GELU_LUT),
             FusedAct::Relu => None,
         }
     }
@@ -983,6 +1001,7 @@ impl FusedAct {
             FusedAct::Sigmoid => &KERNEL_NAME_BY_STREAM,
             FusedAct::Tanh => &KNAME_TANH,
             FusedAct::Relu => &KNAME_RELU,
+            FusedAct::Gelu => &KNAME_GELU,
         }
     }
     /// k=1 fused-op skeleton for this family.
@@ -991,6 +1010,7 @@ impl FusedAct {
             FusedAct::Sigmoid => SKELETON_CONV64_SIG,
             FusedAct::Tanh => SKELETON_CONV64_TANH,
             FusedAct::Relu => SKELETON_CONV64_RELU,
+            FusedAct::Gelu => SKELETON_CONV64_GELU,
         }
     }
 }
@@ -1059,6 +1079,18 @@ const KNAME_RELU: [&str; 8] = [
     "K5303A3B852F86C1D39B8B5A057E5C08C4C08CEC0D5BFDE9D451D1CFD5E30F759",
     "KF27D0F46516949E5A75C7C5EA6855C4DD90D1927F9D98AB0EFFFDB7D9D6F7437",
     "KD904D046DD3308218EF464C12742276B8E854770ACF6A21091C2F20B4A87001B",
+];
+
+/// Gelu-family kernel names by stream ordinal (`offset / 0x2800`).
+const KNAME_GELU: [&str; 8] = [
+    "K3D216797AB3DE2F3DF01E439006E24578C7FFEEA13233932238F3676268575D0",
+    "KE8BE9FE86A0E25227C0528CC13E26C7853B941975120893A3A90E317705018C9",
+    "KB47C60104FE03EF329310D96FE9D2EF91E20C9F85B85A565EE7065F71F381756",
+    "KD7E2AD4EE920B2A3315E4022D3EAA7278B02EAE498CC9FE79E4F7A34338C62BD",
+    "K2CC5BC9A41207938E891C6230A998FE9E9E5EC158F0F19DDF0580320CBD8D0D9",
+    "K53233454AA2E9E748AD8A556A6BFB9C8FB61D0B2B72FF4F737C214C8EDBD1290",
+    "K1FB68BF6CE04899ED637EBA1CABEC51781E671E0F6594C25A038B66CC44E11B6",
+    "KD48F54858D73FDA7FBDF455FB1A66821CB9A1EDC6B71707E3FD55988DB581FB5",
 ];
 
 /// Section-relative offset of each layer record's weight-stream
@@ -1704,6 +1736,10 @@ mod tests {
             (FusedAct::Tanh, 2, 1, "conv_act2_tanh_reference.hwx", "chain_conv2_tanh2"),
             (FusedAct::Tanh, 5, 1, "conv_sig5_tanh_reference.hwx", "chain5_tanh"),
             (FusedAct::Tanh, 8, 8, "conv_act8_tanh_dw_reference.hwx", "chain8_tanh_dw"),
+            (FusedAct::Gelu, 1, 1, "conv64_gelu_skeleton.hwx", "chain_conv_gelu"),
+            (FusedAct::Gelu, 2, 1, "conv_act2_gelu_reference.hwx", "chain_conv2_gelu2"),
+            (FusedAct::Gelu, 5, 1, "conv_sig5_gelu_reference.hwx", "chain5_gelu"),
+            (FusedAct::Gelu, 8, 8, "conv_act8_gelu_dw_reference.hwx", "chain8_gelu_dw"),
         ] {
             let expect = std::fs::read(format!(
                 "{}/assets/{asset}",
