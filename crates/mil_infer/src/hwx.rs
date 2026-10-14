@@ -3080,7 +3080,51 @@ fn mil_scalar_f16(text: &str, name: &str) -> Option<u16> {
 /// (`[1,64,1,64]` and `[1,8,64,64]`), and arbitrary-depth
 /// `conv -> {sigmoid|tanh|relu|gelu|silu|softmax|layer_norm|rms_norm}`
 /// chains (C=64) with shared/distinct/partially-deduplicated weights.
+///
+/// Real MIL tensor names are substituted into the emitted artifact —
+/// arbitrary `func main` io names work, including names that reorder
+/// the alphabetical section ranks.
 pub fn emit_from_mil(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> {
+    let img = emit_from_mil_inner(mil_path, out_path)?;
+    let text = std::fs::read_to_string(mil_path).map_err(|e| format!("{mil_path}: {e}"))?;
+    let Some(io) = mil_io_sig(&text) else {
+        return Ok(img);
+    };
+    let (ops, _) = mil_ops(&text);
+    // skeleton-name -> MIL-name role convention: skeletons were captured
+    // from MILs whose io names were x/y/m/p/z/sc; each name's role is a
+    // fixed DAG operand slot shared by every family using it.
+    let arg_of = |opname: &str, key: &str| -> Option<String> {
+        ops.iter().find(|o| o.op == opname).and_then(|o| {
+            o.args
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        })
+    };
+    let first_arg = |key: &str| -> Option<String> {
+        ops.first().and_then(|o| {
+            o.args
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        })
+    };
+    let out_name = io.out.clone();
+    let resolve = move |skel: &str| -> Option<String> {
+        match skel {
+            "x" => first_arg("x"),
+            "y" => first_arg("y"),
+            "m" => arg_of("add", "y"),
+            "sc" => arg_of("mul", "y"),
+            "z" | "p" => Some(out_name.clone()),
+            _ => None,
+        }
+    };
+    apply_io_names(&img, &io, &resolve)
+}
+
+fn emit_from_mil_inner(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> {
     let text = std::fs::read_to_string(mil_path).map_err(|e| format!("{mil_path}: {e}"))?;
     let mil_dir = std::path::Path::new(mil_path)
         .parent()
@@ -3299,7 +3343,645 @@ pub fn emit_from_mil(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> 
     }
 }
 
-#[cfg(test)]
+// ---------------------------------------------------------------------------
+// IO-name substitution
+// ---------------------------------------------------------------------------
+
+/// Real io names parsed from a MIL `func main` signature: inputs in
+/// declaration order plus the single output.
+#[derive(Debug)]
+struct IoSig {
+    ins: Vec<String>,
+    out: String,
+}
+
+/// Parse `func main<…>(tensor<..> a, tensor<..> b) { .. } -> (out)` —
+/// parameter names are the last token of each `tensor<..> name` entry.
+fn mil_io_sig(text: &str) -> Option<IoSig> {
+    let fpos = text.find("func main")?;
+    let paren = text[fpos..].find('(')? + fpos;
+    let (mut depth, mut close) = (0usize, paren + 1);
+    for (i, c) in text[paren..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = paren + i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut ins = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for c in text[paren + 1..close].chars() {
+        match c {
+            '<' | '[' | '(' => depth += 1,
+            '>' | ']' | ')' => depth -= 1,
+            ',' if depth == 0 => {
+                ins.push(std::mem::take(&mut cur));
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+    }
+    ins.push(cur);
+    let ins: Vec<String> = ins
+        .iter()
+        .filter_map(|p| {
+            let p = p.trim();
+            if p.is_empty() {
+                return None;
+            }
+            p.rsplit(|c: char| c == ' ' || c == '>')
+                .next()
+                .map(str::to_string)
+        })
+        .collect();
+    let arrow = text[close..].find("->")? + close;
+    let open = text[arrow + 2..].find('(')? + arrow + 2;
+    let shut = text[open..].find(')')? + open;
+    let out = text[open + 1..shut].split(',').next()?.trim().to_string();
+    if out.is_empty() {
+        return None;
+    }
+    Some(IoSig { ins, out })
+}
+
+/// Shift position-derived field ids inside a layout-descriptor body:
+/// every `N=` token whose id lies in `[lo, lo+4]` moves by `delta`.
+/// Shape dims (`ar1;0;64`, `s128`, `s8192n`) never match `N=` form.
+fn rebase_desc(body: &str, lo: u32, delta: i32) -> String {
+    let b = body.as_bytes();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_digit() {
+            let j = i + b[i..].iter().take_while(|c| c.is_ascii_digit()).count();
+            if body[j..].starts_with('=') {
+                let n: u32 = body[i..j].parse().unwrap_or(0);
+                if (lo..lo + 5).contains(&n) {
+                    out.push_str(&(n as i32 + delta).to_string());
+                    i = j;
+                    continue;
+                }
+            }
+            out.push_str(&body[i..j]);
+            i = j;
+        } else {
+            out.push(b[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Substitute real MIL tensor names into a just-emitted artifact,
+/// rebuilding the whole name plane the way ANEC does for arbitrary
+/// names:
+///
+/// * `n_sect` = alphabetical rank among io names plus the family's
+///   fixed offset for hidden section classes; `n_value` keeps the
+///   family's `base + (sec-1)*stride` addressing (fit from the
+///   skeleton's io heads),
+/// * type-`0x40` section records re-sort by name and carry the new
+///   addresses,
+/// * cmd-`0x4` name blocks resize (`main\0name[@output]\0name\0` in an
+///   `align8` region, capacity `>= 0x10`) and re-sort — inputs
+///   alphabetical, output last,
+/// * symtab heads keep the skeleton's nlist slot order; layout
+///   descriptors re-sort alphabetically with type bases `t24+5i` and
+///   `n_desc = (0x18+5i)&0x1f`,
+/// * task-record `4_9_` binding fields re-key to
+///   `0x2200 + (sec-1)*0x80` (`0x2080` scalar bindings untouched),
+/// * `sizeofcmds`/`symoff`/`stroff`/`reloff` recompute as resized
+///   commands shift the whole prefix.
+///
+/// Byte-identical to ANEC whenever the family's nlist order is
+/// role-stable under renaming — verified for the conv family.
+fn apply_io_names(
+    img: &[u8],
+    io: &IoSig,
+    resolve: &dyn Fn(&str) -> Option<String>,
+) -> Result<Vec<u8>, String> {
+    let rd32 = |o: usize| u32::from_le_bytes(img[o..o + 4].try_into().unwrap()) as usize;
+    let ncmds = rd32(0x10);
+
+    // ---- walk load commands -------------------------------------------
+    let mut cmd_offs: Vec<(u32, usize, usize)> = Vec::with_capacity(ncmds); // (cmd, off, sz)
+    let (mut symoff, mut nsyms, mut stroff, mut strsize) = (0usize, 0usize, 0usize, 0usize);
+    let (mut text_off, mut text_sz) = (0usize, 0usize);
+    let (mut reloff, mut nreloc, mut reloff_field) = (0usize, 0usize, 0usize);
+    let mut off = 0x20usize;
+    for _ in 0..ncmds {
+        let cmd = rd32(off) as u32;
+        let sz = rd32(off + 4);
+        match cmd {
+            2 => {
+                symoff = rd32(off + 8);
+                nsyms = rd32(off + 12);
+                stroff = rd32(off + 16);
+                strsize = rd32(off + 20);
+            }
+            0x19 => {
+                for s in 0..rd32(off + 0x40) {
+                    let e = off + 0x48 + s * 0x50;
+                    if &img[e..e + 6] == b"__text" {
+                        text_sz = rd32(e + 0x28);
+                        text_off = rd32(e + 0x30);
+                        if rd32(e + 0x3c) > 0 {
+                            reloff = rd32(e + 0x38);
+                            nreloc = rd32(e + 0x3c);
+                            reloff_field = e + 0x38;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        cmd_offs.push((cmd, off, sz));
+        off += sz;
+    }
+    if nreloc == 0 && rd32(0x21c) > 0 && rd32(0x21c) < 0x20 {
+        // single-section skeletons carry the pair in the header
+        reloff = rd32(0x218);
+        nreloc = rd32(0x21c);
+        reloff_field = 0x218;
+    }
+    if text_off == 0 || symoff == 0 {
+        return Err("apply_io_names: malformed image (no __text or LC_SYMTAB)".into());
+    }
+
+    // ---- symtab ---------------------------------------------------------
+    let strtab = &img[stroff..stroff + strsize];
+    let sym_name = |sx: usize| -> String {
+        let e = strtab[sx..].iter().position(|&b| b == 0).unwrap();
+        String::from_utf8_lossy(&strtab[sx..sx + e]).into_owned()
+    };
+    // (name, ty, sect, desc, val)
+    let mut syms: Vec<(String, u8, u8, u16, u64)> = Vec::with_capacity(nsyms);
+    for i in 0..nsyms {
+        let e = symoff + i * 16;
+        syms.push((
+            sym_name(rd32(e)),
+            img[e + 4],
+            img[e + 5],
+            u16::from_le_bytes(img[e + 6..e + 8].try_into().unwrap()),
+            u64::from_le_bytes(img[e + 8..e + 16].try_into().unwrap()),
+        ));
+    }
+
+    // ---- cmd-0x4 blocks: discover the skeleton io names ------------------
+    // name region = trailing `main\0name\0name\0` / `main\0name@output\0name\0`
+    enum Blk {
+        Main,
+        In { name: String },
+        Out { name: String },
+    }
+    let mut blocks: Vec<(usize, Blk)> = Vec::new(); // (cmd index, kind)
+    for (ci, &(cmd, coff, csz)) in cmd_offs.iter().enumerate() {
+        if cmd != 4 {
+            continue;
+        }
+        let b = &img[coff..coff + csz];
+        let Some(mpos) = b.windows(5).rposition(|w| w == b"main\0") else {
+            continue;
+        };
+        let rest = &b[mpos + 5..];
+        let end = rest.iter().position(|&c| c == 0).unwrap_or(rest.len());
+        let first = String::from_utf8_lossy(&rest[..end]).into_owned();
+        let kind = if first.is_empty() {
+            Blk::Main
+        } else if let Some(n) = first.strip_suffix("@output") {
+            Blk::Out { name: n.to_string() }
+        } else {
+            Blk::In { name: first }
+        };
+        blocks.push((ci, kind));
+    }
+    let skel_ins: Vec<String> = blocks
+        .iter()
+        .filter_map(|(_, k)| match k {
+            Blk::In { name } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    let Some((_, Blk::Out { name: skel_out })) = blocks
+        .iter()
+        .find(|(_, k)| matches!(k, Blk::Out { .. }))
+    else {
+        return Ok(img.to_vec()); // no io blocks — nothing to substitute
+    };
+    let skel_out = skel_out.clone();
+
+    // ---- resolve each skeleton name to its real MIL name -----------------
+    let new_name = |skel: &str| -> Option<String> { resolve(skel) };
+    let mut new_ins: Vec<String> = Vec::with_capacity(skel_ins.len());
+    for s in &skel_ins {
+        let resolved = new_name(s).or_else(|| {
+            if skel_ins.len() == 1 {
+                io.ins.first().cloned()
+            } else {
+                io.ins.iter().find(|i| *i == s).cloned()
+            }
+        });
+        let Some(n) = resolved else {
+            return Err(format!("apply_io_names: no MIL input for skeleton input `{s}`"));
+        };
+        new_ins.push(n);
+    }
+    let new_out = new_name(&skel_out).unwrap_or_else(|| io.out.clone());
+    if new_ins == skel_ins && new_out == skel_out {
+        return Ok(img.to_vec()); // already named correctly
+    }
+    let io_names: Vec<String> = skel_ins.iter().cloned().chain([skel_out.clone()]).collect();
+    let new_all: Vec<String> = new_ins.iter().cloned().chain([new_out.clone()]).collect();
+    if new_all.iter().any(|n| n.len() > 15 || n.contains('\0')) {
+        return Err("io name exceeds the 15-char type-0x40 name field".into());
+    }
+    if new_all.iter().collect::<std::collections::HashSet<_>>().len() != new_all.len() {
+        return Err("io names must be distinct".into());
+    }
+
+    // ---- new section ranks ----------------------------------------------
+    // Skeleton io heads carry the family's sec assignment; io secs must
+    // be contiguous (hidden classes take fixed secs outside the range).
+    let io_secs: Vec<u8> = syms
+        .iter()
+        .filter(|(n, ty, s, _, _)| *ty == 0x0f && *s != 0 && io_names.contains(n))
+        .map(|(_, _, s, _, _)| *s)
+        .collect();
+    if io_secs.len() != io_names.len() {
+        return Err("apply_io_names: io head symbols not found in symtab".into());
+    }
+    let sec_lo = *io_secs.iter().min().unwrap();
+    let mut sorted_secs = io_secs.clone();
+    sorted_secs.sort_unstable();
+    if sorted_secs
+        .iter()
+        .enumerate()
+        .any(|(i, &s)| s != sec_lo + i as u8)
+    {
+        return Err("apply_io_names: non-contiguous io sec range".into());
+    }
+    let io_off = sec_lo as u32 - 1;
+    // n_value = vbase + (sec-1)*vstride, fit over the io heads
+    let io_heads: Vec<(u8, u64)> = syms
+        .iter()
+        .filter(|(n, ty, s, _, _)| *ty == 0x0f && *s != 0 && io_names.contains(n))
+        .map(|(_, _, s, _, v)| (*s, *v))
+        .collect();
+    let (vbase, vstride) = if io_heads.len() >= 2 {
+        let mut hh = io_heads.clone();
+        hh.sort();
+        let (s1, v1) = hh[0];
+        let (s2, v2) = hh[1];
+        let stride = (v2 - v1) / (s2 - s1) as u64;
+        (v1 - stride * (s1 as u64 - 1), stride)
+    } else {
+        (0x3000_0000, 0x4000)
+    };
+    // new sec for every io name = alpha rank + family offset
+    let mut alpha: Vec<&String> = new_all.iter().collect();
+    alpha.sort();
+    let new_sec = |name: &str| -> u8 {
+        (alpha.iter().position(|n| n.as_str() == name).unwrap() + 1) as u8 + io_off as u8
+    };
+    // sec -> skeleton io name (for re-keying record bindings)
+    let sec_name: Vec<(u8, String)> = syms
+        .iter()
+        .filter(|(n, ty, s, _, _)| *ty == 0x0f && *s != 0 && io_names.contains(n))
+        .map(|(n, _, s, _, _)| (*s, n.clone()))
+        .collect();
+
+    // ---- rebuild cmd-0x40 section records (alpha-sorted by new name) -----
+    // record: cmd,sz | +8: 0x18 | +0x10: vmaddr | name @0x18 in a field
+    // of `align8(len+1)` bytes (min 8) — the record grows with the name.
+    let mut c40: Vec<Vec<u8>> = Vec::new();
+    for &(cmd, coff, csz) in &cmd_offs {
+        if cmd != 0x40 {
+            continue;
+        }
+        let rec = &img[coff..coff + csz];
+        let name = String::from_utf8_lossy(&rec[0x18..])
+            .split('\0')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        // rename + re-address: io names get their new sec's vmaddr;
+        // non-io entries keep the skeleton's name/address.
+        let (nm, addr) = if let Some(pos) = io_names.iter().position(|n| *n == name) {
+            let nn = new_all[pos].clone();
+            let a = vbase + vstride * (new_sec(&nn) as u64 - 1);
+            (nn, a)
+        } else {
+            (
+                new_name(&name).unwrap_or_else(|| name.clone()),
+                u64::from_le_bytes(rec[0x10..0x18].try_into().unwrap()),
+            )
+        };
+        let nb = nm.as_bytes();
+        let csz_new = 0x18 + ((nb.len() + 1 + 7) & !7).max(8);
+        let mut rec = Vec::with_capacity(csz_new);
+        rec.extend_from_slice(&0x40u32.to_le_bytes());
+        rec.extend_from_slice(&(csz_new as u32).to_le_bytes());
+        rec.extend_from_slice(&0x18u64.to_le_bytes());
+        rec.extend_from_slice(&addr.to_le_bytes());
+        rec.extend_from_slice(nb);
+        rec.resize(csz_new, 0);
+        c40.push(rec);
+    }
+    {
+        // re-sort the rebuilt records by their embedded name
+        let key = |r: &Vec<u8>| {
+            String::from_utf8_lossy(&r[0x18..])
+                .split('\0')
+                .next()
+                .unwrap_or("")
+                .to_string()
+        };
+        c40.sort_by_key(key);
+    }
+
+    // ---- permute per-tensor segments by new sec order --------------------
+    // A tensor segment = LC_SEGMENT_64 whose single section's vmaddr is an
+    // io address. Section content (sectname/prot/flags) is role-bound and
+    // re-sorts with the tensor's new sec; addresses stay position-bound.
+    let mut tensor_segs: Vec<(usize, u8)> = Vec::new(); // (cmd index, skel sec)
+    for (ci, &(cmd, coff, _)) in cmd_offs.iter().enumerate() {
+        if cmd != 0x19 || rd32(coff + 0x40) != 1 {
+            continue;
+        }
+        let addr = u64::from_le_bytes(img[coff + 0x68..coff + 0x70].try_into().unwrap());
+        if io_heads.iter().any(|(_, v)| *v == addr) {
+            let sec = io_heads.iter().find(|(_, v)| *v == addr).unwrap().0;
+            tensor_segs.push((ci, sec));
+        }
+    }
+    // skeleton sec -> the io role's skeleton seg cmd index
+    let seg_at_skel_sec = |s: u8| -> Option<usize> {
+        tensor_segs.iter().find(|(_, ss)| *ss == s).map(|(ci, _)| *ci)
+    };
+
+    // ---- rebuild cmd-0x4 blocks (ins alpha-sorted, output last) ---------
+    // Rebuild each block's name tail; blocks move to the cmd slots in
+    // new-alpha order.
+    let tail_and_pad = |body: &[u8], tail_start: usize, region: &[u8]| -> Vec<u8> {
+        let cap = (region.len().max(0x10) + 7) & !7;
+        let mut b = body[..tail_start].to_vec();
+        b.extend_from_slice(region);
+        b.resize(tail_start + cap, 0);
+        let sz = b.len() as u32;
+        b[4..8].copy_from_slice(&sz.to_le_bytes());
+        // +0x7c interior field = block-relative offset of the second
+        // name occurrence: tail_start + len("main\0") + len(first) + 1
+        let first_len = region[5..]
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(0);
+        let ptr = (tail_start + 5 + first_len + 1) as u32;
+        b[0x7c..0x80].copy_from_slice(&ptr.to_le_bytes());
+        b
+    };
+    let mut in_blks: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut out_blk: Option<Vec<u8>> = None;
+    for &(ci, ref kind) in &blocks {
+        let (_, coff, csz) = cmd_offs[ci];
+        let b = &img[coff..coff + csz];
+        let mpos = b.windows(5).rposition(|w| w == b"main\0").unwrap();
+        match kind {
+            Blk::Main => {}
+            Blk::In { name } => {
+                let pos = io_names.iter().position(|n| n == name).unwrap();
+                let nn = &new_all[pos];
+                let mut region = b"main\0".to_vec();
+                region.extend_from_slice(nn.as_bytes());
+                region.push(0);
+                region.extend_from_slice(nn.as_bytes());
+                region.push(0);
+                in_blks.push((nn.clone(), tail_and_pad(b, mpos, &region)));
+            }
+            Blk::Out { .. } => {
+                let mut region = b"main\0".to_vec();
+                region.extend_from_slice(new_out.as_bytes());
+                region.extend_from_slice(b"@output\0");
+                region.extend_from_slice(new_out.as_bytes());
+                region.push(0);
+                out_blk = Some(tail_and_pad(b, mpos, &region));
+            }
+        }
+    }
+    in_blks.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // ---- rebuild the nlist ----------------------------------------------
+    // io heads: substitute name/sec/val in place (skeleton slot order is
+    // the family's canonical order); layout descriptors rebuild at the
+    // tail of the nlist in new-alpha order.
+    struct Desc {
+        skel_name: String,
+        body: String, // "t<base>=<rest>"
+        skel_base: u32,
+    }
+    let mut descs: Vec<Desc> = Vec::new();
+    let mut entries: Vec<(u32, u8, u8, u16, u64)> = Vec::with_capacity(nsyms); // strx filled later
+    let mut strtab_new = vec![0u8];
+    let strx = |s: &str, t: &mut Vec<u8>| -> u32 {
+        let o = t.len() as u32;
+        t.extend_from_slice(s.as_bytes());
+        t.push(0);
+        o
+    };
+    for (name, ty, sect, desc, val) in &syms {
+        if let Some(pos) = io_names.iter().position(|n| n == name) {
+            // io head — substitute role's new name, re-rank sec
+            let nn = new_all[pos].clone();
+            let sec = new_sec(&nn);
+            let val = vbase + vstride * (sec as u64 - 1);
+            let sx = strx(&nn, &mut strtab_new);
+            entries.push((sx, *ty, sec, *desc, val));
+        } else if *ty == 0x20 {
+            if let Some((nm, rest)) = name.split_once(':') {
+                if let Some(tbase) = rest.strip_prefix('t').and_then(|r| {
+                    r.split('=').next().and_then(|d| d.parse::<u32>().ok())
+                }) {
+                    descs.push(Desc {
+                        skel_name: nm.to_string(),
+                        body: rest[tbase.to_string().len() + 1 + 1..].to_string(),
+                        skel_base: tbase,
+                    });
+                    continue;
+                }
+            }
+            let sx = strx(name, &mut strtab_new);
+            entries.push((sx, *ty, *sect, *desc, *val));
+        } else {
+            // non-io heads (const scalars like sc/fl) and kernel/type
+            // syms: rename only if the resolver knows the role
+            let nn = new_name(name).unwrap_or_else(|| name.clone());
+            let sx = strx(&nn, &mut strtab_new);
+            entries.push((sx, *ty, *sect, *desc, *val));
+        }
+    }
+    // layout descriptors in new-alpha order; a desc's tensor set is the
+    // union of io names and any non-io desc carriers.
+    let mut desc_pos: Vec<String> = descs
+        .iter()
+        .map(|d| {
+            if let Some(pos) = io_names.iter().position(|n| *n == d.skel_name) {
+                new_all[pos].clone()
+            } else {
+                new_name(&d.skel_name).unwrap_or_else(|| d.skel_name.clone())
+            }
+        })
+        .collect();
+    desc_pos.sort();
+    for nm in &desc_pos {
+        // find which skeleton desc this position's tensor carries
+        let d = descs
+            .iter()
+            .find(|d| {
+                let nn = if let Some(pos) = io_names.iter().position(|n| *n == d.skel_name) {
+                    &new_all[pos]
+                } else {
+                    nm
+                };
+                nn == nm
+            })
+            .unwrap();
+        let i_new = desc_pos.iter().position(|n| n == nm).unwrap() as u32;
+        let base = 24 + 5 * i_new;
+        let body = rebase_desc(&d.body, d.skel_base, base as i32 - d.skel_base as i32);
+        let full = format!("{nm}:t{base}={body}");
+        let sx = strx(&full, &mut strtab_new);
+        entries.push((sx, 0x20, 0, (0x18 + 5 * i_new as u16) & 0x1f, 0));
+    }
+
+    // ---- reassemble ------------------------------------------------------
+    let mut new_cmds: Vec<u8> = Vec::new();
+    let mut c40i = 0usize;
+    let mut inbi = 0usize;
+    let mut symtab_cmd_pos = 0usize;
+    for (ci, &(cmd, coff, csz)) in cmd_offs.iter().enumerate() {
+        match cmd {
+            0x40 => {
+                new_cmds.extend_from_slice(&c40[c40i]);
+                c40i += 1;
+            }
+            0x19 if tensor_segs.iter().any(|(tci, _)| *tci == ci) => {
+                // this slot's sec -> the role whose NEW sec lands here ->
+                // that role's skeleton segment body, with the slot's
+                // position-bound fields restored
+                let slot_sec = tensor_segs.iter().find(|(tci, _)| *tci == ci).unwrap().1;
+                let role_j = (0..io_names.len()).find(|&j| new_sec(&new_all[j]) == slot_sec);
+                let src = role_j
+                    .and_then(|j| {
+                        let skel_nm = &io_names[j];
+                        let sksec = sec_name.iter().find(|(_, n)| n == skel_nm)?.0;
+                        seg_at_skel_sec(sksec)
+                    })
+                    .map(|sci| cmd_offs[sci]);
+                match src {
+                    Some((_, soff, ssz)) if ssz == csz => {
+                        let mut seg = img[soff..soff + ssz].to_vec();
+                        // position-bound: seg addrs/sizes + nsects/flags +
+                        // the section's segname..nreloc fields
+                        for (a, b) in [(0x18, 0x38), (0x40, 0x48), (0x58, 0x88)] {
+                            seg[a..b].copy_from_slice(&img[coff + a..coff + b]);
+                        }
+                        new_cmds.extend_from_slice(&seg);
+                    }
+                    _ => new_cmds.extend_from_slice(&img[coff..coff + csz]),
+                }
+            }
+            4 => {
+                match &blocks.iter().find(|(bci, _)| *bci == ci).map(|(_, k)| k) {
+                    Some(Blk::In { .. }) => {
+                        new_cmds.extend_from_slice(&in_blks[inbi].1);
+                        inbi += 1;
+                    }
+                    Some(Blk::Out { .. }) => {
+                        new_cmds.extend_from_slice(out_blk.as_ref().unwrap())
+                    }
+                    _ => new_cmds.extend_from_slice(&img[coff..coff + csz]),
+                }
+            }
+            2 => {
+                symtab_cmd_pos = new_cmds.len();
+                new_cmds.extend_from_slice(&[0u8; 0x18]); // patched below
+            }
+            _ => new_cmds.extend_from_slice(&img[coff..coff + csz]),
+        }
+    }
+    let cmds_end = 0x20 + new_cmds.len();
+    let symoff_new = cmds_end;
+    let stroff_new = symoff_new + entries.len() * 16;
+    new_cmds[symtab_cmd_pos..symtab_cmd_pos + 0x18].copy_from_slice(&[
+        2u32.to_le_bytes(),
+        0x18u32.to_le_bytes(),
+        (symoff_new as u32).to_le_bytes(),
+        (entries.len() as u32).to_le_bytes(),
+        (stroff_new as u32).to_le_bytes(),
+        (strtab_new.len() as u32).to_le_bytes(),
+    ].concat());
+
+    let mut out = img[..0x20].to_vec();
+    put_u32(&mut out, 0x14, new_cmds.len() as u32);
+    out.extend_from_slice(&new_cmds);
+    for (sx, ty, sec, desc, val) in &entries {
+        out.extend_from_slice(&sx.to_le_bytes());
+        out.push(*ty);
+        out.push(*sec);
+        out.extend_from_slice(&desc.to_le_bytes());
+        out.extend_from_slice(&val.to_le_bytes());
+    }
+    out.extend_from_slice(&strtab_new);
+    if nreloc > 0 {
+        let rl = (out.len() + 7) & !7;
+        out.resize(rl, 0);
+        out.extend_from_slice(&img[reloff..reloff + 8 * nreloc]);
+        put_u32(&mut out, reloff_field, rl as u32);
+    }
+    // pad to __text — emitted layouts carry only zero padding between
+    // the variable region and the section data; bail if a family hides
+    // real bytes there
+    let old_end = (stroff + strsize).max(reloff + 8 * nreloc);
+    if img[old_end..text_off].iter().any(|&b| b != 0) {
+        return Err("apply_io_names: data between strtab and __text unhandled".into());
+    }
+    if out.len() > text_off {
+        return Err("apply_io_names: rebuilt prefix overflows __text".into());
+    }
+    out.resize(text_off, 0);
+
+    // ---- patch task-record binding fields in __text ----------------------
+    // `4_ 9_ <u16>` entries bind tensors by sec: 0x2200+(sec-1)*0x80.
+    let mut text = img[text_off..].to_vec();
+    let end = text_sz.min(text.len());
+    for i in 2..end.saturating_sub(1) {
+        if text[i - 2] & 0xf0 != 0x40 || text[i - 1] & 0xf0 != 0x90 {
+            continue;
+        }
+        let v = u16::from_le_bytes([text[i], text[i + 1]]);
+        if v < 0x2200 || (v - 0x2200) % 0x80 != 0 || v == 0x2200 {
+            continue;
+        }
+        let sec = ((v - 0x2200) / 0x80) as u8;
+        let Some(skel) = sec_name.iter().find(|(s, _)| *s == sec).map(|(_, n)| n) else {
+            continue;
+        };
+        let pos = io_names.iter().position(|n| n == skel).unwrap();
+        let ns = new_sec(&new_all[pos]);
+        let nv = 0x2200u16 + ns as u16 * 0x80;
+        text[i..i + 2].copy_from_slice(&nv.to_le_bytes());
+    }
+    out.extend_from_slice(&text);
+    Ok(out)
+}
+
 mod tests {
     use super::*;
     use std::sync::Mutex;
@@ -3422,6 +4104,59 @@ mod tests {
                 diffs.first().copied().unwrap_or(0)
             );
         }
+    }
+
+    /// Arbitrary io names on the conv family: same-sort, reordered,
+    /// and long names must reproduce the ANEC artifacts byte-for-byte
+    /// — including the name-sort-sensitive sec ranks, section records,
+    /// segment permutations, name-table resizes and record bindings.
+    #[test]
+    fn io_names_byte_identical() {
+        let _g = SIG_LOCK.lock().unwrap();
+        let weights: Vec<u16> = (0..64 * 64).map(|i| i as u16).collect();
+        std::env::set_var("HWX_SIG_ANEC", "1");
+        for (probe, i_name, o_name) in [
+            ("same", "bb", "cc"),
+            ("alpha", "aa", "zz"),
+            ("reorder", "zz", "aa"),
+            ("long", "input_xx", "output_zz"),
+            ("r2", "yy", "xx"),
+            ("r3", "nn", "mm"),
+        ] {
+            let mil = format!("/tmp/ioname/{probe}/net.mil");
+            let out = format!("/tmp/ioname/{probe}/out/net.macho");
+            let img = emit_conv1x1(ConvShape::C64W8, &weights, &mil, &out).unwrap();
+            let io = IoSig {
+                ins: vec![i_name.to_string()],
+                out: o_name.to_string(),
+            };
+            let (inn, outn) = (i_name.to_string(), o_name.to_string());
+            let img = apply_io_names(
+                &img,
+                &io,
+                &move |s| match s {
+                    "x" => Some(inn.clone()),
+                    "z" => Some(outn.clone()),
+                    _ => None,
+                },
+            )
+            .unwrap();
+            let expect = std::fs::read(format!(
+                "{}/assets/ioname_{probe}_reference.hwx",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap();
+            let diffs: Vec<usize> = (0..expect.len().min(img.len()))
+                .filter(|&i| img[i] != expect[i])
+                .collect();
+            assert!(
+                diffs.is_empty() && img.len() == expect.len(),
+                "{probe}: {} diffs, first at {:#x}",
+                diffs.len(),
+                diffs.first().copied().unwrap_or(0)
+            );
+        }
+        std::env::remove_var("HWX_SIG_ANEC");
     }
 
     /// The fused conv+sigmoid chain must reproduce the ANEC artifact
