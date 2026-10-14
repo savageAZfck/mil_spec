@@ -1650,12 +1650,14 @@ const SKELETON_CONV_SM3: &[u8] = include_bytes!("../assets/conv_sm3_skeleton.hwx
 /// Distinct-weight softmax kernel names by stream ordinal — the
 /// conv-task descriptor hash in multi-stream programs (stream 0
 /// uses `K9419..` only when it is the program's sole stream). Mined
-/// from ANEC dw probes; ordinals beyond 3 need further mining.
-const KNAME_SM_DW: [&str; 4] = [
+/// from ANEC dw probes; ordinals beyond 5 need further mining.
+const KNAME_SM_DW: [&str; 6] = [
     "KE3E0F4E952E53E653B75FE6AF44DD22939751A660FEF245DA535F7F503E9AC52",
     "K36F9FAA5AC1598F61E735E999A791F3AF94F26320DC08F4A47655BE0F56D009C",
     "K445C1528F57CD5C3F8981EF604408231AE7ABE5C085A6D3966F1B4E5B85CDB85",
     "K8352046B90FD96625782305C20104AE0C2A4CE2D9D985157FCA0FC20945A859E",
+    "K85542F51A780FBCE6FF5BED1B91438097147F4C3080AD4F938E620367C9D2EA3",
+    "K54AF82C5871EA2863186C5298F4A8364871F89349D053806768B5829341185D5",
 ];
 
 // Multi-task templates inside the sm3 `__text` section — section
@@ -1981,12 +1983,14 @@ const SKELETON_CONV_LN4: &[u8] = include_bytes!("../assets/conv_ln4_skeleton.hwx
 
 /// Distinct-weight layer-norm kernel names by stream ordinal (the
 /// single-stream program always uses `K9419..`). Mined from ANEC
-/// lndw2/3/4 probes; ordinals beyond 3 need further mining.
-const KNAME_LN_DW: [&str; 4] = [
+/// lndw2-6 probes; ordinals beyond 5 need further mining.
+const KNAME_LN_DW: [&str; 6] = [
     "K3C23BA63F9FE7926259BE0CD49C610C288A7DB57FE6AFF2F2F0543F4EF3B5712",
     "KE3545219F139ACC28DC984868084DC69371098AC16C6143198F730D551E6D04F",
     "K49750E73342DC5A9AF618282C1FC3E0663E255CD326287258C267314D841D492",
     "KC2200A5DA40187D6913B22C3566BA0458BC425B33670C299DF9AB485B31C198E",
+    "K97766E9CC7D38B5F48C560C7A007B1F77335519988EE1ECCC57EADC0FDEE3AFC",
+    "K3E3F259488E410992DE415DA6A4746060519BB624D148CBA18B8C2327A0E01F1",
 ];
 
 /// Program header + record prologue (`0x30` header, `01 00 05 00`).
@@ -2368,6 +2372,16 @@ pub fn emit_conv_rms_n_dw(
             "{} distinct weight streams exceeds the mined kernel-name table ({})",
             streams.len(),
             KNAME_SM_DW.len()
+        ));
+    }
+    // aux3 carries a per-program schedule table that switches to an
+    // extended 0x220/0x160 form at ≥5 streams; that generated block is
+    // not yet decoded, so deep multi-stream RMS programs reject here.
+    if streams.len() > 4 {
+        return Err(format!(
+            "{} distinct weight streams exceeds the decoded aux3 \
+             schedule-table family (4)",
+            streams.len()
         ));
     }
     let n_streams = streams.len();
@@ -3542,15 +3556,17 @@ mod tests {
     #[test]
     fn conv_sm_chain_byte_identical() {
         let _g = SIG_LOCK.lock().unwrap();
-        for (layers, n_blobs, asset, case) in [
-            (2usize, 1usize, "conv_sm2_reference.hwx", "sm2"),
-            (3, 1, "conv_sm3_skeleton.hwx", "sm3"),
-            (4, 1, "conv_sm4_reference.hwx", "sm4"),
-            (5, 1, "conv_sm5_reference.hwx", "sm5"),
-            (2, 2, "conv_smdw2_reference.hwx", "smdw2"),
-            (3, 3, "conv_smdw3_reference.hwx", "smdw3"),
-            (4, 4, "conv_smdw4_reference.hwx", "smdw4"),
-            (3, 2, "conv_smpdw_reference.hwx", "smpdw"),
+        for (layers, n_blobs, asset, case, nested) in [
+            (2usize, 1usize, "conv_sm2_reference.hwx", "sm2", false),
+            (3, 1, "conv_sm3_skeleton.hwx", "sm3", false),
+            (4, 1, "conv_sm4_reference.hwx", "sm4", false),
+            (5, 1, "conv_sm5_reference.hwx", "sm5", false),
+            (2, 2, "conv_smdw2_reference.hwx", "smdw2", false),
+            (3, 3, "conv_smdw3_reference.hwx", "smdw3", false),
+            (4, 4, "conv_smdw4_reference.hwx", "smdw4", false),
+            (5, 5, "conv_smdw5_reference.hwx", "smdw5", true),
+            (6, 6, "conv_smdw6_reference.hwx", "smdw6", true),
+            (3, 2, "conv_smpdw_reference.hwx", "smpdw", false),
         ] {
             let expect = std::fs::read(format!(
                 "{}/assets/{asset}",
@@ -3568,14 +3584,19 @@ mod tests {
                 })
                 .collect();
             let wrefs: Vec<&[u16]> = weights.iter().map(|w| w.as_slice()).collect();
+            let (mil, out) = if nested {
+                (
+                    format!("/tmp/dwmine/{case}/net.mil"),
+                    format!("/tmp/dwmine/{case}/out/net.macho/net.macho"),
+                )
+            } else {
+                (
+                    format!("/tmp/ane_sm/{case}/net.mil"),
+                    format!("/tmp/ane_sm/{case}/out/net.macho"),
+                )
+            };
             std::env::set_var("HWX_SIG_ANEC", "1");
-            let img = emit_conv_sm_n_dw(
-                layers,
-                &wrefs,
-                &format!("/tmp/ane_sm/{case}/net.mil"),
-                &format!("/tmp/ane_sm/{case}/out/net.macho"),
-            )
-            .unwrap();
+            let img = emit_conv_sm_n_dw(layers, &wrefs, &mil, &out).unwrap();
             std::env::remove_var("HWX_SIG_ANEC");
             let diffs: Vec<usize> = (0..expect.len().min(img.len()))
                 .filter(|&i| img[i] != expect[i])
@@ -3597,16 +3618,18 @@ mod tests {
     fn conv_ln_chain_byte_identical() {
         let _g = SIG_LOCK.lock().unwrap();
         const SEEDS: [u32; 4] = [1, 0x5555, 0xaaaa, 0x3333];
-        for (layers, n_blobs, asset, case) in [
-            (1usize, 1usize, "conv_ln1_skeleton.hwx", "ln1"),
-            (2, 1, "conv_ln2_reference.hwx", "ln2"),
-            (3, 1, "conv_ln3_skeleton.hwx", "ln3"),
-            (4, 1, "conv_ln4_skeleton.hwx", "ln4"),
-            (5, 1, "conv_ln5_reference.hwx", "ln5"),
-            (6, 1, "conv_ln6_reference.hwx", "ln6"),
-            (2, 2, "conv_lndw2_reference.hwx", "lndw2"),
-            (3, 3, "conv_lndw3_reference.hwx", "lndw3"),
-            (4, 4, "conv_lndw4_reference.hwx", "lndw4"),
+        for (layers, n_blobs, asset, case, ramp) in [
+            (1usize, 1usize, "conv_ln1_skeleton.hwx", "ln1", false),
+            (2, 1, "conv_ln2_reference.hwx", "ln2", false),
+            (3, 1, "conv_ln3_skeleton.hwx", "ln3", false),
+            (4, 1, "conv_ln4_skeleton.hwx", "ln4", false),
+            (5, 1, "conv_ln5_reference.hwx", "ln5", false),
+            (6, 1, "conv_ln6_reference.hwx", "ln6", false),
+            (2, 2, "conv_lndw2_reference.hwx", "lndw2", false),
+            (3, 3, "conv_lndw3_reference.hwx", "lndw3", false),
+            (4, 4, "conv_lndw4_reference.hwx", "lndw4", false),
+            (5, 5, "conv_lndw5_reference.hwx", "lndw5", true),
+            (6, 6, "conv_lndw6_reference.hwx", "lndw6", true),
         ] {
             let expect = std::fs::read(format!(
                 "{}/assets/{asset}",
@@ -3618,20 +3641,28 @@ mod tests {
                     let j = i % n_blobs;
                     if n_blobs == 1 {
                         vec![0x3c00u16; 64 * 64]
+                    } else if ramp {
+                        // the lndw5/6 probes use the `j*0x5555` ramp
+                        (0..64u32 * 64).map(|e| (e + j as u32 * 0x5555) as u16).collect()
                     } else {
                         (0..64u32 * 64).map(|e| (e + SEEDS[j]) as u16).collect()
                     }
                 })
                 .collect();
             let wrefs: Vec<&[u16]> = weights.iter().map(|w| w.as_slice()).collect();
+            let (mil, out) = if ramp {
+                (
+                    format!("/tmp/dwmine/{case}/net.mil"),
+                    format!("/tmp/dwmine/{case}/out/net.macho/net.macho"),
+                )
+            } else {
+                (
+                    format!("/tmp/ane_ln/{case}/net.mil"),
+                    format!("/tmp/ane_ln/{case}/out/net.macho"),
+                )
+            };
             std::env::set_var("HWX_SIG_ANEC", "1");
-            let img = emit_conv_ln_n_dw(
-                layers,
-                &wrefs,
-                &format!("/tmp/ane_ln/{case}/net.mil"),
-                &format!("/tmp/ane_ln/{case}/out/net.macho"),
-            )
-            .unwrap();
+            let img = emit_conv_ln_n_dw(layers, &wrefs, &mil, &out).unwrap();
             std::env::remove_var("HWX_SIG_ANEC");
             let diffs: Vec<usize> = (0..expect.len().min(img.len()))
                 .filter(|&i| img[i] != expect[i])
