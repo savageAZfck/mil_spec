@@ -1680,13 +1680,19 @@ const SKELETON_CONV_SM3: &[u8] = include_bytes!("../assets/conv_sm3_skeleton.hwx
 /// conv-task descriptor hash in multi-stream programs (stream 0
 /// uses `K9419..` only when it is the program's sole stream). Mined
 /// from ANEC dw probes; ordinals beyond 5 need further mining.
-const KNAME_SM_DW: [&str; 6] = [
+const KNAME_SM_DW: [&str; 12] = [
     "KE3E0F4E952E53E653B75FE6AF44DD22939751A660FEF245DA535F7F503E9AC52",
     "K36F9FAA5AC1598F61E735E999A791F3AF94F26320DC08F4A47655BE0F56D009C",
     "K445C1528F57CD5C3F8981EF604408231AE7ABE5C085A6D3966F1B4E5B85CDB85",
     "K8352046B90FD96625782305C20104AE0C2A4CE2D9D985157FCA0FC20945A859E",
     "K85542F51A780FBCE6FF5BED1B91438097147F4C3080AD4F938E620367C9D2EA3",
     "K54AF82C5871EA2863186C5298F4A8364871F89349D053806768B5829341185D5",
+    "K0AA87BB51004D6284B7AE5CDA663CC8198C38BA3BF9D5C1154C5A348327EF014",
+    "KDB0CCC61329C942785BA98FF3791D13EE53D966FFDC7CD2A4A1C96AD69B6FBA6",
+    "K81BF0E9988805F7BAF6D3D574EC5CDE61B7C0F51AF4A235DE581EA539E2ABC66",
+    "K80C4CCDDB1B6B3E1E9D5B5AB255039AB8CA529A0CDB3591F69734D877EEB75D2",
+    "KEB1128FF3601A42210AE7DAB8F9EA0A9F0658244A7F78C002C028ABDF85B6037",
+    "K6502428E710051C8E12E86D0756DD39A411400A54AECA6D3F0528BD8FAAFAD8E",
 ];
 
 // Multi-task templates inside the sm3 `__text` section — section
@@ -1804,11 +1810,10 @@ pub fn emit_conv_sm_n_dw(
             }
         }
     }
-    if streams.len() > KNAME_SM_DW.len() {
+    if streams.len() > 6 {
         return Err(format!(
-            "{} distinct softmax weight streams exceeds the mined kernel-name table ({})",
-            streams.len(),
-            KNAME_SM_DW.len()
+            "{} distinct softmax weight streams exceeds the verified table (6)",
+            streams.len()
         ));
     }
     let n_streams = streams.len();
@@ -2297,6 +2302,15 @@ const SKELETON_CONV_RMS1: &[u8] = include_bytes!("../assets/conv_rms1_skeleton.h
 const SKELETON_CONV_RMS2: &[u8] = include_bytes!("../assets/conv_rms2_skeleton.hwx");
 const SKELETON_CONV_RMS4: &[u8] = include_bytes!("../assets/conv_rms4_skeleton.hwx");
 const SKELETON_CONV_RMS5: &[u8] = include_bytes!("../assets/conv_rms5_skeleton.hwx");
+/// Extended-family skeletons — ANEC switches `(conv -> rms_norm)^k`
+/// depthwise programs to a 13-task-id-stride record with per-layer
+/// `__KERN_0` lanes (no weight-stream dedup) once `layers >= 5` and
+/// `distinct >= 2`. The 8-layer artifact supplies every task template
+/// except the terminal+marker aux3, which only occurs when `k % 3`
+/// leaves a partial trailing triple-group on the last layer — the
+/// 7-layer artifact provides it.
+const SKELETON_CONV_RMSX7: &[u8] = include_bytes!("../assets/conv_rmsdw7_skeleton.hwx");
+const SKELETON_CONV_RMSX8: &[u8] = include_bytes!("../assets/conv_rmsdw8_skeleton.hwx");
 
 /// Program header + record prologue.
 const RMS_PROG: (usize, usize) = (0x4000, 0x34);
@@ -2396,21 +2410,20 @@ pub fn emit_conv_rms_n_dw(
             }
         }
     }
+    // `layers >= 5` with more than one distinct weight stream selects
+    // the extended family: no dedup (one `__KERN_0` lane per layer),
+    // 13-id stride, wide aux3 schedule tables, a per-layer ramp table
+    // in the second `__TEXT` section, and ordinal-positioned kernel
+    // names. (Shared-weight chains — one distinct stream — stay on the
+    // compact path at any depth.)
+    if layers >= 5 && streams.len() > 1 {
+        return emit_conv_rms_xdw(layers, weights, mil_path, out_path);
+    }
     if streams.len() > KNAME_SM_DW.len() {
         return Err(format!(
             "{} distinct weight streams exceeds the mined kernel-name table ({})",
             streams.len(),
             KNAME_SM_DW.len()
-        ));
-    }
-    // aux3 carries a per-program schedule table that switches to an
-    // extended 0x220/0x160 form at ≥5 streams; that generated block is
-    // not yet decoded, so deep multi-stream RMS programs reject here.
-    if streams.len() > 4 {
-        return Err(format!(
-            "{} distinct weight streams exceeds the decoded aux3 \
-             schedule-table family (4)",
-            streams.len()
         ));
     }
     let n_streams = streams.len();
@@ -2714,6 +2727,343 @@ pub fn emit_conv_rms_n_dw(
             0x153 + 0xa8 * (layers as u32 - 2)
         },
     );
+    Ok(img)
+}
+
+/// `__text` section (file offset, size) of a multi-section skeleton —
+/// the second entry of the third segment command (fixed head offset
+/// `0x1e0` on the conv/rms chain families).
+fn xtext_bounds(skel: &[u8]) -> (usize, usize) {
+    let s = 0x1e0usize;
+    let off = u32::from_le_bytes(skel[s + 0x30..s + 0x34].try_into().unwrap()) as usize;
+    let size = u32::from_le_bytes(skel[s + 0x28..s + 0x2c].try_into().unwrap()) as usize;
+    (off, size)
+}
+
+/// Task-descriptor head offsets inside an extended-family `__text`.
+/// Every task head is `XX 00 40 15 c0 ff 40 02` and the first sits at
+/// `0x32`; tasks are emitted four per layer (conv, aux1, aux2, aux3).
+fn xtask_starts(text: &[u8]) -> Vec<usize> {
+    let pat = [0x40u8, 0x15, 0xc0, 0xff, 0x40, 0x02];
+    let mut v = Vec::new();
+    let mut i = 0x32usize;
+    while let Some(p) = text[i..].windows(6).position(|w| w == pat) {
+        v.push(i + p - 2);
+        i += p + 6;
+    }
+    v
+}
+
+/// Extended multi-lane `(conv -> rms_norm)^k` depthwise family —
+/// `layers >= 5` with ≥2 distinct weight streams. ANEC drops weight
+/// deduplication entirely: layer `i` binds `__KERN_0` lane `i` keyed
+/// by the ordinal-position kernel name `KNAME_SM_DW[i]`, the record
+/// runs on a 13-task-id stride, aux3 carries a wide schedule table
+/// (four forms: interior `0x220`, marker `0x230`, terminal `0x23a`,
+/// terminal+marker `0x24a`), and the second `__TEXT` section grows to
+/// `0x40 + 0x100*layers` holding a constant ramp lane per layer. The
+/// record is stream-content-invariant — the task bytes depend only on
+/// the layer count.
+///
+/// Marker rule: a layer is "marked" iff `i == 3*floor(layers/3)` and
+/// `layers % 3 != 0` — the first layer of the trailing partial
+/// triple-group. Marked layers patch aux2 (`+0x18a`=0x44, `+0x1c0`=0x39,
+/// task-rel) and select the wide aux3 forms.
+fn emit_conv_rms_xdw(
+    layers: usize,
+    weights: &[&[u16]],
+    mil_path: &str,
+    out_path: &str,
+) -> Result<Vec<u8>, String> {
+    const C: usize = 64;
+    if layers > KNAME_SM_DW.len() {
+        return Err(format!(
+            "{layers} layers exceeds the mined ordinal kernel-name table ({})",
+            KNAME_SM_DW.len()
+        ));
+    }
+    let skel = SKELETON_CONV_RMSX8;
+    let (toff8, tsz8) = xtext_bounds(skel);
+    let text8 = &skel[toff8..toff8 + tsz8];
+    let (toff7, tsz7) = xtext_bounds(SKELETON_CONV_RMSX7);
+    let text7 = &SKELETON_CONV_RMSX7[toff7..toff7 + tsz7];
+    let st8 = xtask_starts(text8);
+    let st7 = xtask_starts(text7);
+    debug_assert_eq!(st8.len(), 32);
+    debug_assert_eq!(st7.len(), 28);
+
+    // Emitted slice of a donor task — the 2-byte head (`05 00`/`01 00`)
+    // is carried by the preceding slice's tail (or the prologue for
+    // task 0), so slices run `[start+2, next_start+2)`; the program's
+    // last task has no successor and emits body-only.
+    let task = |text: &[u8], st: &[usize], t: usize| -> Vec<u8> {
+        let s = st[t];
+        let e = if t + 1 < st.len() { st[t + 1] + 2 } else { text.len() };
+        text[s + 2..e].to_vec()
+    };
+
+    let (x_entries, x_relocs) = tail_meta(skel);
+    let rflag: [u8; 4] = x_relocs[0][4..8].try_into().unwrap();
+
+    let mut stream = text8[..0x34].to_vec();
+    let mut reloc_offs = Vec::with_capacity(4 * layers + 1);
+    let mk = 3 * (layers / 3);
+
+    for i in 0..layers {
+        let last = i + 1 == layers;
+        let marked = mk < layers && i == mk;
+
+        // conv — layer 0 keeps the input-DMA prologue form; interior
+        // layers carry no stream binding at all in this family
+        let co = stream.len() - 0x34 + 4;
+        if i == 0 {
+            stream.extend_from_slice(&task(text8, &st8, 0));
+            reloc_offs.push(co + 0x14c);
+        } else {
+            let mut t = task(text8, &st8, 4);
+            patch_task_column(&mut t, (13 * i) as u16, 16);
+            put_u16(&mut t, 0x06, (13 * i + 1) as u16);
+            put_u16(&mut t, 0x125, (0x20 * i + 1) as u16);
+            put_u16(&mut t, 0x12c, (13 * i + 1) as u16);
+            put_u16(&mut t, 0x1ac, (13 * i + 2) as u16);
+            put_u16(&mut t, 0x22c, (13 * i + 3) as u16);
+            put_u16(&mut t, 0x2ac, (13 * i + 4) as u16);
+            if last {
+                // `00 05` writeback tags → `80 04`
+                put_u16(&mut t, 0x21c, 0x0480);
+                put_u16(&mut t, 0x288, 0x0480);
+                put_u16(&mut t, 0x294, 0x0480);
+            }
+            stream.extend_from_slice(&t);
+            reloc_offs.push(co + 0x124);
+        }
+
+        // aux1 — single 0x1f0 form; terminal adds release descriptors
+        let co = stream.len() - 0x34 + 4;
+        let mut t = task(text8, &st8, 5);
+        patch_task_column(&mut t, (13 * i + 4) as u16, 17);
+        put_u16(&mut t, 0x06, (13 * i + 5) as u16);
+        put_u16(&mut t, 0xcc, (13 * i + 5) as u16);
+        put_u16(&mut t, 0x14c, (13 * i + 6) as u16);
+        put_u16(&mut t, 0x1cc, (13 * i + 7) as u16);
+        if last {
+            put_u16(&mut t, 0x94, 0x0480);
+            put_u16(&mut t, 0xa0, 0x0490);
+            put_u16(&mut t, 0x130, 0x0490);
+        }
+        stream.extend_from_slice(&t);
+        reloc_offs.push(co + 0xb8);
+
+        // aux2 — marker layers re-tag the aux3 lane producers
+        let co = stream.len() - 0x34 + 4;
+        let mut t = task(text8, &st8, 6);
+        patch_task_column(&mut t, (13 * i + 7) as u16, 17);
+        put_u16(&mut t, 0x06, (13 * i + 8) as u16);
+        put_u16(&mut t, 0xbc, (13 * i + 8) as u16);
+        put_u16(&mut t, 0x13c, (13 * i + 9) as u16);
+        put_u16(&mut t, 0x1bc, (13 * i + 10) as u16);
+        if marked {
+            t[0x188] = 0x44;
+            t[0x1be] = 0x39;
+        }
+        if last {
+            for o in [0x8cusize, 0x94, 0x120, 0x124, 0x128, 0x1a4, 0x1a8] {
+                put_u16(&mut t, o, 0x0480);
+            }
+        }
+        stream.extend_from_slice(&t);
+        reloc_offs.push(co + 0xac);
+
+        // aux3 — four structural forms; interior emits `13i+13` (the
+        // next layer's producer), terminal forms carry no emit id
+        let co = stream.len() - 0x34 + 4;
+        let (mut t, roff) = match (last, marked) {
+            (false, false) => (task(text8, &st8, 7), 0xb4usize),
+            (false, true) => (task(text8, &st8, 27), 0xb8),
+            (true, false) => (task(text8, &st8, 31), 0xb4),
+            (true, true) => (task(text7, &st7, 27), 0xb8),
+        };
+        patch_task_column(&mut t, (13 * i + 10) as u16, 17);
+        put_u16(&mut t, 0x06, (13 * i + 11) as u16);
+        match (last, marked) {
+            (false, false) => {
+                put_u16(&mut t, 0xbc, (13 * i + 11) as u16);
+                put_u16(&mut t, 0x13c, (13 * i + 12) as u16);
+                put_u16(&mut t, 0x1e1, i as u16);
+                put_u16(&mut t, 0x1ee, (13 * i + 12) as u16);
+                put_u16(&mut t, 0x1fc, (13 * i + 13) as u16);
+            }
+            (false, true) => {
+                put_u16(&mut t, 0xcc, (13 * i + 11) as u16);
+                put_u16(&mut t, 0x14c, (13 * i + 12) as u16);
+                put_u16(&mut t, 0x1f1, i as u16);
+                put_u16(&mut t, 0x1fe, (13 * i + 12) as u16);
+                put_u16(&mut t, 0x20c, (13 * i + 13) as u16);
+            }
+            (true, false) => {
+                put_u16(&mut t, 0xbc, (13 * i + 11) as u16);
+                put_u16(&mut t, 0x13c, (13 * i + 12) as u16);
+                put_u16(&mut t, 0x202, (13 * i + 12) as u16);
+                put_u16(&mut t, 0x215, i as u16);
+                put_u16(&mut t, 0x22e, (13 * i + 12) as u16);
+                // trailing byte is a `01` tag, not the id high byte
+                t[0x236] = (13 * i + 12) as u8;
+            }
+            (true, true) => {
+                put_u16(&mut t, 0xcc, (13 * i + 11) as u16);
+                put_u16(&mut t, 0x14c, (13 * i + 12) as u16);
+                put_u16(&mut t, 0x212, (13 * i + 12) as u16);
+                put_u16(&mut t, 0x225, i as u16);
+                put_u16(&mut t, 0x23e, (13 * i + 12) as u16);
+                t[0x246] = (13 * i + 12) as u8;
+            }
+        }
+        stream.extend_from_slice(&t);
+        reloc_offs.push(co + roff);
+    }
+
+    let relocs: Vec<[u8; 8]> = reloc_offs
+        .iter()
+        .map(|&o| {
+            let mut e = [0u8; 8];
+            e[..4].copy_from_slice(&(o as u32 + 0x30).to_le_bytes());
+            e[4..].copy_from_slice(&rflag);
+            e
+        })
+        .collect();
+
+    // The second `__TEXT` section holds a `0x40`-byte `00 1c` header
+    // then one `0x100` lane per layer — `0x80` zeros plus a constant
+    // u16 ramp `0x1234..0x1273`. The symtab names each lane `TT<out>`
+    // after the layer's output tensor (s{i+2} .. z by corpus
+    // convention).
+    let section_size = stream.len();
+    let aligned = (section_size + 0x3f) & !0x3f;
+    let sec2_addr = 0x3000_8000u64 + aligned as u64;
+    let sec2_size = 0x40u32 + 0x100 * layers as u32;
+    let kern_addr = (sec2_addr + sec2_size as u64 + 0x3fff) & !0x3fff;
+    let kern_payload = 0x100 + 0x2000 * layers;
+    let kern_vsz = (kern_payload + 0x3fff) & !0x3fff;
+    let stream_off = |o: usize| if o == 0 { 0 } else { 0x100 + 0x2000 * o };
+
+    // symtab — [fl, x, z] + per-lane ne_0 (lane 0 trails the two
+    // `_actlut` names) + per-layer `TT` lane descriptors + per-lane
+    // ne_1..ne_15 groups (bare LUT names trail lane 0) + scalars.
+    let mut e = Vec::with_capacity(17 * layers + 32);
+    e.push(x_entries[0].clone());
+    e.push(x_entries[1].clone());
+    e.push(x_entries[2].clone());
+    e[0].4 = sec2_addr;
+    let tpl0 = x_entries[3].clone();
+    let ttt = x_entries[13].clone();
+    let tpln = x_entries[21].clone();
+    for j in 0..layers {
+        e.push((
+            format!("{}_ne_0", KNAME_SM_DW[j]),
+            tpl0.1,
+            tpl0.2,
+            tpl0.3,
+            kern_addr + stream_off(j) as u64,
+        ));
+        if j == 0 {
+            e.push((x_entries[4].0.clone(), tpl0.1, tpl0.2, tpl0.3, kern_addr + 0x2000));
+            e.push((x_entries[5].0.clone(), tpl0.1, tpl0.2, tpl0.3, kern_addr + 0x2080));
+        }
+    }
+    for j in 0..layers {
+        let nm = if j + 1 == layers {
+            "z".to_string()
+        } else {
+            format!("s{}", j + 2)
+        };
+        e.push((
+            format!("TT{nm}_ew_to_goc_xfm_1_fuse_goc_const_xfm_0"),
+            ttt.1,
+            ttt.2,
+            ttt.3,
+            sec2_addr + 0x40 + 0x100 * j as u64,
+        ));
+    }
+    for j in 0..layers {
+        for b in 1..16u64 {
+            e.push((
+                format!("{}_ne_{b}", KNAME_SM_DW[j]),
+                tpln.1,
+                tpln.2,
+                tpln.3,
+                kern_addr + stream_off(j) as u64 + 0x200 * b,
+            ));
+        }
+        if j == 0 {
+            e.push((x_entries[36].0.clone(), tpln.1, tpln.2, tpln.3, kern_addr + 0x2080));
+            e.push((x_entries[37].0.clone(), tpln.1, tpln.2, tpln.3, kern_addr + 0x2100));
+        }
+    }
+    e.extend_from_slice(&x_entries[x_entries.len() - 25..]);
+
+    let (mut img, text_off) = build_tail_at(
+        skel,
+        CONV_TAIL_OFF,
+        &e,
+        &relocs,
+        mil_path,
+        out_path,
+    );
+    // `__KERN_0` file offset mirrors the vmaddr delta — the next
+    // 0x4000 page past the end of the second `__TEXT` section.
+    let kern_off = text_off + (kern_addr - 0x3000_8000) as usize;
+    img.extend_from_slice(&stream);
+    img.resize(kern_off + kern_vsz, 0);
+    img[text_off + aligned + 1] = 0x1c;
+    for j in 0..layers {
+        let lane = text_off + aligned + 0x40 + 0x100 * j + 0x80;
+        for k in 0..64u16 {
+            img[lane + 2 * k as usize..lane + 2 * k as usize + 2]
+                .copy_from_slice(&(0x1234u16 + k).to_le_bytes());
+        }
+    }
+    for (j, w) in weights.iter().enumerate() {
+        let inter = weight_interleave(w, C);
+        for b in 0..16usize {
+            let base = kern_off + stream_off(j) + b * 0x200;
+            for (i, v) in inter[b * 256..b * 256 + 256].iter().enumerate() {
+                img[base + i * 2..base + i * 2 + 2]
+                    .copy_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
+    // div/recip LUT tail on lane 0
+    img[kern_off + 0x2000..kern_off + 0x2100]
+        .copy_from_slice(&skel[0x12000..0x12100]);
+
+    // scalars — the `__text` segment spans through `__KERN_0`'s
+    // page-aligned file offset
+    let seg_span = kern_off - text_off;
+    put_u32(&mut img, 0x1b8, seg_span as u32);
+    put_u32(&mut img, 0x1c8, seg_span as u32);
+    put_u32(&mut img, 0x1c0, text_off as u32);
+    put_u32(&mut img, 0x208, section_size as u32);
+    put_u32(&mut img, 0x210, text_off as u32);
+    put_u32(&mut img, 0x21c, (4 * layers) as u32);
+    put_u32(&mut img, 0x250, sec2_addr as u32);
+    put_u32(&mut img, 0x258, sec2_size);
+    put_u32(&mut img, 0x260, (text_off + aligned) as u32);
+    put_u32(&mut img, 0x298, kern_addr as u32);
+    put_u32(&mut img, 0x2a0, kern_vsz as u32);
+    put_u32(&mut img, 0x2a8, kern_off as u32);
+    put_u32(&mut img, 0x2b0, kern_vsz as u32);
+    put_u32(&mut img, 0x2e8, kern_addr as u32);
+    img[0x2f0..0x2f8].copy_from_slice(&(kern_payload as u64).to_le_bytes());
+    put_u32(&mut img, 0x2f8, kern_off as u32);
+    put_u32(&mut img, 0x378, sec2_addr as u32);
+    put_u32(&mut img, 0x3d8, kern_addr as u32);
+    put_u32(
+        &mut img,
+        0xb7c,
+        0x220 + (section_size as u32 - 0x880) / 4,
+    );
+    put_u32(&mut img, 0xb88, 13 * layers as u32);
+    put_u32(&mut img, 0xbb8, 0x3 + 0xb6 * layers as u32);
     Ok(img)
 }
 
@@ -4555,6 +4905,78 @@ mod tests {
                 diffs.first().copied().unwrap_or(0)
             );
         }
+    }
+
+    /// Extended rms-norm family (`layers >= 5 && distinct >= 2`): one
+    /// `__KERN_0` lane per layer with no dedup, 13-id stride, wide
+    /// aux3 schedule tables with the marker lane at layer `3*(k/3)`.
+    /// Covers k=5..12 (interior/terminal x marker forms, ordinals up
+    /// to 11) plus partial-dup and true-dup stream patterns.
+    #[test]
+    fn conv_rms_extended_byte_identical() {
+        let _g = SIG_LOCK.lock().unwrap();
+        // probe weight generators, by blob index `j`
+        let pat = |p: u8, j: u32, e: u32| -> u16 {
+            match p {
+                b'A' => (j.wrapping_mul(0x5555) + e) as u16,
+                b'B' => ((((j + 1) * 0x5555 + e) & 0xffff) & 0x3bff) as u16,
+                b'C' => (0x3c00 + ((j * 37 + e * 7) & 0x3ff)) as u16,
+                _ => (0x3c00 + (((j + 1) * 37 + e * 7) & 0x3ff)) as u16,
+            }
+        };
+        let seq = |k: usize| (0..k).collect::<Vec<_>>();
+        for (asset, case, p, blobs, nested) in [
+            ("conv_rmsdw5_reference.hwx", "rmsdw5", b'A', seq(5), true),
+            ("conv_rmsdw6_reference.hwx", "rmsdw6", b'A', seq(6), true),
+            ("conv_rmsdw7_skeleton.hwx", "rmsdw7", b'B', seq(7), false),
+            ("conv_rmsdw8_skeleton.hwx", "rmsdw8", b'B', seq(8), false),
+            ("conv_rmsdw9_reference.hwx", "rmsdw9", b'D', seq(9), false),
+            ("conv_rmsdw10_reference.hwx", "rmsdw10", b'D', seq(10), false),
+            ("conv_rmsdw11_reference.hwx", "rmsdw11", b'C', seq(11), false),
+            ("conv_rmsdw12_reference.hwx", "rmsdw12", b'C', seq(12), false),
+            ("conv_rmspdw5_2_reference.hwx", "rmspdw5_2", b'C', vec![0, 1, 0, 1, 0], false),
+            ("conv_rmspdw6_4_reference.hwx", "rmspdw6_4", b'C', vec![0, 1, 2, 3, 0, 1], false),
+        ] {
+            let expect = std::fs::read(format!(
+                "{}/assets/{asset}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap();
+            let weights: Vec<Vec<u16>> = blobs
+                .iter()
+                .map(|&j| (0..64u32 * 64).map(|e| pat(p, j as u32, e)).collect())
+                .collect();
+            let wrefs: Vec<&[u16]> = weights.iter().map(|w| w.as_slice()).collect();
+            let out = if nested {
+                format!("/tmp/dwmine/{case}/out/net.macho/net.macho")
+            } else {
+                format!("/tmp/dwmine/{case}/out/net.macho")
+            };
+            std::env::set_var("HWX_SIG_ANEC", "1");
+            let img = emit_conv_rms_n_dw(
+                blobs.len(),
+                &wrefs,
+                &format!("/tmp/dwmine/{case}/net.mil"),
+                &out,
+            )
+            .unwrap();
+            std::env::remove_var("HWX_SIG_ANEC");
+            let diffs: Vec<usize> = (0..expect.len().min(img.len()))
+                .filter(|&i| img[i] != expect[i])
+                .collect();
+            assert!(
+                diffs.is_empty() && img.len() == expect.len(),
+                "{case}: {} diffs, first at {:#x}",
+                diffs.len(),
+                diffs.first().copied().unwrap_or(0)
+            );
+        }
+        // beyond the mined ordinal table: clear error, no bad bytes
+        let (w0, w1) = (vec![0u16; 64 * 64], vec![1u16; 64 * 64]);
+        let many: Vec<&[u16]> = (0..13)
+            .map(|i| if i % 2 == 0 { w0.as_slice() } else { w1.as_slice() })
+            .collect();
+        assert!(emit_conv_rms_n_dw(13, &many, "/tmp/x.mil", "/tmp/x.out").is_err());
     }
 
     /// The fused two-elementwise-op family must likewise reproduce
