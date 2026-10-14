@@ -31,6 +31,12 @@ const SKELETON_CONV64S1: &[u8] = include_bytes!("../assets/conv64s1_skeleton.hwx
 const SKELETON_CONV64S5: &[u8] = include_bytes!("../assets/conv64s5_skeleton.hwx");
 const SKELETON_CONV64S8: &[u8] = include_bytes!("../assets/conv64s8p_skeleton.hwx");
 const SKELETON_CONV128: &[u8] = include_bytes!("../assets/conv128_skeleton.hwx");
+/// `W=8` convs at other channel counts — the record program and the
+/// `__KERN_0` band layout both vary with `C` (`C=16` packs sixteen
+/// weight bands at a `0x20`-u16 stride; `C>=32` is contiguous).
+const SKELETON_CONV16S8: &[u8] = include_bytes!("../assets/conv16s8_skeleton.hwx");
+const SKELETON_CONV32S8: &[u8] = include_bytes!("../assets/conv32s8_skeleton.hwx");
+const SKELETON_CONV128S8: &[u8] = include_bytes!("../assets/conv128s8_skeleton.hwx");
 
 /// Square-matmul skeletons: `z = matmul(x, w, transpose_y)` over fp16
 /// `[1,N,1,N]` with a `[1,N,1,N]` constant weight, h16. Unlike conv,
@@ -39,6 +45,7 @@ const SKELETON_CONV128: &[u8] = include_bytes!("../assets/conv128_skeleton.hwx")
 /// `conv64s1` + `sigmoid` chain reference (ones weights): `__KERN_0`
 /// carries sixteen `0x280`-byte bands of `[0x80 LUT][0x200 weights]`.
 const SKELETON_CONV64_SIG: &[u8] = include_bytes!("../assets/conv64_sig_skeleton.hwx");
+const SKELETON_MM16: &[u8] = include_bytes!("../assets/mm16_skeleton.hwx");
 const SKELETON_MM32: &[u8] = include_bytes!("../assets/mm32_skeleton.hwx");
 const SKELETON_MM64: &[u8] = include_bytes!("../assets/mm64_skeleton.hwx");
 const SKELETON_MM128: &[u8] = include_bytes!("../assets/mm128_skeleton.hwx");
@@ -690,6 +697,12 @@ pub enum ConvShape {
     C64W8,
     /// `[1,128,1,1]` in, `[128,128,1,1]` weight.
     C128W1,
+    /// `[1,16,8,1]` in, `[16,16,1,1]` weight.
+    C16W8,
+    /// `[1,32,8,1]` in, `[32,32,1,1]` weight.
+    C32W8,
+    /// `[1,128,8,1]` in, `[128,128,1,1]` weight.
+    C128W8,
 }
 
 impl ConvShape {
@@ -699,6 +712,9 @@ impl ConvShape {
             ConvShape::C32W1 => 32,
             ConvShape::C64W1 | ConvShape::C64W5 | ConvShape::C64W8 => 64,
             ConvShape::C128W1 => 128,
+            ConvShape::C16W8 => 16,
+            ConvShape::C32W8 => 32,
+            ConvShape::C128W8 => 128,
         }
     }
 
@@ -709,6 +725,9 @@ impl ConvShape {
             ConvShape::C64W5 => SKELETON_CONV64S5,
             ConvShape::C64W8 => SKELETON_CONV64S8,
             ConvShape::C128W1 => SKELETON_CONV128,
+            ConvShape::C16W8 => SKELETON_CONV16S8,
+            ConvShape::C32W8 => SKELETON_CONV32S8,
+            ConvShape::C128W8 => SKELETON_CONV128S8,
         }
     }
 }
@@ -904,9 +923,19 @@ pub fn emit_conv1x1(
     let mut img = rebuild_tail_at(skel, CONV_TAIL_OFF, &entries, &relocs, mil_path, out_path);
 
     let stream = weight_interleave(weights, c);
-    for (i, v) in stream.iter().enumerate() {
-        img[CONV_WEIGHTS_OFF + i * 2..CONV_WEIGHTS_OFF + i * 2 + 2]
-            .copy_from_slice(&v.to_le_bytes());
+    if c == 16 {
+        // C=16 pads each 16-wide band to a 0x20-u16 stride
+        for b in 0..16usize {
+            for (i, v) in stream[b * 16..b * 16 + 16].iter().enumerate() {
+                let off = CONV_WEIGHTS_OFF + b * 0x40 + i * 2;
+                img[off..off + 2].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+    } else {
+        for (i, v) in stream.iter().enumerate() {
+            img[CONV_WEIGHTS_OFF + i * 2..CONV_WEIGHTS_OFF + i * 2 + 2]
+                .copy_from_slice(&v.to_le_bytes());
+        }
     }
     Ok(img)
 }
@@ -2691,6 +2720,9 @@ pub fn emit_conv_rms_n_dw(
 /// Matmul shape families with a captured skeleton.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MmShape {
+    /// `[1,16,1,16]` operands — sub-tile family: the const pool
+    /// holds sixteen `0x40`-byte bands of `[0x20 weights][0x20 pad]`.
+    N16,
     /// `[1,32,1,32]` operands.
     N32,
     /// `[1,64,1,64]` operands.
@@ -2705,6 +2737,7 @@ impl MmShape {
     /// Operand width `N`.
     pub fn n(self) -> usize {
         match self {
+            MmShape::N16 => 16,
             MmShape::N32 => 32,
             MmShape::N64 => 64,
             MmShape::N128 => 128,
@@ -2714,6 +2747,7 @@ impl MmShape {
 
     fn skeleton(self) -> &'static [u8] {
         match self {
+            MmShape::N16 => SKELETON_MM16,
             MmShape::N32 => SKELETON_MM32,
             MmShape::N64 => SKELETON_MM64,
             MmShape::N128 => SKELETON_MM128,
@@ -2875,8 +2909,16 @@ pub fn emit_matmul(
     let mut img = rebuild_tail_at(skel, MM_TAIL_OFF, &entries, &relocs, mil_path, out_path);
 
     let off = shape.weights_off();
-    for (i, v) in weights.iter().enumerate() {
-        img[off + i * 2..off + i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+    if shape == MmShape::N16 {
+        // sub-tile pool: 16 weights per 0x40-byte band
+        for (i, v) in weights.iter().enumerate() {
+            let o = off + (i / 16) * 0x40 + (i % 16) * 2;
+            img[o..o + 2].copy_from_slice(&v.to_le_bytes());
+        }
+    } else {
+        for (i, v) in weights.iter().enumerate() {
+            img[off + i * 2..off + i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+        }
     }
     Ok(img)
 }
@@ -3081,6 +3123,9 @@ pub fn emit_from_mil(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> 
                 (64, 5) => ConvShape::C64W5,
                 (64, 8) => ConvShape::C64W8,
                 (128, 1) => ConvShape::C128W1,
+                (16, 8) => ConvShape::C16W8,
+                (32, 8) => ConvShape::C32W8,
+                (128, 8) => ConvShape::C128W8,
                 _ => return Err(format!("conv shape {:?} not on a skeleton family", o.shape)),
             };
             return emit_conv1x1(shape, &weights_of(o)?, mil_path, out_path);
@@ -3166,6 +3211,7 @@ pub fn emit_from_mil(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> 
         if let Some(path) = blob_of(&y) {
             let n = ops[0].shape.get(1).copied().unwrap_or(0) as usize;
             let shape = match n {
+                16 => MmShape::N16,
                 32 => MmShape::N32,
                 64 => MmShape::N64,
                 128 => MmShape::N128,
@@ -3312,23 +3358,54 @@ mod tests {
     #[test]
     fn conv1x1_byte_identical() {
         let _g = SIG_LOCK.lock().unwrap();
-        for (shape, case) in [
-            (ConvShape::C32W1, "conv32p"),
-            (ConvShape::C64W1, "conv64p"),
-            (ConvShape::C64W5, "conv64s5p"),
-            (ConvShape::C64W8, "conv64s8p"),
-            (ConvShape::C128W1, "conv128p"),
+        for (shape, case, weights, rel) in [
+            (ConvShape::C32W1, "conv32p", vec![0u16; 0], false),
+            (ConvShape::C64W1, "conv64p", vec![0u16; 0], false),
+            (ConvShape::C64W5, "conv64s5p", vec![0u16; 0], false),
+            (ConvShape::C64W8, "conv64s8p", vec![0u16; 0], false),
+            (ConvShape::C128W1, "conv128p", vec![0u16; 0], false),
+            // fp16 ramp weights (`conv_ramp` corpus case)
+            (
+                ConvShape::C16W8,
+                "conv_ramp",
+                (0..256u32)
+                    .map(|i| half::f16::from_f32((i as f32 - 4.0).max(0.0)).to_bits())
+                    .collect(),
+                false,
+            ),
+            // perm weights; refs embed relative sig paths
+            (
+                ConvShape::C32W8,
+                "conv_perm32",
+                (0..1024u32).map(|i| (i as u16).saturating_sub(4)).collect(),
+                true,
+            ),
+            (
+                ConvShape::C128W8,
+                "conv_perm128",
+                (0..16384u32).map(|i| (i as u16).saturating_sub(4)).collect(),
+                true,
+            ),
         ] {
             let c = shape.channels();
-            let weights: Vec<u16> = (0..(c * c) as u16).collect();
+            let weights = if weights.is_empty() {
+                (0..(c * c) as u16).collect::<Vec<u16>>()
+            } else {
+                weights
+            };
+            let (mil, out) = if rel {
+                (
+                    format!("{case}/net.mil"),
+                    format!("{case}/out/net.macho"),
+                )
+            } else {
+                (
+                    format!("/tmp/ane_corpus/{case}/net.mil"),
+                    format!("/tmp/ane_corpus/{case}/out/net.macho"),
+                )
+            };
             std::env::set_var("HWX_SIG_ANEC", "1");
-            let img = emit_conv1x1(
-                shape,
-                &weights,
-                &format!("/tmp/ane_corpus/{case}/net.mil"),
-                &format!("/tmp/ane_corpus/{case}/out/net.macho"),
-            )
-            .unwrap();
+            let img = emit_conv1x1(shape, &weights, &mil, &out).unwrap();
             std::env::remove_var("HWX_SIG_ANEC");
             let expect = std::fs::read(format!(
                 "{}/assets/{case}_reference.hwx",
@@ -3815,9 +3892,20 @@ mod tests {
     #[test]
     fn matmul_byte_identical() {
         let _g = SIG_LOCK.lock().unwrap();
-        for (shape, case) in [(MmShape::N32, "mm32p"), (MmShape::N64, "mm64p")] {
+        for (shape, case, ramp) in [
+            (MmShape::N16, "mm_ramp16", true),
+            (MmShape::N32, "mm32p", false),
+            (MmShape::N64, "mm64p", false),
+        ] {
             let n = shape.n();
-            let weights: Vec<u16> = (0..(n * n) as u16).collect();
+            // `mm_ramp16` weights are an fp16 ramp after a 4-element pad
+            let weights: Vec<u16> = if ramp {
+                (0..n * n)
+                    .map(|i| half::f16::from_f32((i as f32 - 4.0).max(0.0)).to_bits())
+                    .collect()
+            } else {
+                (0..(n * n) as u16).collect()
+            };
             std::env::set_var("HWX_SIG_ANEC", "1");
             let img = emit_matmul(
                 shape,
