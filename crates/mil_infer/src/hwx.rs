@@ -2714,6 +2714,262 @@ pub fn emit_matmul(
     Ok(img)
 }
 
+// ---------------------------------------------------------------------------
+// MIL-driven dispatch — `milc compile --target ane --emit-hwx`.
+// ---------------------------------------------------------------------------
+
+/// A compute op extracted from MIL text: op type, result shape, and
+/// the operand names we inspect (`x`/`y`/`weight`).
+struct MilOp {
+    op: String,
+    shape: Vec<i64>,
+    args: Vec<(String, String)>,
+}
+
+/// Scan MIL text for compute ops (non-`const` declarations of the
+/// form `tensor<dtype, [shape]> name = op(arg = operand, ...)`) and
+/// blob-const bindings (`name = const()[..BLOBFILE(path = string("P"))]`).
+fn mil_ops(text: &str) -> (Vec<MilOp>, Vec<(String, String)>) {
+    let mut ops = Vec::new();
+    let mut blobs = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        let Some(eq) = line.find(" = ") else { continue };
+        let (lhs, rhs) = line.split_at(eq);
+        let rhs = &rhs[3..];
+        const BLOB_PFX: &str = "BLOBFILE(path = string(\"";
+        if let Some(blob_pos) = rhs.find(BLOB_PFX) {
+            if let Some(name) = lhs.rsplit(' ').next() {
+                let rest = &rhs[blob_pos + BLOB_PFX.len()..];
+                if let Some(end) = rest.find('"') {
+                    blobs.push((name.to_string(), rest[..end].to_string()));
+                }
+            }
+            continue;
+        }
+        let Some(paren) = rhs.find('(') else { continue };
+        let op = rhs[..paren].trim();
+        if !op.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || op == "const"
+            || !line.contains("tensor<")
+        {
+            continue;
+        }
+        let shape = lhs
+            .find('[')
+            .and_then(|l| lhs.find(']').map(|r| (l, r)))
+            .map(|(l, r)| {
+                lhs[l + 1..r]
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<i64>().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let arg_str = &rhs[paren + 1..rhs.rfind(')').unwrap_or(rhs.len())];
+        let args = arg_str
+            .split(',')
+            .filter_map(|a| {
+                let (k, v) = a.split_once('=')?;
+                Some((k.trim().to_string(), v.trim().to_string()))
+            })
+            .collect();
+        ops.push(MilOp {
+            op: op.to_string(),
+            shape,
+            args,
+        });
+    }
+    (ops, blobs)
+}
+
+/// Load the `u16` payload of a weight blob — deadbeef-headered blobs
+/// carry data at byte 128; bare files are read from offset 0.
+fn load_blob_u16(path: &std::path::Path) -> Result<Vec<u16>, String> {
+    let b = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let off = if b.len() > 132 && &b[64..68] == b"\xef\xbe\xad\xde" {
+        128
+    } else {
+        0
+    };
+    Ok(b[off..]
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect())
+}
+
+/// Resolve a `BLOBFILE` path — `@model_path/` prefixes and relative
+/// paths resolve against the MIL's directory.
+fn resolve_blob<'a>(mil_dir: &'a std::path::Path, p: &'a str) -> std::path::PathBuf {
+    let p = p.strip_prefix("@model_path/").unwrap_or(p);
+    let pb = std::path::PathBuf::from(p);
+    if pb.is_absolute() {
+        pb
+    } else {
+        mil_dir.join(pb)
+    }
+}
+
+/// Emit a complete HWX image for a MIL program on a covered skeleton
+/// family — the dispatch behind `milc compile --target ane --emit-hwx`.
+/// Matches the op sequence against every verified family and loads
+/// `BLOBFILE` weights itself; the returned bytes embed `mil_path` /
+/// `out_path` in the signature block.
+///
+/// Covered: `conv1x1` (C=32/64/128, spatial 1/5/8), single `add`/`mul`/
+/// `sub`/`sigmoid`/`tanh`, const-weight `matmul` (N=32..256),
+/// activation `matmul` and its fused `softmax`/`add`/`mul` partitions
+/// (`[1,64,1,64]` and `[1,8,64,64]`), and arbitrary-depth
+/// `conv -> {sigmoid|tanh|relu|gelu|silu|softmax|layer_norm|rms_norm}`
+/// chains (C=64) with shared/distinct/partially-deduplicated weights.
+pub fn emit_from_mil(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> {
+    let text = std::fs::read_to_string(mil_path).map_err(|e| format!("{mil_path}: {e}"))?;
+    let mil_dir = std::path::Path::new(mil_path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+    let (ops, blobs) = mil_ops(&text);
+    let blob_of = |name: &str| -> Option<String> {
+        blobs
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, p)| p.clone())
+    };
+    let arg = |op: &MilOp, k: &str| -> Option<String> {
+        op.args
+            .iter()
+            .find(|(n, _)| n == k)
+            .map(|(_, v)| v.clone())
+    };
+    let weights_of = |op: &MilOp| -> Result<Vec<u16>, String> {
+        let wname = arg(op, "weight").ok_or("conv without weight operand")?;
+        let path = blob_of(&wname).ok_or_else(|| format!("weight `{wname}` is not a blob const"))?;
+        load_blob_u16(&resolve_blob(&mil_dir, &path))
+    };
+    let names: Vec<&str> = ops.iter().map(|o| o.op.as_str()).collect();
+    let elems = |o: &MilOp| -> u32 {
+        o.shape.iter().map(|d| (*d).max(1) as u32).product()
+    };
+
+    // ---- single-op families ----
+    match names.as_slice() {
+        ["conv"] => {
+            let o = &ops[0];
+            let (c, w) = (o.shape.get(1).copied().unwrap_or(0), o.shape.get(2).copied().unwrap_or(1));
+            let shape = match (c, w) {
+                (32, 1) => ConvShape::C32W1,
+                (64, 1) => ConvShape::C64W1,
+                (64, 5) => ConvShape::C64W5,
+                (64, 8) => ConvShape::C64W8,
+                (128, 1) => ConvShape::C128W1,
+                _ => return Err(format!("conv shape {:?} not on a skeleton family", o.shape)),
+            };
+            return emit_conv1x1(shape, &weights_of(o)?, mil_path, out_path);
+        }
+        ["add"] => return Ok(emit_elementwise2(EwOp::Add, elems(&ops[0]), mil_path, out_path)),
+        ["mul"] => return Ok(emit_elementwise2(EwOp::Mul, elems(&ops[0]), mil_path, out_path)),
+        ["sub"] => return Ok(emit_elementwise2(EwOp::Sub, elems(&ops[0]), mil_path, out_path)),
+        ["sigmoid"] => return Ok(emit_unary_lut(LutOp::Sigmoid, elems(&ops[0]), mil_path, out_path)),
+        ["tanh"] => return Ok(emit_unary_lut(LutOp::Tanh, elems(&ops[0]), mil_path, out_path)),
+        _ => {}
+    }
+
+    // ---- matmul families ----
+    let mm_part = |names: &[&str]| -> Option<MmPart> {
+        let shape = &ops[0].shape;
+        let is64 = shape == &[1, 64, 1, 64];
+        let is4d = shape == &[1, 8, 64, 64];
+        match (names, is64, is4d) {
+            (["matmul"], true, _) => Some(MmPart::Act64),
+            (["matmul"], _, true) => Some(MmPart::Act4d),
+            (["matmul", "softmax"], true, _) => Some(MmPart::MmSm64),
+            (["matmul", "softmax"], _, true) => Some(MmPart::MmSm4d),
+            (["softmax", "matmul"], true, _) => Some(MmPart::SmMm64),
+            (["matmul", "add", "softmax"] | ["matmul", "mul", "add", "softmax"], true, _) => {
+                Some(MmPart::MmAddSm64)
+            }
+            (["matmul", "mul", "softmax"], true, _) => Some(MmPart::MmMulSm64),
+            _ => None,
+        }
+    };
+    if let ["matmul"] = names.as_slice() {
+        // const-weight matmul → the MmShape families.
+        let y = arg(&ops[0], "y").unwrap_or_default();
+        if let Some(path) = blob_of(&y) {
+            let n = ops[0].shape.get(1).copied().unwrap_or(0) as usize;
+            let shape = match n {
+                32 => MmShape::N32,
+                64 => MmShape::N64,
+                128 => MmShape::N128,
+                256 => MmShape::N256,
+                _ => return Err(format!("matmul shape {:?} not on a skeleton family", ops[0].shape)),
+            };
+            return emit_matmul(shape, &load_blob_u16(&resolve_blob(&mil_dir, &path))?, mil_path, out_path);
+        }
+    }
+    if let Some(part) = mm_part(&names) {
+        return Ok(emit_mm_part(part, mil_path, out_path));
+    }
+
+    // ---- conv chains: group aux ops after each conv ----
+    if names.first() != Some(&"conv") || !names.iter().all(|n| {
+        matches!(
+            *n,
+            "conv"
+                | "sigmoid"
+                | "tanh"
+                | "relu"
+                | "gelu"
+                | "softmax"
+                | "layer_norm"
+                | "mul"
+                | "abs"
+                | "reduce_max"
+                | "maximum"
+                | "real_div"
+                | "reduce_mean"
+                | "add"
+                | "rsqrt"
+        )
+    }) {
+        return Err(format!(
+            "op sequence {names:?} is not on a covered skeleton family"
+        ));
+    }
+    let mut layers: Vec<(&MilOp, Vec<&str>)> = Vec::new();
+    for (i, o) in ops.iter().enumerate() {
+        if o.op == "conv" {
+            layers.push((o, Vec::new()));
+        } else if let Some(l) = layers.last_mut() {
+            l.1.push(names[i]);
+        }
+    }
+    let k = layers.len();
+    let ws: Vec<Vec<u16>> = layers
+        .iter()
+        .map(|(o, _)| weights_of(o))
+        .collect::<Result<_, _>>()?;
+    let wrefs: Vec<&[u16]> = ws.iter().map(|w| w.as_slice()).collect();
+    let aux: &[&str] = &layers[0].1;
+    let uniform = layers.iter().all(|(_, a)| a == &aux);
+    if !uniform {
+        return Err("chain layers have non-uniform aux-op patterns".into());
+    }
+    match aux {
+        [] => Err("plain conv chains are not on a covered family".into()),
+        ["sigmoid"] => emit_conv_act_n_dw(FusedAct::Sigmoid, k, &wrefs, mil_path, out_path),
+        ["tanh"] => emit_conv_act_n_dw(FusedAct::Tanh, k, &wrefs, mil_path, out_path),
+        ["relu"] => emit_conv_act_n_dw(FusedAct::Relu, k, &wrefs, mil_path, out_path),
+        ["gelu"] => emit_conv_act_n_dw(FusedAct::Gelu, k, &wrefs, mil_path, out_path),
+        ["sigmoid", "mul"] => emit_conv_act_n_dw(FusedAct::Silu, k, &wrefs, mil_path, out_path),
+        ["softmax"] => emit_conv_sm_n_dw(k, &wrefs, mil_path, out_path),
+        ["layer_norm"] => emit_conv_ln_n_dw(k, &wrefs, mil_path, out_path),
+        ["abs", "reduce_max", "maximum", "real_div", "mul", "reduce_mean", "real_div", "mul", "add", "rsqrt", "mul", "mul"] => {
+            emit_conv_rms_n_dw(k, &wrefs, mil_path, out_path)
+        }
+        _ => Err(format!("aux-op pattern {aux:?} is not on a covered family")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

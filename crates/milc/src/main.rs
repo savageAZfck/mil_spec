@@ -73,6 +73,7 @@ fn usage() {
          \x20 milc diff    <a.mlmodel|pkg> <b.mlmodel|pkg>\n\
          \x20 milc compile <pkg.mlpackage> [-o <out_dir>]\n\
          \x20 milc compile <model.mil> --target ane [-o <dir>] [--arch h16g] [--pos N]   # lower + ANECCompile → Mach-O, no CoreML\n\
+         \x20                                    [--emit-hwx]   # native Rust HWX emission — no ANECompiler at all\n\
          \x20 milc run     <model.mlmodelc|bundle.milshards> [--units ane|gpu|all|cpu] [--steps N]\n\
          \x20 milc plan    <pkg|model.mlmodelc> [--units all|ane|gpu|cpu] [--json]   # Core ML compute plan: per-op device + cost\n\
          \x20 milc verify\n\
@@ -908,6 +909,7 @@ fn cmd_compile(args: &[String]) -> ExitCode {
     let mut target = "coreml".to_string();
     let mut arch = "h16g".to_string();
     let mut pos = 0i64;
+    let mut emit_hwx = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -918,6 +920,10 @@ fn cmd_compile(args: &[String]) -> ExitCode {
             "--target" => {
                 target = args.get(i + 1).cloned().unwrap_or_default();
                 i += 2;
+            }
+            "--emit-hwx" => {
+                emit_hwx = true;
+                i += 1;
             }
             "--arch" => {
                 arch = args.get(i + 1).cloned().unwrap_or_default();
@@ -970,6 +976,39 @@ fn cmd_compile(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        if emit_hwx {
+            // Native emission — no ANECompiler.framework at all. The
+            // dispatcher matches the lowered program against every
+            // verified skeleton family.
+            let work = out.join("mil");
+            let _ = std::fs::create_dir_all(&work);
+            let lmil = work.join("model.mil");
+            if let Err(e) = std::fs::write(&lmil, &lowered) {
+                eprintln!("milc compile --emit-hwx: {}: {e}", lmil.display());
+                return ExitCode::FAILURE;
+            }
+            let dst = out.join("model.macho");
+            let _ = std::fs::create_dir_all(&out);
+            return match mil_infer::hwx::emit_from_mil(
+                &lmil.display().to_string(),
+                &dst.display().to_string(),
+            ) {
+                Ok(img) => match std::fs::write(&dst, &img) {
+                    Ok(()) => {
+                        println!("{} via hwx ({} bytes)", dst.display(), img.len());
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("milc compile --emit-hwx: {}: {e}", dst.display());
+                        ExitCode::FAILURE
+                    }
+                },
+                Err(e) => {
+                    eprintln!("milc compile --emit-hwx: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         let ane = match mil_infer::Anec::open() {
             Ok(a) => a,
             Err(e) => {
