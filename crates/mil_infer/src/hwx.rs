@@ -642,14 +642,19 @@ fn tail_meta(skel: &[u8]) -> (Vec<(String, u8, u8, u16, u64)>, Vec<[u8; 8]>) {
             u64::from_le_bytes(e[8..16].try_into().unwrap()),
         ));
     }
-    let relocs = {
-        let reloff = u32::from_le_bytes(skel[0x218..0x21c].try_into().unwrap()) as usize;
-        let n = u32::from_le_bytes(skel[0x21c..0x220].try_into().unwrap()) as usize;
-        (0..n)
-            .map(|i| skel[reloff + 8 * i..reloff + 8 * i + 8].try_into().unwrap())
-            .collect()
-    };
+    let relocs = reloc_entries(skel, 0x218);
     (entries, relocs)
+}
+
+/// `__text` relocation entries, located through the `reloff`/`nreloc`
+/// field pair at `reloff_field` (header `0x218` on single-section
+/// skeletons; the `__text` section entry on multi-section families).
+fn reloc_entries(skel: &[u8], reloff_field: usize) -> Vec<[u8; 8]> {
+    let reloff = u32::from_le_bytes(skel[reloff_field..reloff_field + 4].try_into().unwrap()) as usize;
+    let n = u32::from_le_bytes(skel[reloff_field + 4..reloff_field + 8].try_into().unwrap()) as usize;
+    (0..n)
+        .map(|i| skel[reloff + 8 * i..reloff + 8 * i + 8].try_into().unwrap())
+        .collect()
 }
 
 /// Rebuild the variable tail after `tail_off` — signature command,
@@ -666,6 +671,22 @@ fn build_tail_at(
     relocs: &[[u8; 8]],
     mil_path: &str,
     out_path: &str,
+) -> (Vec<u8>, usize) {
+    build_tail_at_reloc(skel, tail_off, entries, relocs, mil_path, out_path, 0x218)
+}
+
+/// [`build_tail_at`] with an explicit `reloff_field` — the image offset
+/// of the `reloff`/`nreloc` field pair that receives the rebuilt
+/// relocation table address (`0x218` normally; the `__text` section
+/// entry on the matmul family whose record floats past it).
+fn build_tail_at_reloc(
+    skel: &[u8],
+    tail_off: usize,
+    entries: &[(String, u8, u8, u16, u64)],
+    relocs: &[[u8; 8]],
+    mil_path: &str,
+    out_path: &str,
+    reloff_field: usize,
 ) -> (Vec<u8>, usize) {
     let sig = signature(mil_path, out_path);
     let sig_pad = (8 - (sig.len() + 1) % 8) % 8 + 1;
@@ -719,7 +740,7 @@ fn build_tail_at(
         for r in relocs {
             tail.extend_from_slice(r);
         }
-        put_u32(&mut img, 0x218, reloff as u32);
+        put_u32(&mut img, reloff_field, reloff as u32);
     }
     img.extend_from_slice(&tail);
     put_u32(&mut img, 0x14, (tail_off + csz + 0x30 + 0x18 - 0x20) as u32);
@@ -2557,6 +2578,88 @@ impl MmShape {
     }
 }
 
+/// Activation-matmul skeleton: `z = matmul(x, y, transpose_y)` over
+/// fp16 `[1,64,1,64]` with both operands as program inputs — the
+/// attention QK^T / PV form. The record is a fixed `0x1fc` task
+/// descriptor at `__text` fileoff `0x8000`; there are no weight
+/// streams, no `__KERN_0`, and no relocations. The variable front
+/// matter (signature + `rt.version` + `LC_SYMTAB`) ends at `0x33f0`.
+const SKELETON_MM_ACT64: &[u8] = include_bytes!("../assets/mm_act64_skeleton.hwx");
+/// Signature-command offset inside `SKELETON_MM_ACT64` — everything
+/// from here to `__text` at `0x8000` is regenerated.
+const MM_ACT_TAIL_OFF: usize = 0x33f0;
+
+/// Emit a complete HWX image for `z = matmul(x, y, transpose_y)` with
+/// both operands activations. Unlike [`emit_matmul`] there is no
+/// weight stream: the `__text` record and all-zero const pools are
+/// copied verbatim and only the signature block is rebuilt.
+pub fn emit_mm_act(mil_path: &str, out_path: &str) -> Vec<u8> {
+    let skel = SKELETON_MM_ACT64;
+    let (entries, relocs) = tail_meta(skel);
+    let (mut img, text_off) =
+        build_tail_at(skel, MM_ACT_TAIL_OFF, &entries, &relocs, mil_path, out_path);
+    debug_assert_eq!(text_off, 0x8000);
+    img.extend_from_slice(&skel[0x8000..]);
+    img
+}
+
+/// `matmul -> softmax` fused skeleton — the QK^T+softmax attention
+/// partition over fp16 `[1,64,1,64]` activation operands. The `0x4f0`
+/// `__text` record composes the matmul task with a softmax tail; the
+/// softmax LUT lives in `__KERN_0` at `0x10000` and is bound by one
+/// `__text` relocation whose `reloff` field sits inside the `__text`
+/// section entry at `0x2b0`.
+const SKELETON_MMSM64: &[u8] = include_bytes!("../assets/mmsm64_skeleton.hwx");
+const MMSM_TAIL_OFF: usize = 0x3488;
+const MMSM_RELOFF_FIELD: usize = 0x2b0;
+/// `softmax -> matmul` fused skeleton — the softmax+PV attention
+/// partition. Same envelope as `SKELETON_MMSM64` with an extra
+/// `__DATA/__bss` segment; sig at `0x3540`, `__text` section entry at
+/// `0x310` (`reloff` field `0x348`), record `0x570`.
+const SKELETON_SMMM64: &[u8] = include_bytes!("../assets/smmm64_skeleton.hwx");
+const SMMM_TAIL_OFF: usize = 0x3540;
+const SMMM_RELOFF_FIELD: usize = 0x348;
+
+/// Emit `p = softmax(matmul(x, y^T))` — both operands activations —
+/// byte-identically for the `[1,64,1,64]` skeleton family.
+pub fn emit_mm_sm(mil_path: &str, out_path: &str) -> Vec<u8> {
+    let skel = SKELETON_MMSM64;
+    let (entries, _) = tail_meta(skel);
+    let relocs = reloc_entries(skel, MMSM_RELOFF_FIELD);
+    let (mut img, text_off) = build_tail_at_reloc(
+        skel,
+        MMSM_TAIL_OFF,
+        &entries,
+        &relocs,
+        mil_path,
+        out_path,
+        MMSM_RELOFF_FIELD,
+    );
+    debug_assert_eq!(text_off, 0x8000);
+    img.extend_from_slice(&skel[0x8000..]);
+    img
+}
+
+/// Emit `z = matmul(softmax(x), y^T)` — both operands activations —
+/// byte-identically for the `[1,64,1,64]` skeleton family.
+pub fn emit_sm_mm(mil_path: &str, out_path: &str) -> Vec<u8> {
+    let skel = SKELETON_SMMM64;
+    let (entries, _) = tail_meta(skel);
+    let relocs = reloc_entries(skel, SMMM_RELOFF_FIELD);
+    let (mut img, text_off) = build_tail_at_reloc(
+        skel,
+        SMMM_TAIL_OFF,
+        &entries,
+        &relocs,
+        mil_path,
+        out_path,
+        SMMM_RELOFF_FIELD,
+    );
+    debug_assert_eq!(text_off, 0x8000);
+    img.extend_from_slice(&skel[0x8000..]);
+    img
+}
+
 /// Emit a complete HWX image for `z = matmul(x, w, transpose_y)` on a
 /// skeleton family. `weights` is the raw `[N,N]` fp16 matrix stored
 /// verbatim in `__TEXT`'s const pool (no interleave for matmul).
@@ -3075,6 +3178,47 @@ mod tests {
             std::env::remove_var("HWX_SIG_ANEC");
             let expect = std::fs::read(format!(
                 "{}/assets/{case}_reference.hwx",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap();
+            let diffs: Vec<usize> = (0..expect.len().min(img.len()))
+                .filter(|&i| img[i] != expect[i])
+                .collect();
+            assert!(
+                diffs.is_empty() && img.len() == expect.len(),
+                "{case}: {} diffs, first at {:#x}",
+                diffs.len(),
+                diffs.first().copied().unwrap_or(0)
+            );
+        }
+    }
+
+    /// The activation-matmul attention family must likewise reproduce
+    /// the ANEC artifacts byte-for-byte: `matmul(x, y)` with both
+    /// operands program inputs, `matmul -> softmax`, and
+    /// `softmax -> matmul` — the three partitions an attention block
+    /// splits into (ANEC refuses two chained matmuls in one program).
+    #[test]
+    fn mm_act_byte_identical() {
+        let _g = SIG_LOCK.lock().unwrap();
+        for (f, case) in [
+            (emit_mm_act as fn(&str, &str) -> Vec<u8>, "mm_act64"),
+            (emit_mm_sm, "mmsm64"),
+            (emit_sm_mm, "smmm64"),
+        ] {
+            let dir = match case {
+                "mm_act64" => "mm_act",
+                "mmsm64" => "mmsm",
+                _ => "smmm",
+            };
+            std::env::set_var("HWX_SIG_ANEC", "1");
+            let img = f(
+                &format!("/tmp/ane_attn/{dir}/net.mil"),
+                &format!("/tmp/ane_attn/{dir}/out/net.macho/net.macho"),
+            );
+            std::env::remove_var("HWX_SIG_ANEC");
+            let expect = std::fs::read(format!(
+                "{}/assets/{case}_skeleton.hwx",
                 env!("CARGO_MANIFEST_DIR")
             ))
             .unwrap();
