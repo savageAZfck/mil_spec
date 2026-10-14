@@ -54,6 +54,10 @@ pub enum EwOp {
     Mul,
     /// `sub` — elementwise difference.
     Sub,
+    /// `minimum` — elementwise min.
+    Min,
+    /// `maximum` — elementwise max.
+    Max,
 }
 
 impl EwOp {
@@ -62,6 +66,8 @@ impl EwOp {
             EwOp::Add => 0x0008_0000,
             EwOp::Mul => 0x0008_0004,
             EwOp::Sub => 0x000c_0000,
+            EwOp::Min => 0x0008_000c,
+            EwOp::Max => 0x0008_0008,
         }
     }
 }
@@ -76,6 +82,11 @@ const FLD_N_DIV4: &[usize] = &[
 const FLD_N_DIV128: &[usize] = &[0x0c08];
 /// Offset of the u32 opcode word inside the instruction stream.
 const OP_FIELD: usize = 0x80cc;
+
+/// Two-op elementwise chain (`t = x ⊕ y ; z = t ⊗ x`) — same envelope
+/// as the single-ew family, with a 0x1c0-byte fused instruction
+/// record at 0x8000 in place of the 0x130-byte single record.
+const SKELETON_EWCHAIN: &[u8] = include_bytes!("../assets/ew_chain_skeleton.hwx");
 
 /// Tail-byte table for the `(tail_bytes, vec_count)` instruction
 /// words. Encoded from the reference corpus across `N mod 64`.
@@ -140,7 +151,7 @@ pub fn emit_elementwise2(op: EwOp, n: u32, mil_path: &str, out_path: &str) -> Ve
     // Rebuild cmd[12] (signature), rt.version, symtab+strtab with our
     // own paths; then fix every offset that moves. This re-splices the
     // instruction region, so stream patches come after.
-    rebuild_tail(&mut img, n, mil_path, out_path);
+    rebuild_tail(&mut img, n, mil_path, out_path, &SKELETON[0x8000..]);
 
     // ---- instruction stream ------------------------------------------
     let v16 = n / 16;
@@ -160,6 +171,108 @@ pub fn emit_elementwise2(op: EwOp, n: u32, mil_path: &str, out_path: &str) -> Ve
     put_u32(&mut img, OP_FIELD, op.opcode());
 
     img
+}
+
+/// Emit `t = x ⊕ y ; z = t ⊗ w` (w ∈ {x, y}) — a fused
+/// two-elementwise-op instruction record (0x1c0 bytes at 0x8000) on
+/// the single-ew envelope. `op2_t_first` selects the operand order
+/// of the second op: `z = op2(t, w)` vs `z = op2(w, t)`;
+/// `op2_free_y` selects which program input is the free operand.
+///
+/// Decoded field map (record-relative, all u32 LE):
+///   +0x14            n/128            +0x40/+0x50/+0x138/+0x148  n
+///   +0x168           n*2              +0xc8/+0x180               op opcodes
+///   +0x8c..+0xb4     lane descriptors — two swapped arrangements:
+///                    free=x → `71,72 / n*2 / v16 / ac / b4 / v16`,
+///                    free=y → `72,71 / ac / b4 / n*2 / v16`
+///                    where `ac = n*2&0xff (+0x40 if 64|n) | hi<<8`,
+///                    `hi = v16 + n/128`, `b4 = f(n%64) | v16<<8`
+///   +0x158..+0x178   op2 operand-order descriptor block
+///   +0x178           `n*2 & 0xff | hi << 8`
+pub fn emit_elementwise_chain(
+    op1: EwOp,
+    op2: EwOp,
+    op2_t_first: bool,
+    op2_free_y: bool,
+    n: u32,
+    mil_path: &str,
+    out_path: &str,
+) -> Result<Vec<u8>, String> {
+    if n < 32 {
+        return Err(format!(
+            "elementwise chain n={n} is below the covered template (n>=32)"
+        ));
+    }
+    let mut img = SKELETON_EWCHAIN.to_vec();
+
+    // ---- scalar shape fields (same plane as the single-ew family) --
+    for &f in FLD_N {
+        put_u32(&mut img, f, n);
+    }
+    for &f in FLD_N_DIV4 {
+        put_u32(&mut img, f, n / 4);
+    }
+    for &f in FLD_N_DIV128 {
+        put_u32(&mut img, f, n / 128);
+    }
+
+    rebuild_tail(&mut img, n, mil_path, out_path, &SKELETON_EWCHAIN[0x8000..]);
+
+    // ---- fused instruction record -----------------------------------
+    let r = 0x8000usize;
+    let v16 = n / 16;
+    put_u32(&mut img, r + 0x14, n / 128);
+    for &f in &[0x40usize, 0x50, 0x138, 0x148] {
+        put_u32(&mut img, r + f, n);
+    }
+    put_u32(&mut img, r + 0x168, n * 2);
+    put_u32(&mut img, r + 0x178, (n * 2 & 0xff) | ((v16 + n / 128) << 8));
+
+    // lane descriptors: which program input is op2's free operand
+    // swaps the two descriptor halves.
+    let ac = (n * 2 & 0xff) + if n % 64 == 0 { 0x40 } else { 0 };
+    let hi = v16 + n / 128;
+    let b4 = if n >= 64 && n % 64 == 0 {
+        0x20
+    } else if n % 64 == 32 {
+        0x10
+    } else {
+        0
+    };
+    for &f in &[0xa4usize, 0xa8, 0xb8, 0xbc] {
+        put_u32(&mut img, r + f, v16 << 8);
+    }
+    if op2_free_y {
+        img[r + 0x8c] = 0x72;
+        img[r + 0x90] = 0x71;
+        put_u32(&mut img, r + 0x98, ac | (hi << 8));
+        put_u32(&mut img, r + 0xa0, b4 | (v16 << 8));
+        put_u32(&mut img, r + 0xac, n * 2);
+        put_u32(&mut img, r + 0xb4, v16 << 8);
+    } else {
+        put_u32(&mut img, r + 0x98, n * 2);
+        put_u32(&mut img, r + 0xa0, v16 << 8);
+        put_u32(&mut img, r + 0xac, ac | (hi << 8));
+        put_u32(&mut img, r + 0xb4, b4 | (v16 << 8));
+    }
+
+    put_u32(&mut img, r + 0xc8, op1.opcode());
+    put_u32(&mut img, r + 0x180, op2.opcode());
+
+    // op2 operand-order descriptor block.
+    if op2_t_first {
+        img[r + 0x158..r + 0x15c].copy_from_slice(&[0x00, 0x01, 0x00, 0x00]);
+        img[r + 0x160..r + 0x164].copy_from_slice(&[0x41, 0x10, 0xc0, 0x80]);
+        img[r + 0x170..r + 0x178]
+            .copy_from_slice(&[0x52, 0x90, 0x00, 0x00, 0x4a, 0x01, 0x00, 0x00]);
+    } else {
+        img[r + 0x158..r + 0x15c].copy_from_slice(&[0x00, 0x02, 0x00, 0x00]);
+        img[r + 0x160..r + 0x164].copy_from_slice(&[0x42, 0x10, 0x03, 0xc0]);
+        img[r + 0x170..r + 0x178]
+            .copy_from_slice(&[0x4a, 0x01, 0x00, 0x00, 0x53, 0x10, 0x00, 0x00]);
+    }
+
+    Ok(img)
 }
 
 const SIG_FLAGS: &str = "-t h16\n\t\
@@ -285,7 +398,7 @@ fn layout_desc(name: &str, base: u32, n: u32) -> String {
 /// Rebuild everything after the z-task-descriptor (file offset
 /// `0x33f0`): signature command, `rt.version`, `LC_SYMTAB`, symbol
 /// table, string table — then fix `sizeofcmds` in the header.
-fn rebuild_tail(img: &mut Vec<u8>, n: u32, mil_path: &str, out_path: &str) {
+fn rebuild_tail(img: &mut Vec<u8>, n: u32, mil_path: &str, out_path: &str, post: &[u8]) {
     let sig = signature(mil_path, out_path);
     let sig_pad = (8 - (sig.len() + 1) % 8) % 8 + 1; // NUL + 8-align
     let csz = 8 + sig.len() + sig_pad;
@@ -360,7 +473,7 @@ fn rebuild_tail(img: &mut Vec<u8>, n: u32, mil_path: &str, out_path: &str) {
     img.truncate(0x33f0);
     img.extend_from_slice(&tail);
     img.resize(0x8000, 0);
-    img.extend_from_slice(&SKELETON[0x8000..]);
+    img.extend_from_slice(post);
     // header sizeofcmds = end-of-load-commands - 0x20
     let sizeofcmds = (0x33f0 + csz + 0x30 + 0x18 - 0x20) as u32;
     put_u32(img, 0x14, sizeofcmds);
@@ -470,10 +583,13 @@ fn rebuild_tail_ulut(img: &mut Vec<u8>, op: LutOp, n: u32, mil_path: &str, out_p
     ]);
 
     let symoff = 0x2688 + tail.len() + 0x18;
-    let kb = format!(
-        "K{}",
-        mil_spec::sha256::sha256_hex(&op.lut()).to_uppercase()
-    );
+    // ANEC names the standalone apply-LUT kernel per op — a mined
+    // constant, not a content hash (the same name appears at every N
+    // for a given op).
+    let kb = match op {
+        LutOp::Sigmoid => "KB3B269BED6CC462DFC66AA7343285C01AFD65136F6C478452FF3605131C3FEBE",
+        LutOp::Tanh => "KEEC44EE7EC029FB6826DF7CE273672621421E515063188B15C0A849E2323006F",
+    };
     let kb_actlut = format!("{kb}_actlut");
 
     let mut strtab = vec![0u8];
@@ -779,9 +895,10 @@ pub fn emit_conv1x1(
     out_path: &str,
 ) -> Result<Vec<u8>, String> {
     let c = shape.channels();
-    if weights.len() != c * c {
+    if weights.len() < c * c {
         return Err(format!("expected {} weights, got {}", c * c, weights.len()));
     }
+    let weights = &weights[..c * c];
     let skel = shape.skeleton();
     let (entries, relocs) = tail_meta(skel);
     let mut img = rebuild_tail_at(skel, CONV_TAIL_OFF, &entries, &relocs, mil_path, out_path);
@@ -820,9 +937,10 @@ pub fn emit_conv_act(
     out_path: &str,
 ) -> Result<Vec<u8>, String> {
     const C: usize = 64;
-    if weights.len() != C * C {
+    if weights.len() < C * C {
         return Err(format!("expected {} weights, got {}", C * C, weights.len()));
     }
+    let weights = &weights[..C * C];
     let skel = act.skeleton1();
     let (entries, relocs) = tail_meta(skel);
     let mut img = rebuild_tail_at(skel, CONV_TAIL_OFF, &entries, &relocs, mil_path, out_path);
@@ -1241,11 +1359,16 @@ pub fn emit_conv_act_n_dw(
     if layers == 0 || weights.len() != layers {
         return Err(format!("expected {layers} weight blobs, got {}", weights.len()));
     }
-    for w in weights {
-        if w.len() != C * C {
-            return Err(format!("expected {} weights, got {}", C * C, w.len()));
-        }
-    }
+    let weights: Vec<&[u16]> = weights
+        .iter()
+        .map(|w| -> Result<&[u16], String> {
+            if w.len() < C * C {
+                return Err(format!("expected {} weights, got {}", C * C, w.len()));
+            }
+            Ok(&w[..C * C])
+        })
+        .collect::<Result<_, _>>()?;
+    let weights = &weights[..];
     if layers == 1 {
         return emit_conv_act(act, weights[0], mil_path, out_path);
     }
@@ -1628,11 +1751,16 @@ pub fn emit_conv_sm_n_dw(
     if layers == 0 || weights.len() != layers {
         return Err(format!("expected {layers} weight blobs, got {}", weights.len()));
     }
-    for w in weights {
-        if w.len() != C * C {
-            return Err(format!("expected {} weights, got {}", C * C, w.len()));
-        }
-    }
+    let weights: Vec<&[u16]> = weights
+        .iter()
+        .map(|w| -> Result<&[u16], String> {
+            if w.len() < C * C {
+                return Err(format!("expected {} weights, got {}", C * C, w.len()));
+            }
+            Ok(&w[..C * C])
+        })
+        .collect::<Result<_, _>>()?;
+    let weights = &weights[..];
     // dedup blobs by content, first-use order
     let mut streams: Vec<&[u16]> = Vec::new();
     let mut ords = Vec::with_capacity(layers);
@@ -1918,11 +2046,16 @@ pub fn emit_conv_ln_n_dw(
     if layers == 0 || weights.len() != layers {
         return Err(format!("expected {layers} weight blobs, got {}", weights.len()));
     }
-    for w in weights {
-        if w.len() != C * C {
-            return Err(format!("expected {} weights, got {}", C * C, w.len()));
-        }
-    }
+    let weights: Vec<&[u16]> = weights
+        .iter()
+        .map(|w| -> Result<&[u16], String> {
+            if w.len() < C * C {
+                return Err(format!("expected {} weights, got {}", C * C, w.len()));
+            }
+            Ok(&w[..C * C])
+        })
+        .collect::<Result<_, _>>()?;
+    let weights = &weights[..];
     let mut streams: Vec<&[u16]> = Vec::new();
     let mut ords = Vec::with_capacity(layers);
     for w in weights {
@@ -2209,11 +2342,16 @@ pub fn emit_conv_rms_n_dw(
     if layers == 0 || weights.len() != layers {
         return Err(format!("expected {layers} weight blobs, got {}", weights.len()));
     }
-    for w in weights {
-        if w.len() != C * C {
-            return Err(format!("expected {} weights, got {}", C * C, w.len()));
-        }
-    }
+    let weights: Vec<&[u16]> = weights
+        .iter()
+        .map(|w| -> Result<&[u16], String> {
+            if w.len() < C * C {
+                return Err(format!("expected {} weights, got {}", C * C, w.len()));
+            }
+            Ok(&w[..C * C])
+        })
+        .collect::<Result<_, _>>()?;
+    let weights = &weights[..];
     let mut streams: Vec<&[u16]> = Vec::new();
     let mut ords = Vec::with_capacity(layers);
     for w in weights {
@@ -2578,6 +2716,20 @@ impl MmShape {
     }
 }
 
+/// Standalone `relu` skeleton over fp16 `[1,64,1,1]` — no LUT (relu is
+/// a fixed clamp, not a table op): `0x104` `__text` record at `0x4000`,
+/// zero-filled const pool, tail rebuilt after `0x25f0`.
+const SKELETON_RELU64: &[u8] = include_bytes!("../assets/relu64_skeleton.hwx");
+const RELU_TAIL_OFF: usize = 0x25f0;
+
+/// Emit `z = relu(x)` `[1,64,1,1]` byte-identically — the standalone
+/// (non-fused) relu program.
+pub fn emit_relu(mil_path: &str, out_path: &str) -> Vec<u8> {
+    let skel = SKELETON_RELU64;
+    let (entries, relocs) = tail_meta(skel);
+    rebuild_tail_at(skel, RELU_TAIL_OFF, &entries, &relocs, mil_path, out_path)
+}
+
 /// Activation-matmul skeleton: `z = matmul(x, y, transpose_y)` over
 /// fp16 `[1,64,1,64]` with both operands as program inputs — the
 /// attention QK^T / PV form. The record is a fixed `0x1fc` task
@@ -2700,9 +2852,10 @@ pub fn emit_matmul(
     out_path: &str,
 ) -> Result<Vec<u8>, String> {
     let n = shape.n();
-    if weights.len() != n * n {
+    if weights.len() < n * n {
         return Err(format!("expected {} weights, got {}", n * n, weights.len()));
     }
+    let weights = &weights[..n * n];
     let skel = shape.skeleton();
     let (entries, relocs) = tail_meta(skel);
     let mut img = rebuild_tail_at(skel, MM_TAIL_OFF, &entries, &relocs, mil_path, out_path);
@@ -2722,6 +2875,8 @@ pub fn emit_matmul(
 /// the operand names we inspect (`x`/`y`/`weight`).
 struct MilOp {
     op: String,
+    /// Result tensor name (the lhs identifier).
+    result: String,
     shape: Vec<i64>,
     args: Vec<(String, String)>,
 }
@@ -2732,7 +2887,23 @@ struct MilOp {
 fn mil_ops(text: &str) -> (Vec<MilOp>, Vec<(String, String)>) {
     let mut ops = Vec::new();
     let mut blobs = Vec::new();
-    for raw in text.lines() {
+    // Op declarations may wrap after `=` — join continuation lines so
+    // `name =\n    op(...)` parses as one statement.
+    let joined = {
+        let mut out = String::with_capacity(text.len());
+        for raw in text.lines() {
+            let line = raw.trim_end();
+            if out.ends_with(" =") && line.trim_start().starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+                out.push(' ');
+                out.push_str(line.trim_start());
+            } else {
+                out.push('\n');
+                out.push_str(line);
+            }
+        }
+        out
+    };
+    for raw in joined.lines() {
         let line = raw.trim();
         let Some(eq) = line.find(" = ") else { continue };
         let (lhs, rhs) = line.split_at(eq);
@@ -2765,7 +2936,14 @@ fn mil_ops(text: &str) -> (Vec<MilOp>, Vec<(String, String)>) {
                     .collect()
             })
             .unwrap_or_default();
-        let arg_str = &rhs[paren + 1..rhs.rfind(')').unwrap_or(rhs.len())];
+        // The op call's closing paren precedes `[name = ...]` or `;`
+        // (a later rfind(')') would land inside `string("...")`).
+        let close = rhs[paren..]
+            .find(")[")
+            .or_else(|| rhs[paren..].find(");"))
+            .map(|i| paren + i)
+            .unwrap_or(rhs.len());
+        let arg_str = &rhs[paren + 1..close];
         let args = arg_str
             .split(',')
             .filter_map(|a| {
@@ -2775,6 +2953,12 @@ fn mil_ops(text: &str) -> (Vec<MilOp>, Vec<(String, String)>) {
             .collect();
         ops.push(MilOp {
             op: op.to_string(),
+            result: lhs
+                .rsplit(|c: char| c == ' ' || c == '>')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string(),
             shape,
             args,
         });
@@ -2809,6 +2993,25 @@ fn resolve_blob<'a>(mil_dir: &'a std::path::Path, p: &'a str) -> std::path::Path
     }
 }
 
+/// Extract a scalar `fp16` const's bit pattern: `<ty> <name> =
+/// const()[val = fp16(V)]`. Returns `None` if `name` isn't declared
+/// as a scalar fp16 const (e.g. a blob tensor).
+fn mil_scalar_f16(text: &str, name: &str) -> Option<u16> {
+    for raw in text.lines() {
+        let line = raw.trim();
+        let Some(eq) = line.find(" = ") else { continue };
+        if line[..eq].rsplit(|c: char| c == ' ' || c == '>').next() != Some(name) {
+            continue;
+        }
+        let rhs = &line[eq + 3..];
+        let v = rhs.find("fp16(")?;
+        let end = rhs[v..].find(')')? + v;
+        let f: f32 = rhs[v + 5..end].parse().ok()?;
+        return Some(half::f16::from_f32(f).to_bits());
+    }
+    None
+}
+
 /// Emit a complete HWX image for a MIL program on a covered skeleton
 /// family — the dispatch behind `milc compile --target ane --emit-hwx`.
 /// Matches the op sequence against every verified family and loads
@@ -2828,6 +3031,9 @@ pub fn emit_from_mil(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> 
         .unwrap_or(std::path::Path::new("."))
         .to_path_buf();
     let (ops, blobs) = mil_ops(&text);
+    if ops.is_empty() {
+        return Err(format!("{mil_path}: no compute ops found"));
+    }
     let blob_of = |name: &str| -> Option<String> {
         blobs
             .iter()
@@ -2868,8 +3074,57 @@ pub fn emit_from_mil(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> 
         ["add"] => return Ok(emit_elementwise2(EwOp::Add, elems(&ops[0]), mil_path, out_path)),
         ["mul"] => return Ok(emit_elementwise2(EwOp::Mul, elems(&ops[0]), mil_path, out_path)),
         ["sub"] => return Ok(emit_elementwise2(EwOp::Sub, elems(&ops[0]), mil_path, out_path)),
+        ["minimum"] => {
+            return Ok(emit_elementwise2(EwOp::Min, elems(&ops[0]), mil_path, out_path))
+        }
+        ["maximum"] => {
+            return Ok(emit_elementwise2(EwOp::Max, elems(&ops[0]), mil_path, out_path))
+        }
+        ["relu"] => return Ok(emit_relu(mil_path, out_path)),
         ["sigmoid"] => return Ok(emit_unary_lut(LutOp::Sigmoid, elems(&ops[0]), mil_path, out_path)),
         ["tanh"] => return Ok(emit_unary_lut(LutOp::Tanh, elems(&ops[0]), mil_path, out_path)),
+        [a, b] => {
+            let ew = |s: &str| -> Option<EwOp> {
+                Some(match s {
+                    "add" => EwOp::Add,
+                    "mul" => EwOp::Mul,
+                    "sub" => EwOp::Sub,
+                    "minimum" => EwOp::Min,
+                    "maximum" => EwOp::Max,
+                    _ => return None,
+                })
+            };
+            if let (Some(op1), Some(op2)) = (ew(a), ew(b)) {
+                let (o1, o2) = (&ops[0], &ops[1]);
+                if arg(o1, "x").as_deref() != Some("x")
+                    || arg(o1, "y").as_deref() != Some("y")
+                {
+                    return Err("elementwise chain op1 must bind (x = x, y = y)".into());
+                }
+                let (ox, oy) = (arg(o2, "x"), arg(o2, "y"));
+                let (t_first, free) = if ox.as_deref() == Some(o1.result.as_str()) {
+                    (true, oy.as_deref())
+                } else if oy.as_deref() == Some(o1.result.as_str()) {
+                    (false, ox.as_deref())
+                } else {
+                    return Err("elementwise chain op2 must consume op1's result".into());
+                };
+                if !matches!(free, Some("x") | Some("y")) {
+                    return Err(
+                        "elementwise chain op2's free operand must be x or y".into(),
+                    );
+                }
+                return emit_elementwise_chain(
+                    op1,
+                    op2,
+                    t_first,
+                    free == Some("y"),
+                    elems(o2),
+                    mil_path,
+                    out_path,
+                );
+            }
+        }
         _ => {}
     }
 
@@ -2907,7 +3162,21 @@ pub fn emit_from_mil(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> 
         }
     }
     if let Some(part) = mm_part(&names) {
-        return Ok(emit_mm_part(part, mil_path, out_path));
+        let mut img = emit_mm_part(part, mil_path, out_path);
+        // A scalar fp16 `mul` on the matmul output folds into the
+        // fused record as the scale operand at __text+0x1ac.
+        if matches!(part, MmPart::MmAddSm64 | MmPart::MmMulSm64) {
+            let mul = &ops[1];
+            let free = if arg(mul, "x").as_deref() == Some(ops[0].result.as_str()) {
+                arg(mul, "y")
+            } else {
+                arg(mul, "x")
+            };
+            if let Some(bits) = free.and_then(|f| mil_scalar_f16(&text, &f)) {
+                img[0x81ac..0x81ae].copy_from_slice(&bits.to_le_bytes());
+            }
+        }
+        return Ok(img);
     }
 
     // ---- conv chains: group aux ops after each conv ----
@@ -3439,6 +3708,71 @@ mod tests {
             assert!(
                 diffs.is_empty() && img.len() == expect.len(),
                 "{case}: {} diffs, first at {:#x}",
+                diffs.len(),
+                diffs.first().copied().unwrap_or(0)
+            );
+        }
+    }
+
+    /// The fused two-elementwise-op family must likewise reproduce
+    /// the ANEC artifacts byte-for-byte: both operand orders
+    /// (`z = op2(t, x)` vs `z = op2(x, t)`), the free-operand-`y`
+    /// descriptor swap, and the n=128 lane-descriptor ramp.
+    #[test]
+    fn ew_chain_byte_identical() {
+        let _g = SIG_LOCK.lock().unwrap();
+        for (op1, op2, t_first, free_y, n, mil, out, asset) in [
+            (
+                EwOp::Add,
+                EwOp::Mul,
+                true,
+                false,
+                64,
+                "/tmp/ane_act/chain_add_mul/net.mil",
+                "/tmp/ane_act/chain_add_mul/out/net.macho",
+                "ew_chain_skeleton.hwx",
+            ),
+            (
+                EwOp::Add,
+                EwOp::Add,
+                true,
+                true,
+                64,
+                "/tmp/ane_act/chain_add_add/net.mil",
+                "/tmp/ane_act/chain_add_add/out/net.macho",
+                "ew_chain_add_add.hwx",
+            ),
+            (
+                EwOp::Add,
+                EwOp::Mul,
+                true,
+                false,
+                128,
+                "/tmp/ew_chain/n128_add_mul/net.mil",
+                "/tmp/ew_chain/n128_add_mul/out/net.macho/net.macho",
+                "ew_chain_n128.hwx",
+            ),
+            (
+                EwOp::Add,
+                EwOp::Mul,
+                false,
+                false,
+                64,
+                "/tmp/ew_chain/swap_add_mul/net.mil",
+                "/tmp/ew_chain/swap_add_mul/out/net.macho/net.macho",
+                "ew_chain_swap.hwx",
+            ),
+        ] {
+            std::env::set_var("HWX_SIG_ANEC", "1");
+            let img = emit_elementwise_chain(op1, op2, t_first, free_y, n, mil, out).unwrap();
+            std::env::remove_var("HWX_SIG_ANEC");
+            let expect = std::fs::read(format!("{}/assets/{asset}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+            let diffs: Vec<usize> = (0..expect.len().min(img.len()))
+                .filter(|&i| img[i] != expect[i])
+                .collect();
+            assert!(
+                diffs.is_empty() && img.len() == expect.len(),
+                "{asset}: {} diffs, first at {:#x}",
                 diffs.len(),
                 diffs.first().copied().unwrap_or(0)
             );
