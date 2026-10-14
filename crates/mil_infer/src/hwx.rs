@@ -1025,7 +1025,7 @@ const DYN_TEXT_NARROW: &[u8] = include_bytes!("../assets/conv_dyn_text_narrow.bi
 /// the tagged field at blob `0xbe8` / text `0x14`; `pad16` is the extra
 /// `*16` row padding applied to the text `0x158`/`0x168` copies; `big`
 /// selects the `0x244404` text `0x124` flag. Inside the swept range
-/// (`C in 32..=2079`) these come from
+/// (`C in 32..=4096`) these come from
 /// [`crate::conv_chan_table::CONV_CHAN_TABLE`], which stores ANEC's
 /// observed values verbatim — a `u32::MAX` `f14` marks the `713..=720`
 /// 59-symbol variant window. Beyond the table the fallback uses the
@@ -1033,7 +1033,7 @@ const DYN_TEXT_NARROW: &[u8] = include_bytes!("../assets/conv_dyn_text_narrow.bi
 /// pad, `big` once the payload exceeds 1 MiB).
 fn conv_chan_params(c: usize, kern_sz: usize) -> (u32, usize, bool) {
     let table = crate::conv_chan_table::CONV_CHAN_TABLE;
-    if (32..=2079).contains(&c) {
+    if (32..=4096).contains(&c) {
         let v = table[c - 32];
         if v == u32::MAX {
             return (u32::MAX, 0, false);
@@ -1058,7 +1058,7 @@ fn conv_chan_params(c: usize, kern_sz: usize) -> (u32, usize, bool) {
 /// `__text` encoding templates are the only bytes carried verbatim.
 ///
 /// Field model recovered from a dense ANEC channel sweep
-/// (`/tmp/cdense`, every `C` in 32..=2079):
+/// (`/tmp/cdense`+`/tmp/cdense2`, every `C` in 32..=4096):
 /// - `__const`/`__data` slots are `align(C*64, 0x4000)` each; `__TEXT`
 ///   follows at `+2*slot`, `__KERN_0` at `text_va + 0x8000`.
 /// - `__KERN_0` payload is [`weight_layout`]'s 16-lane stream; the text
@@ -3449,6 +3449,9 @@ pub fn emit_relu(mil_path: &str, out_path: &str) -> Vec<u8> {
 /// streams, no `__KERN_0`, and no relocations. The variable front
 /// matter (signature + `rt.version` + `LC_SYMTAB`) ends at `0x33f0`.
 const SKELETON_MM_ACT64: &[u8] = include_bytes!("../assets/mm_act64_skeleton.hwx");
+/// Same partition over `[1,32,1,32]` — smaller lane footprint
+/// (`0x1f4` record) but the identical envelope and symtab plan.
+const SKELETON_MM_ACT32: &[u8] = include_bytes!("../assets/mm_act32_skeleton.hwx");
 
 /// Emit a complete HWX image for `z = matmul(x, y, transpose_y)` with
 /// both operands activations. Unlike [`emit_matmul`] there is no
@@ -3491,6 +3494,8 @@ const SKELETON_MMSM4D: &[u8] = include_bytes!("../assets/mmsm4d_skeleton.hwx");
 /// section layout all differ.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MmPart {
+    /// `matmul(x, y)` `[1,32,1,32]` — bare PV/QK partition.
+    Act32,
     /// `matmul(x, y)` `[1,64,1,64]` — bare PV/QK partition.
     Act64,
     /// `matmul -> softmax` `[1,64,1,64]` — QK^T+softmax.
@@ -3512,6 +3517,7 @@ impl MmPart {
     /// `(skeleton, sig tail offset, __text section reloff field)`.
     fn spec(self) -> (&'static [u8], usize, usize) {
         match self {
+            MmPart::Act32 => (SKELETON_MM_ACT32, 0x33f0, 0),
             MmPart::Act64 => (SKELETON_MM_ACT64, 0x33f0, 0),
             MmPart::MmSm64 => (SKELETON_MMSM64, 0x3488, 0x2b0),
             MmPart::SmMm64 => (SKELETON_SMMM64, 0x3540, 0x348),
@@ -3843,7 +3849,7 @@ fn emit_from_mil_inner(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String
             let (c, w) = (o.shape.get(1).copied().unwrap_or(0), o.shape.get(2).copied().unwrap_or(1));
             // square `[1,C,1,1]` conv1x1 with C>=32 goes through the
             // parametric emitter — byte-verified against ANEC for every
-            // channel count in 32..=2079 (except the 713..=720 variant
+            // channel count in 32..=4096 (except the 713..=720 variant
             // window, which errors cleanly)
             if w == 1 && c >= 32 {
                 return emit_conv1x1_dyn(c as usize, &weights_of(o)?, mil_path, out_path);
@@ -3918,18 +3924,20 @@ fn emit_from_mil_inner(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String
     // ---- matmul families ----
     let mm_part = |names: &[&str]| -> Option<MmPart> {
         let shape = &ops[0].shape;
+        let is32 = shape == &[1, 32, 1, 32];
         let is64 = shape == &[1, 64, 1, 64];
         let is4d = shape == &[1, 8, 64, 64];
-        match (names, is64, is4d) {
-            (["matmul"], true, _) => Some(MmPart::Act64),
-            (["matmul"], _, true) => Some(MmPart::Act4d),
-            (["matmul", "softmax"], true, _) => Some(MmPart::MmSm64),
-            (["matmul", "softmax"], _, true) => Some(MmPart::MmSm4d),
-            (["softmax", "matmul"], true, _) => Some(MmPart::SmMm64),
-            (["matmul", "add", "softmax"] | ["matmul", "mul", "add", "softmax"], true, _) => {
+        match (names, is32, is64, is4d) {
+            (["matmul"], true, _, _) => Some(MmPart::Act32),
+            (["matmul"], _, true, _) => Some(MmPart::Act64),
+            (["matmul"], _, _, true) => Some(MmPart::Act4d),
+            (["matmul", "softmax"], _, true, _) => Some(MmPart::MmSm64),
+            (["matmul", "softmax"], _, _, true) => Some(MmPart::MmSm4d),
+            (["softmax", "matmul"], _, true, _) => Some(MmPart::SmMm64),
+            (["matmul", "add", "softmax"] | ["matmul", "mul", "add", "softmax"], _, true, _) => {
                 Some(MmPart::MmAddSm64)
             }
-            (["matmul", "mul", "softmax"], true, _) => Some(MmPart::MmMulSm64),
+            (["matmul", "mul", "softmax"], _, true, _) => Some(MmPart::MmMulSm64),
             _ => None,
         }
     };
@@ -5564,6 +5572,7 @@ mod tests {
     fn mm_act_byte_identical() {
         let _g = SIG_LOCK.lock().unwrap();
         for (part, case, dir) in [
+            (MmPart::Act32, "mm_act32", "mm_act32"),
             (MmPart::Act64, "mm_act64", "mm_act"),
             (MmPart::MmSm64, "mmsm64", "mmsm"),
             (MmPart::SmMm64, "smmm64", "smmm"),

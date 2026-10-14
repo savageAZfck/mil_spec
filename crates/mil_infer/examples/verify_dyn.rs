@@ -32,6 +32,10 @@ fn main() {
                     .chunks_exact(2)
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect(),
+                // conv_extract probes were compiled with zero weights
+                _ if std::env::var_os("VERIFY_ZERO_W").is_some() => {
+                    vec![0u16; c * c]
+                }
                 _ => (0..c * c).map(|i| i as u16).collect(),
             };
             total += 1;
