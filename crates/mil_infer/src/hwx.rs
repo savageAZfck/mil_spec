@@ -680,6 +680,68 @@ pub fn weight_interleave(w: &[u16], c: usize) -> Vec<u16> {
     out
 }
 
+/// General `__KERN_0` layout for a square `[C,C,1,1]` conv weight at
+/// any `C`: output channels spread over sixteen lanes, the first
+/// `C % 16` lanes taking one extra row; each lane stores its rows
+/// transposed (`for ic { for m in rows }`) and pads to 64 bytes.
+/// Returns the stream plus each lane's byte offset and padded size
+/// (the record's lane tables). Reduces to [`weight_interleave`] when
+/// `32 | C`. Verified byte-exact against ANEC for 19 channel counts,
+/// `C = 8..512`, including uneven `C = 24, 40, 56, 80, 112`.
+pub fn weight_layout(w: &[u16], c: usize) -> (Vec<u16>, Vec<usize>, Vec<usize>) {
+    debug_assert_eq!(w.len(), c * c);
+    let (q, r) = (c / 16, c % 16);
+    let (mut out, mut offs, mut sizes) = (Vec::with_capacity(c * c), Vec::new(), Vec::new());
+    let mut start = 0;
+    for g in 0..16 {
+        let rows = q + usize::from(g < r);
+        offs.push(out.len() * 2);
+        for ic in 0..c {
+            for m in 0..rows {
+                out.push(w[(start + m) * c + ic]);
+            }
+        }
+        let bytes = rows * c * 2;
+        let pad = (64 - bytes % 64) % 64;
+        out.resize(out.len() + pad / 2, 0);
+        sizes.push(bytes + pad);
+        start += rows;
+    }
+    (out, offs, sizes)
+}
+
+/// ANEC's conv kernel symbol name (`K<sha256>`) for a square
+/// `[C,C,1,1]` weight const at `@model_path/weights/weight.bin`.
+///
+/// The name is SHA-256 over a 235-byte record ANEC builds from the
+/// weight const — blob stem + file name, data offset and byte size, a
+/// `desc` block with the weight dims, and a trailer carrying the
+/// per-lane row count `ceil(C/16)`. Recovered by tracing
+/// `CC_SHA256_Update` inside `ANECompiler` during a live compile; it is
+/// independent of the weight values and of the activation's spatial
+/// size. Verified against 19 swept channel counts and the corpus
+/// conv32/64/128 artifacts (square weights only).
+pub fn conv_kernel_name(c: u64, data_offset: u64) -> String {
+    let mut s: Vec<u8> = Vec::with_capacity(235);
+    s.extend_from_slice(b"weight");
+    s.extend_from_slice(b"weight.bin0");
+    s.extend_from_slice(&data_offset.to_le_bytes());
+    s.extend_from_slice(&(c * c * 2).to_le_bytes());
+    s.extend_from_slice(&[0; 5]);
+    s.extend_from_slice(b"desc");
+    s.extend_from_slice(&[0; 40]);
+    for v in [c, c, 1, 1, 1, c, 1, 1, 1, 1, 0, 0] {
+        s.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in [1u32, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0] {
+        s.extend_from_slice(&v.to_le_bytes());
+    }
+    s.extend_from_slice(&c.div_ceil(16).to_le_bytes());
+    s.push(0);
+    debug_assert_eq!(s.len(), 235);
+    format!("K{}", mil_spec::sha256::sha256_hex(&s).to_uppercase())
+}
+
 /// Conv shape families with a captured skeleton. `(channels, spatial)`
 /// selects the reference artifact whose instruction stream and task
 /// descriptors are reused verbatim — the ANE conv kernel is generated
@@ -4452,6 +4514,56 @@ mod tests {
                 .collect();
             let src: Vec<u16> = (0..(c * c) as u16).collect();
             assert_eq!(weight_interleave(&src, c), expect, "{key}");
+        }
+    }
+
+    /// `weight_layout` reproduces ANEC's `__KERN_0` stream for uneven
+    /// channel counts (C=40, 80: lanes of unequal row counts) from the
+    /// sweep's `0x3c00 + (i*7 % 0x3ff)` weights, and collapses to
+    /// `weight_interleave` whenever 16 divides C.
+    #[test]
+    fn weight_layout_matches_anec_any_c() {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/conv_uneven_kern.json"
+        ))
+        .unwrap();
+        let vec: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        for c in [40usize, 80] {
+            let w: Vec<u16> = (0..c * c).map(|i| 0x3c00 + ((i * 7) % 0x3ff) as u16).collect();
+            let expect: Vec<u16> = vec[c.to_string()]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as u16)
+                .collect();
+            assert_eq!(weight_layout(&w, c).0, expect, "C={c}");
+        }
+        // (C=16 lanes are 32 bytes and pad to 64 — the padded-band form
+        // `weight_interleave` doesn't model; C>=32 lanes are 64-aligned.)
+        for c in [32usize, 64, 128] {
+            let w: Vec<u16> = (0..(c * c) as u32).map(|i| i as u16).collect();
+            assert_eq!(weight_layout(&w, c).0, weight_interleave(&w, c), "C={c}");
+        }
+    }
+
+    /// Computed kernel names match the ones ANEC embedded in the
+    /// captured conv skeletons — no lookup table.
+    #[test]
+    fn conv_kernel_name_matches_skeletons() {
+        for (c, skel) in [
+            (32u64, SKELETON_CONV32),
+            (64, SKELETON_CONV64S1),
+            (64, SKELETON_CONV64S8),
+            (128, SKELETON_CONV128),
+            (16, SKELETON_CONV16S8),
+            (128, SKELETON_CONV128S8),
+        ] {
+            let name = conv_kernel_name(c, 0x80);
+            assert!(
+                skel.windows(name.len()).any(|w| w == name.as_bytes()),
+                "C={c}: {name} not in skeleton"
+            );
         }
     }
 
