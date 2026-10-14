@@ -1819,6 +1819,287 @@ pub fn emit_conv_sm_n_dw(
     Ok(img)
 }
 
+/// Layer-norm skeletons — `conv_ln1` k=1 task (`0x37c`), `conv_ln3`
+/// terminal-even task, `conv_ln4` first/interior/terminal task
+/// templates. `layer_norm` fuses into the conv task itself (no
+/// separate reduce tasks, no LUT stream): each layer is one `0x330`
+/// task carrying the conv+LN descriptor program, allocating five
+/// task ids.
+const SKELETON_CONV_LN1: &[u8] = include_bytes!("../assets/conv_ln1_skeleton.hwx");
+const SKELETON_CONV_LN2: &[u8] = include_bytes!("../assets/conv_ln2_reference.hwx");
+const SKELETON_CONV_LN3: &[u8] = include_bytes!("../assets/conv_ln3_skeleton.hwx");
+const SKELETON_CONV_LN4: &[u8] = include_bytes!("../assets/conv_ln4_skeleton.hwx");
+
+/// Distinct-weight layer-norm kernel names by stream ordinal (the
+/// single-stream program always uses `K9419..`). Mined from ANEC
+/// lndw2/3/4 probes; ordinals beyond 3 need further mining.
+const KNAME_LN_DW: [&str; 4] = [
+    "K3C23BA63F9FE7926259BE0CD49C610C288A7DB57FE6AFF2F2F0543F4EF3B5712",
+    "KE3545219F139ACC28DC984868084DC69371098AC16C6143198F730D551E6D04F",
+    "K49750E73342DC5A9AF618282C1FC3E0663E255CD326287258C267314D841D492",
+    "KC2200A5DA40187D6913B22C3566BA0458BC425B33670C299DF9AB485B31C198E",
+];
+
+/// Program header + record prologue (`0x30` header, `01 00 05 00`).
+const LN_PROG: (usize, usize) = (0x4000, 0x34);
+/// k=1 whole task — `0x37c`, terminal+first combined.
+const LN_K1: (usize, usize) = (0x4034, 0x37c);
+/// Layer-0 task — `0x370` with the input-DMA insert at +0x130.
+/// k=2 chains run the whole program bank-swapped, so L0 uses the
+/// odd-parity variant captured from the ln2 reference.
+const LN_FIRST: (usize, usize) = (0x4034, 0x370);
+/// Layer-0 task, bank-swapped (k=2 programs only).
+const LN_FIRST_ODD: (usize, usize) = (0x4034, 0x370);
+/// Interior task at odd layer index — `0x330`.
+const LN_INT_ODD: (usize, usize) = (0x43a4, 0x330);
+/// Interior task at even layer index — `0x330` (bank-select bytes
+/// alternate by layer parity).
+const LN_INT_EVEN: (usize, usize) = (0x46d4, 0x330);
+/// Terminal task at odd layer index — `0x350` (output writeback).
+const LN_TERM_ODD: (usize, usize) = (0x4a04, 0x350);
+/// Terminal task at even layer index — `0x350`.
+const LN_TERM_EVEN: (usize, usize) = (0x46d4, 0x350);
+
+/// Emit a complete HWX image for `(conv1x1 -> layer_norm)^k` sharing
+/// one `C=64` weight blob. `layer_norm` fuses into the conv task —
+/// one task per layer allocating five ids (`5i+1..5i+5`), so the
+/// wiring grammar is a single-task variant of the softmax multi-task
+/// family: 16-slot producer column = `5i`, own ids `5i+1..5i+4` at
+/// +0x12c/+0x19c/+0x21c/+0x29c, next-layer input `5i+5` at +0x30c
+/// (interior) or output-writeback refs `5i+4` at +0x32e/+0x34e
+/// (terminal). Bank-select bytes (+0x188/+0x190/...) and the `04/05`
+/// descriptor variants (+0x191/+0x1fd/+0x209/+0x281) alternate by
+/// layer parity — SRAM ping-pong — captured as even/odd templates.
+///
+/// `__KERN_0` = `n` contiguous `0x2000` weight streams (no LUT tail);
+/// relocation per layer targets the stream-offset u32 after the
+/// task's `44 95 80 23` marker (+0x14c first, +0x124 otherwise).
+pub fn emit_conv_ln_n(
+    layers: usize,
+    weights: &[u16],
+    mil_path: &str,
+    out_path: &str,
+) -> Result<Vec<u8>, String> {
+    emit_conv_ln_n_dw(layers, &vec![weights; layers], mil_path, out_path)
+}
+
+/// `emit_conv_ln_n` with per-layer weight blobs — same dedup/stream
+/// model as the other dw emitters: conv task id `5*first_use+1`
+/// (+0x06), last-use release flag (+0x05), stream offset u32
+/// `ord*0x2000`, per-stream `K<hash>_ne_*` symbol groups.
+pub fn emit_conv_ln_n_dw(
+    layers: usize,
+    weights: &[&[u16]],
+    mil_path: &str,
+    out_path: &str,
+) -> Result<Vec<u8>, String> {
+    const C: usize = 64;
+    if layers == 0 || weights.len() != layers {
+        return Err(format!("expected {layers} weight blobs, got {}", weights.len()));
+    }
+    for w in weights {
+        if w.len() != C * C {
+            return Err(format!("expected {} weights, got {}", C * C, w.len()));
+        }
+    }
+    let mut streams: Vec<&[u16]> = Vec::new();
+    let mut ords = Vec::with_capacity(layers);
+    for w in weights {
+        match streams.iter().position(|s| *s == *w) {
+            Some(o) => ords.push(o),
+            None => {
+                ords.push(streams.len());
+                streams.push(w);
+            }
+        }
+    }
+    if streams.len() > KNAME_LN_DW.len() {
+        return Err(format!(
+            "{} distinct layernorm weight streams exceeds the mined kernel-name table ({})",
+            streams.len(),
+            KNAME_LN_DW.len()
+        ));
+    }
+    let n_streams = streams.len();
+    let mut first_use = vec![usize::MAX; n_streams];
+    let mut last_use = vec![0usize; n_streams];
+    for (i, &o) in ords.iter().enumerate() {
+        first_use[o] = first_use[o].min(i);
+        last_use[o] = i;
+    }
+
+    let skel = SKELETON_CONV_LN4;
+    let (ln_entries, ln_relocs) = tail_meta(SKELETON_CONV_LN1);
+    let rflag: [u8; 4] = ln_relocs[0][4..8].try_into().unwrap();
+
+    // symtab — shared uses the k=1 skeleton's entries verbatim; dw is
+    // [x, z] + all streams' `_ne_0` (desc 2) + per-stream lanes 1..15
+    // (desc 0) at `0x30010000 + ord*0x2000 + 0x200*b` + the scalar tail.
+    let entries = if n_streams == 1 {
+        ln_entries.clone()
+    } else {
+        let mut e = Vec::with_capacity(ln_entries.len() + 16 * (n_streams - 1));
+        e.push(ln_entries[0].clone()); // x
+        e.push(ln_entries[1].clone()); // z
+        let tpl0 = ln_entries[2].clone();
+        let tpln = ln_entries[3].clone();
+        for j in 0..n_streams {
+            e.push((
+                format!("{}_ne_0", KNAME_LN_DW[j]),
+                tpl0.1,
+                tpl0.2,
+                tpl0.3,
+                0x3001_0000 + 0x2000 * j as u64,
+            ));
+        }
+        for j in 0..n_streams {
+            for b in 1..16u64 {
+                e.push((
+                    format!("{}_ne_{b}", KNAME_LN_DW[j]),
+                    tpln.1,
+                    tpln.2,
+                    tpln.3,
+                    0x3001_0000 + 0x2000 * j as u64 + 0x200 * b,
+                ));
+            }
+        }
+        e.extend_from_slice(&ln_entries[18..]); // scalar descriptors
+        e
+    };
+
+    // record stream: prologue + one fused conv+LN task per layer;
+    // prologue +0x12 is `0x62` for the single-task program, `0x63`
+    // for multi-task chains
+    let mut stream = skel[LN_PROG.0..LN_PROG.0 + LN_PROG.1].to_vec();
+    stream[0x12] = if layers == 1 { 0x62 } else { 0x63 };
+    let mut reloc_offs = Vec::with_capacity(layers);
+    for i in 0..layers {
+        let co = stream.len() - LN_PROG.1 + 4;
+        let last = i + 1 == layers;
+        // k=2 programs run the whole bank alternation swapped
+        let even = (i % 2 == 0) != (layers == 2);
+        let (mark_u32_off, src, len) = if layers == 1 {
+            (0x148usize, SKELETON_CONV_LN1, LN_K1)
+        } else if i == 0 {
+            if layers == 2 {
+                (0x14cusize, SKELETON_CONV_LN2, LN_FIRST_ODD)
+            } else {
+                (0x14cusize, skel, LN_FIRST)
+            }
+        } else if last {
+            if even {
+                (0x124usize, SKELETON_CONV_LN3, LN_TERM_EVEN)
+            } else {
+                (0x124usize, skel, LN_TERM_ODD)
+            }
+        } else if even {
+            (0x124usize, skel, LN_INT_EVEN)
+        } else {
+            (0x124usize, skel, LN_INT_ODD)
+        };
+        let mut t = src[len.0..len.0 + len.1].to_vec();
+        t[0x05] = if last_use[ords[i]] == i { 0x02 } else { 0x00 };
+        put_u16(&mut t, 0x06, (5 * first_use[ords[i]] + 1) as u16);
+        if i > 0 && layers > 1 {
+            patch_task_column(&mut t, (5 * i) as u16, 16);
+            put_u16(&mut t, 0x12c, (5 * i + 1) as u16);
+            put_u16(&mut t, 0x19c, (5 * i + 2) as u16);
+            put_u16(&mut t, 0x21c, (5 * i + 3) as u16);
+            put_u16(&mut t, 0x29c, (5 * i + 4) as u16);
+            // buffer-slot counters: family A = 4+(i-1)/2, family B
+            // = 4+i/2 interior / 4+(i+2)/3 in the terminal task
+            let ca = (4 + (i - 1) / 2) as u16;
+            for &o in &[0x111usize, 0x189, 0x201, 0x27d, 0x28d] {
+                put_u16(&mut t, o, ca);
+            }
+            if last {
+                let cb = (4 + (i + 2) / 3) as u16;
+                for &o in &[0x191usize, 0x1fd, 0x209, 0x281, 0x311] {
+                    put_u16(&mut t, o, cb);
+                }
+                put_u16(&mut t, 0x32e, (5 * i + 4) as u16);
+                // `xx 01` epilogue slot — single byte + trailing flag
+                t[0x34e] = (5 * i + 4) as u8;
+                put_u16(&mut t, 0x305, ca);
+            } else {
+                let cb = (4 + i / 2) as u16;
+                for &o in &[0x191usize, 0x1fd, 0x209, 0x281] {
+                    put_u16(&mut t, o, cb);
+                }
+                put_u16(&mut t, 0x2fd, ca);
+                put_u16(&mut t, 0x30c, (5 * i + 5) as u16);
+            }
+        }
+        t[mark_u32_off..mark_u32_off + 4]
+            .copy_from_slice(&(0x2000 * ords[i] as u32).to_le_bytes());
+        stream.extend_from_slice(&t);
+        reloc_offs.push(co + mark_u32_off);
+    }
+
+    let relocs: Vec<[u8; 8]> = reloc_offs
+        .iter()
+        .map(|&o| {
+            let mut e = [0u8; 8];
+            e[..4].copy_from_slice(&(o as u32 + 0x30).to_le_bytes());
+            e[4..].copy_from_slice(&rflag);
+            e
+        })
+        .collect();
+
+    let (mut img, text_off) = build_tail_at(
+        skel,
+        CONV_TAIL_OFF,
+        &entries,
+        &relocs,
+        mil_path,
+        out_path,
+    );
+
+    let section_size = stream.len();
+    img.extend_from_slice(&stream);
+
+    // __KERN_0 one 0x8000 page past __text; n contiguous 0x2000
+    // weight streams, no LUT tail
+    let kern_off = text_off + 0x8000;
+    let kern_payload = 0x2000 * n_streams;
+    let kern_vsz = (kern_payload + 0x3fff) & !0x3fff;
+    img.resize(kern_off + kern_vsz, 0);
+    for (j, w) in streams.iter().enumerate() {
+        let inter = weight_interleave(w, C);
+        for b in 0..16usize {
+            let base = kern_off + 0x2000 * j + b * 0x200;
+            for (i, v) in inter[b * 256..b * 256 + 256].iter().enumerate() {
+                img[base + i * 2..base + i * 2 + 2]
+                    .copy_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
+
+    // layer-count scalars — the record-end fields use the
+    // 0x40-aligned text size like the other families
+    let aligned = (section_size + 0x3f) / 0x40 * 0x40;
+    put_u32(&mut img, 0x1c0, text_off as u32);
+    put_u32(&mut img, 0x208, section_size as u32);
+    put_u32(&mut img, 0x210, text_off as u32);
+    put_u32(&mut img, 0x21c, layers as u32);
+    put_u32(&mut img, 0x250, 0x3000_8000 + aligned as u32);
+    put_u32(&mut img, 0x260, text_off as u32 + aligned as u32);
+    put_u32(&mut img, 0x2a0, kern_vsz as u32);
+    put_u32(&mut img, 0x2a8, kern_off as u32);
+    put_u32(&mut img, 0x2b0, kern_vsz as u32);
+    img[0x2f0..0x2f8].copy_from_slice(&(kern_payload as u64).to_le_bytes());
+    put_u32(&mut img, 0x2f8, kern_off as u32);
+    put_u32(&mut img, 0x378, 0x3000_8000 + aligned as u32);
+    img[0xb7c..0xb7e].copy_from_slice(
+        &((0xec + 0xcc * (layers - 1) + if layers > 1 { 5 } else { 0 }) as u16)
+            .to_le_bytes(),
+    );
+    img[0xb88..0xb8c].copy_from_slice(&((5 * layers) as u32).to_le_bytes());
+    img[0xbb8..0xbba]
+        .copy_from_slice(&((0x49 + 0x46 * (layers - 1)) as u16).to_le_bytes());
+    Ok(img)
+}
+
 /// Matmul shape families with a captured skeleton.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MmShape {
@@ -2220,6 +2501,62 @@ mod tests {
                 &wrefs,
                 &format!("/tmp/ane_sm/{case}/net.mil"),
                 &format!("/tmp/ane_sm/{case}/out/net.macho"),
+            )
+            .unwrap();
+            std::env::remove_var("HWX_SIG_ANEC");
+            let diffs: Vec<usize> = (0..expect.len().min(img.len()))
+                .filter(|&i| img[i] != expect[i])
+                .collect();
+            assert!(
+                diffs.is_empty() && img.len() == expect.len(),
+                "{case}: {} diffs, first at {:#x}",
+                diffs.len(),
+                diffs.first().copied().unwrap_or(0)
+            );
+        }
+    }
+
+    /// Layer-norm fused chains — `(conv -> layer_norm)^k` is one
+    /// fused task per layer (5 task ids, bank-select parity
+    /// alternation). Shared cases use all-ones weights; dw uses
+    /// `w[i] = i + seeds[j]` with seeds `[1, 0x5555, 0xaaaa, 0x3333]`.
+    #[test]
+    fn conv_ln_chain_byte_identical() {
+        let _g = SIG_LOCK.lock().unwrap();
+        const SEEDS: [u32; 4] = [1, 0x5555, 0xaaaa, 0x3333];
+        for (layers, n_blobs, asset, case) in [
+            (1usize, 1usize, "conv_ln1_skeleton.hwx", "ln1"),
+            (2, 1, "conv_ln2_reference.hwx", "ln2"),
+            (3, 1, "conv_ln3_skeleton.hwx", "ln3"),
+            (4, 1, "conv_ln4_skeleton.hwx", "ln4"),
+            (5, 1, "conv_ln5_reference.hwx", "ln5"),
+            (6, 1, "conv_ln6_reference.hwx", "ln6"),
+            (2, 2, "conv_lndw2_reference.hwx", "lndw2"),
+            (3, 3, "conv_lndw3_reference.hwx", "lndw3"),
+            (4, 4, "conv_lndw4_reference.hwx", "lndw4"),
+        ] {
+            let expect = std::fs::read(format!(
+                "{}/assets/{asset}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap();
+            let weights: Vec<Vec<u16>> = (0..layers)
+                .map(|i| {
+                    let j = i % n_blobs;
+                    if n_blobs == 1 {
+                        vec![0x3c00u16; 64 * 64]
+                    } else {
+                        (0..64u32 * 64).map(|e| (e + SEEDS[j]) as u16).collect()
+                    }
+                })
+                .collect();
+            let wrefs: Vec<&[u16]> = weights.iter().map(|w| w.as_slice()).collect();
+            std::env::set_var("HWX_SIG_ANEC", "1");
+            let img = emit_conv_ln_n_dw(
+                layers,
+                &wrefs,
+                &format!("/tmp/ane_ln/{case}/net.mil"),
+                &format!("/tmp/ane_ln/{case}/out/net.macho"),
             )
             .unwrap();
             std::env::remove_var("HWX_SIG_ANEC");
