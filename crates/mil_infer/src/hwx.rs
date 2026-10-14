@@ -650,17 +650,20 @@ fn tail_meta(skel: &[u8]) -> (Vec<(String, u8, u8, u16, u64)>, Option<[u8; 8]>) 
 }
 
 /// Rebuild the variable tail after `tail_off` — signature command,
-/// `rt.version`, `LC_SYMTAB`, symtab, strtab, optional `__text`
-/// reloc — then splice the section content at `0x4000` back on and
-/// fix `sizeofcmds` / the `__text` reloff field.
-fn rebuild_tail_at(
+/// `rt.version`, `LC_SYMTAB`, symtab, strtab, then the `relocs`
+/// `__text` relocation entries — and pad to the section's `0x4000`
+/// alignment boundary. Returns the image prefix and the `__text`
+/// section file offset (which floats past `0x4000` when the tail
+/// overflows it); callers append the section content. Fixes
+/// `sizeofcmds` and the `__text` reloff field.
+fn build_tail_at(
     skel: &[u8],
     tail_off: usize,
     entries: &[(String, u8, u8, u16, u64)],
-    reloc: Option<[u8; 8]>,
+    relocs: &[[u8; 8]],
     mil_path: &str,
     out_path: &str,
-) -> Vec<u8> {
+) -> (Vec<u8>, usize) {
     let sig = signature(mil_path, out_path);
     let sig_pad = (8 - (sig.len() + 1) % 8) % 8 + 1;
     let csz = 8 + sig.len() + sig_pad;
@@ -705,18 +708,38 @@ fn rebuild_tail_at(
     tail.extend_from_slice(&strtab);
 
     let mut img = skel[..tail_off].to_vec();
-    if let Some(reloc) = reloc {
+    if !relocs.is_empty() {
         let reloff = tail_off + (tail.len() + 7) / 8 * 8;
         while tail_off + tail.len() < reloff {
             tail.push(0);
         }
-        tail.extend_from_slice(&reloc);
+        for r in relocs {
+            tail.extend_from_slice(r);
+        }
         put_u32(&mut img, 0x218, reloff as u32);
     }
     img.extend_from_slice(&tail);
-    img.resize(0x4000, 0);
-    img.extend_from_slice(&skel[0x4000..]);
     put_u32(&mut img, 0x14, (tail_off + csz + 0x30 + 0x18 - 0x20) as u32);
+    let text_off = (img.len() + 0x3fff) & !0x3fff;
+    img.resize(text_off, 0);
+    (img, text_off)
+}
+
+/// Rebuild the tail and splice the skeleton's section content at
+/// `0x4000` back on — the shared-layout fast path used by the
+/// single-stream emitters.
+fn rebuild_tail_at(
+    skel: &[u8],
+    tail_off: usize,
+    entries: &[(String, u8, u8, u16, u64)],
+    reloc: Option<[u8; 8]>,
+    mil_path: &str,
+    out_path: &str,
+) -> Vec<u8> {
+    let relocs: &[[u8; 8]] = reloc.as_ref().map(std::slice::from_ref).unwrap_or(&[]);
+    let (mut img, text_off) = build_tail_at(skel, tail_off, entries, relocs, mil_path, out_path);
+    debug_assert_eq!(text_off, 0x4000);
+    img.extend_from_slice(&skel[0x4000..]);
     img
 }
 
@@ -825,10 +848,15 @@ fn patch_lane_idx(rec: &mut [u8], i: usize) {
 /// Record-field model (decoded from ANEC k=1..5 references):
 /// - `+0x00` position flag: `01` first/interior, `09` last
 /// - `+0x08` output descriptor: `40 00` interior, `c0 02` last
+/// - `+0x09` weight-stream release: `02` at the last use of the
+///   record's stream, else `00`; `+0x0a` = stream ordinal + 1
 /// - `+0x0e..+0x4e` lane indices = layer index `i`
 /// - `+0x100` fused-sigmoid wiring: buffer release/alloc pairs
 ///   `(4(i-1), 0x10)` / `(4i, 0x10)` around a `52 10/90` gate word,
 ///   `41 10 04 80` header at `i==1`, `41 10 06 80` at `i>=2`
+/// - u32 after each `44 95 80 23` marker = the record's
+///   `__KERN_0` weight-stream offset (`ordinal * 0x2800`); also the
+///   relocation target for that record
 /// - `+0x140`/`+0x150`/`+0x158` (interior) and `+0x170`/`+0x180`/
 ///   `+0x188` (first): next-record-is-terminal markers
 ///   (`0x56/0x64`, `0x20/0x60`, `1/0`)
@@ -844,27 +872,162 @@ pub fn emit_conv_sig_n(
     mil_path: &str,
     out_path: &str,
 ) -> Result<Vec<u8>, String> {
-    if layers == 1 {
-        return emit_conv_sig(weights, mil_path, out_path);
-    }
-    const C: usize = 64;
     if layers == 0 {
         return Err("layers must be >= 1".into());
     }
-    if weights.len() != C * C {
-        return Err(format!("expected {} weights, got {}", C * C, weights.len()));
+    let ws = vec![weights; layers];
+    emit_conv_sig_n_dw(layers, &ws, mil_path, out_path)
+}
+
+/// `K<sha256>_ne_<lane>` kernel names for the `__KERN_0` weight-stream
+/// band groups of the C=64 fused conv+sigmoid family, indexed by
+/// stream ordinal (`offset / 0x2800`). The hash covers ANEC's
+/// internal kernel descriptor keyed on the stream offset — verified
+/// weight-content-independent (swapping blob contents across streams
+/// does not move the names). Mined from ANEC dw-chain artifacts;
+/// chains needing more streams must mine further names.
+const KERNEL_NAME_BY_STREAM: [&str; 8] = [
+    "K471CD71E4391E230B902F296B69E5C520A7450E528ADDDECBA7C4B89BF69E305",
+    "K92076DC27A23A00AF80F5C7FEE82ECAE76AFCF0798A5DBC62E018B79689621F7",
+    "KCB4FC07CDB3A236D799A29B19EE78706DD656A97C6F03E7A7305D33C1C28A7FA",
+    "K4F0A8C558FC8858B7F053216004595AE14C49FF642AA70F4A776D04E80821457",
+    "K00CB9FC85E0D61B8D56401323B3377D3491AFCE66043902D05283FD80853D74F",
+    "KAC5658BCDBBC20FEAD05C3C7CA32BDA57E0C1E3022DA043890A0C582AD84029C",
+    "KDAB1BD6B4EE32537508DF702D04D4D97BAB62348B1164420A810790C675939CF",
+    "KB03EFB6AB1251DC6329B01C8A2A5077965107E4FB519A359D1D8D708B9A76A85",
+];
+
+/// Section-relative offset of each layer record's weight-stream
+/// field — the u32 right after the `44 95 80 23` marker, which is
+/// also the record's relocation `r_address`.
+fn chain_stream_field(i: usize, layers: usize) -> usize {
+    if i == 0 {
+        0x180
+    } else {
+        let rec_rel = 0x1c0 + (i - 1) * 0x160;
+        rec_rel
+            + if i == layers - 1 {
+                if i == 1 {
+                    0x150
+                } else {
+                    0x154
+                }
+            } else if i == 1 {
+                0x12c
+            } else {
+                0x130
+            }
     }
+}
+
+/// Emit a complete HWX image for `(conv1x1 -> sigmoid)^k` where each
+/// layer references its own `C=64` weight blob. Blobs are
+/// deduplicated by content into `__KERN_0` band-group streams (one
+/// `0x2800` group per unique blob, in first-use order); each record
+/// carries its stream ordinal, a last-use release flag, and the
+/// stream's byte offset in the relocated descriptor field.
+///
+/// Multi-stream artifacts restructure: the `__text` plane floats to
+/// the next `0x4000` boundary when the expanded symtab/strtab/reloc
+/// tail overflows `0x4000`, `__KERN_0` floats to the next boundary
+/// after `__const`, and the symtab gains one `K<hash>_ne_<lane>`
+/// name set per stream.
+pub fn emit_conv_sig_n_dw(
+    layers: usize,
+    weights: &[&[u16]],
+    mil_path: &str,
+    out_path: &str,
+) -> Result<Vec<u8>, String> {
+    const C: usize = 64;
+    if layers == 0 || weights.len() != layers {
+        return Err(format!("expected {layers} weight blobs, got {}", weights.len()));
+    }
+    for w in weights {
+        if w.len() != C * C {
+            return Err(format!("expected {} weights, got {}", C * C, w.len()));
+        }
+    }
+    if layers == 1 {
+        return emit_conv_sig(weights[0], mil_path, out_path);
+    }
+    // dedup blobs by content, first-use order
+    let mut streams: Vec<&[u16]> = Vec::new();
+    let mut ords = Vec::with_capacity(layers);
+    for w in weights {
+        match streams.iter().position(|s| *s == *w) {
+            Some(o) => ords.push(o),
+            None => {
+                ords.push(streams.len());
+                streams.push(w);
+            }
+        }
+    }
+    if streams.len() > KERNEL_NAME_BY_STREAM.len() {
+        return Err(format!(
+            "{} distinct weight streams exceeds mined kernel-name table ({})",
+            streams.len(),
+            KERNEL_NAME_BY_STREAM.len()
+        ));
+    }
+    let mut last_use = vec![0usize; streams.len()];
+    for (i, &o) in ords.iter().enumerate() {
+        last_use[o] = i;
+    }
+
     let stream_len = REC_HDR.1
         + REC_FIRST.1
         + REC_INT.1 * (layers - 2)
         + if layers == 2 { REC_LAST1.1 } else { REC_LAST.1 };
-    if 0x4000 + stream_len > CONV_WEIGHTS_OFF {
+    if stream_len > 0x4000 {
         return Err(format!("chain of {layers} layers overflows the record plane"));
     }
 
     let skel = SKELETON_CONV_SIG5;
-    let (entries, reloc) = tail_meta(skel);
-    let mut img = rebuild_tail_at(skel, CONV_TAIL_OFF, &entries, reloc, mil_path, out_path);
+    let (skel_entries, skel_reloc) = tail_meta(skel);
+
+    // symtab: [x, z] + ne_0 for each stream + per-stream ne_1..15 +
+    // the scalar type-descriptor entries copied from the skeleton
+    let mut entries = Vec::with_capacity(2 + 16 * streams.len() + skel_entries.len() - 18);
+    entries.push(skel_entries[0].clone());
+    entries.push(skel_entries[1].clone());
+    // the `_ne_0` band symbol carries n_desc=2; `_ne_1..15` carry 0
+    let tpl0 = skel_entries[2].clone();
+    let tpln = skel_entries[3].clone();
+    for (j, name) in KERNEL_NAME_BY_STREAM.iter().enumerate().take(streams.len()) {
+        entries.push((
+            format!("{name}_ne_0"),
+            tpl0.1,
+            tpl0.2,
+            tpl0.3,
+            0x3001_0000 + 0x2800 * j as u64,
+        ));
+    }
+    for (j, name) in KERNEL_NAME_BY_STREAM.iter().enumerate().take(streams.len()) {
+        for b in 1..16u64 {
+            entries.push((
+                format!("{name}_ne_{b}"),
+                tpln.1,
+                tpln.2,
+                tpln.3,
+                0x3001_0000 + 0x2800 * j as u64 + 0x280 * b,
+            ));
+        }
+    }
+    entries.extend_from_slice(&skel_entries[18..]);
+
+    // one relocation per record at the weight-stream field
+    let rflag: [u8; 4] = skel_reloc.unwrap()[4..8].try_into().unwrap();
+    let relocs: Vec<[u8; 8]> = (0..layers)
+        .map(|i| {
+            let mut e = [0u8; 8];
+            e[..4].copy_from_slice(&(chain_stream_field(i, layers) as u32).to_le_bytes());
+            e[4..].copy_from_slice(&rflag);
+            e
+        })
+        .collect();
+
+    let (mut img, text_off) =
+        build_tail_at(skel, CONV_TAIL_OFF, &entries, &relocs, mil_path, out_path);
 
     let mut rec = Vec::with_capacity(stream_len);
     rec.extend_from_slice(&skel[REC_HDR.0..REC_HDR.0 + REC_HDR.1]);
@@ -873,6 +1036,9 @@ pub fn emit_conv_sig_n(
     {
         let mut r = skel[REC_FIRST.0..REC_FIRST.0 + REC_FIRST.1].to_vec();
         let next_last = layers == 2;
+        r[0x09] = if last_use[ords[0]] == 0 { 2 } else { 0 };
+        r[0x0a] = ords[0] as u8 + 1;
+        r[0x150..0x154].copy_from_slice(&((ords[0] * 0x2800) as u32).to_le_bytes());
         r[0x172..0x174].copy_from_slice(&(if next_last { 0x63u16 } else { 0x55u16 }).to_le_bytes());
         r[0x17b] = if next_last { 4 } else { 0 };
         r[0x180] = if next_last { 0x60 } else { 0x20 };
@@ -908,6 +1074,11 @@ pub fn emit_conv_sig_n(
         for b in &mut r[0x100 + w.len()..0x140] {
             *b = 0;
         }
+        // stream-offset u32 follows the `44 95 80 23` marker
+        let foff = if i == 1 { 0x12c } else { 0x130 };
+        r[foff..foff + 4].copy_from_slice(&((ords[i] * 0x2800) as u32).to_le_bytes());
+        r[0x09] = if last_use[ords[i]] == i { 2 } else { 0 };
+        r[0x0a] = ords[i] as u8 + 1;
         let next_last = i + 1 == layers - 1;
         r[0x140..0x142].copy_from_slice(&(i as u16 + 1).to_le_bytes());
         r[0x142..0x144].copy_from_slice(&(if next_last { 0x64u16 } else { 0x56u16 }).to_le_bytes());
@@ -929,6 +1100,7 @@ pub fn emit_conv_sig_n(
     // layer index sits at `e0 00 <i>` (+0x142) and `31 00 <i> 01`.
     {
         let i = layers - 1;
+        let foff = if i == 1 { 0x150 } else { 0x154 };
         let mut r = if i == 1 {
             let mut r = SKELETON_CONV_SIG2[REC_LAST1.0..REC_LAST1.0 + REC_LAST1.1].to_vec();
             r[0x13e] = i as u8; // e0 00 <i>
@@ -944,66 +1116,76 @@ pub fn emit_conv_sig_n(
             r
         };
         patch_lane_idx(&mut r, i);
+        r[0x09] = 2;
+        r[0x0a] = ords[i] as u8 + 1;
+        r[foff..foff + 4].copy_from_slice(&((ords[i] * 0x2800) as u32).to_le_bytes());
         rec.extend_from_slice(&r);
     }
 
-    let stream_end = 0x4000 + rec.len();
-    debug_assert_eq!(stream_end, 0x4000 + stream_len);
-    img[0x4000..stream_end].copy_from_slice(&rec);
-    for b in &mut img[stream_end..CONV_WEIGHTS_OFF] {
-        *b = 0;
+    debug_assert_eq!(rec.len(), stream_len);
+    img.extend_from_slice(&rec);
+    // zero fill through the __const section, then pad __KERN_0 to the
+    // next 0x4000 boundary and splice each stream's band group
+    let const_end = text_off + (stream_len + 0x3f) / 0x40 * 0x40 + 0x4000;
+    img.resize(const_end, 0);
+    let kern_off = (const_end + 0x3fff) & !0x3fff;
+    img.resize(kern_off + 0x2800 * streams.len(), 0);
+    for (j, w) in streams.iter().enumerate() {
+        let stream = weight_interleave(w, C);
+        for b in 0..16usize {
+            let base = kern_off + j * 0x2800 + b * 0x280;
+            // fixed 128-byte sigmoid LUT, identical in every band
+            img[base..base + 0x80]
+                .copy_from_slice(&skel[CONV_WEIGHTS_OFF..CONV_WEIGHTS_OFF + 0x80]);
+            for (i, v) in stream[b * 256..b * 256 + 256].iter().enumerate() {
+                img[base + 0x80 + i * 2..base + 0x82 + i * 2]
+                    .copy_from_slice(&v.to_le_bytes());
+            }
+        }
     }
-    splice_conv_sig_weights(&mut img, weights);
-    patch_chain_scalars(&mut img, layers, stream_len);
+    img.resize(kern_off + (0x2800 * streams.len() + 0x3fff) & !0x3fff, 0);
+
+    patch_chain_scalars(
+        &mut img,
+        layers,
+        stream_len,
+        streams.len(),
+        text_off,
+        kern_off,
+    );
     Ok(img)
 }
 
-fn splice_conv_sig_weights(img: &mut [u8], weights: &[u16]) {
-    let stream = weight_interleave(weights, 64);
-    for b in 0..16usize {
-        let dst = CONV_WEIGHTS_OFF + b * 0x280 + 0x80;
-        for (i, v) in stream[b * 256..b * 256 + 256].iter().enumerate() {
-            img[dst + i * 2..dst + i * 2 + 2].copy_from_slice(&v.to_le_bytes());
-        }
-    }
-}
-
-/// Layer-count FVMLIB/section scalars for fused conv+sigmoid chains,
-/// plus the per-layer `__text` relocation table: one entry per record
-/// at the u32 immediately after each `44 95 80 23` kernel-descriptor
-/// marker (the __KERN_0 LUT pointer, patched by the loader).
-fn patch_chain_scalars(img: &mut [u8], layers: usize, stream_len: usize) {
-    let align = |n: usize| (n + 0x3f) & !0x3f;
-    let aligned = align(stream_len) as u16;
-    img[0x208..0x20c].copy_from_slice(&(stream_len as u32).to_le_bytes());
-    img[0x21c..0x220].copy_from_slice(&(layers as u32).to_le_bytes());
-    img[0x250..0x252].copy_from_slice(&(0x8000u16 + aligned).to_le_bytes());
-    img[0x260..0x262].copy_from_slice(&(0x4000u16 + aligned).to_le_bytes());
-    img[0x378..0x37a].copy_from_slice(&(0x8000u16 + aligned).to_le_bytes());
+/// Layer-count FVMLIB/section scalars for fused conv+sigmoid chains
+/// and the `__KERN_0` stream sizing for multi-stream (distinct
+/// weight) layouts: `text_off` is the floated `__text` file offset,
+/// `kern_off` the `__KERN_0` file offset.
+fn patch_chain_scalars(
+    img: &mut [u8],
+    layers: usize,
+    stream_len: usize,
+    n_streams: usize,
+    text_off: usize,
+    kern_off: usize,
+) {
+    let aligned = (stream_len + 0x3f) / 0x40 * 0x40;
+    let kern_payload = 0x2800 * n_streams;
+    let kern_vsz = (kern_payload + 0x3fff) & !0x3fff;
+    put_u32(img, 0x1c0, text_off as u32); // __TEXT segment fileoff
+    put_u32(img, 0x208, stream_len as u32); // __text section size
+    put_u32(img, 0x210, text_off as u32); // __text section fileoff
+    put_u32(img, 0x21c, layers as u32); // __text nreloc
+    img[0x250..0x252].copy_from_slice(&(0x8000u16 + aligned as u16).to_le_bytes()); // __const va
+    put_u32(img, 0x260, (text_off + aligned) as u32); // __const fileoff
+    put_u32(img, 0x2a0, kern_vsz as u32); // __KERN_0 segment vsize
+    put_u32(img, 0x2a8, kern_off as u32); // __KERN_0 segment fileoff
+    put_u32(img, 0x2b0, kern_vsz as u32); // __KERN_0 segment filesize
+    img[0x2f0..0x2f8].copy_from_slice(&(kern_payload as u64).to_le_bytes()); // section size
+    put_u32(img, 0x2f8, kern_off as u32); // __kern_0 section fileoff
+    img[0x378..0x37a].copy_from_slice(&(0x8000u16 + aligned as u16).to_le_bytes());
     img[0xb7c..0xb7e].copy_from_slice(&chain_b7c(layers).to_le_bytes());
     img[0xb88..0xb8c].copy_from_slice(&(layers as u32).to_le_bytes());
     img[0xbb8..0xbba].copy_from_slice(&((0xe * layers + 3) as u16).to_le_bytes());
-
-    // reloc table: rebuild_tail_at wrote the skeleton's single entry;
-    // overwrite with `layers` entries — one per record.
-    let reloff = u32::from_le_bytes(img[0x218..0x21c].try_into().unwrap()) as usize;
-    let flag = &img[reloff + 4..reloff + 8].to_vec();
-    let mut addrs = vec![0x180u32]; // first record's descriptor field
-    for i in 1..layers {
-        let rec_rel = 0x1c0 + (i - 1) * 0x160; // section-relative record start
-        let off = if i == layers - 1 {
-            if i == 1 { 0x150 } else { 0x154 } // terminal epilogue field
-        } else if i == 1 {
-            0x12c
-        } else {
-            0x130
-        };
-        addrs.push((rec_rel + off) as u32);
-    }
-    for (j, a) in addrs.iter().enumerate() {
-        img[reloff + j * 8..reloff + j * 8 + 4].copy_from_slice(&a.to_le_bytes());
-        img[reloff + j * 8 + 4..reloff + j * 8 + 8].copy_from_slice(flag);
-    }
 }
 
 /// `0xb7c` — byte-length of the fused-op payload descriptor list.
@@ -1242,6 +1424,56 @@ mod tests {
             let img = emit_conv_sig_n(
                 layers,
                 &weights,
+                &format!("/tmp/ane_corpus/{case}/net.mil"),
+                &format!("/tmp/ane_corpus/{case}/out/net.macho"),
+            )
+            .unwrap();
+            std::env::remove_var("HWX_SIG_ANEC");
+            let diffs: Vec<usize> = (0..expect.len().min(img.len()))
+                .filter(|&i| img[i] != expect[i])
+                .collect();
+            assert!(
+                diffs.is_empty() && img.len() == expect.len(),
+                "{case}: {} diffs, first at {:#x}",
+                diffs.len(),
+                diffs.first().copied().unwrap_or(0)
+            );
+        }
+    }
+
+    /// Distinct-weight chains — one `__KERN_0` band-group stream per
+    /// unique blob, per-record stream ordinals, floated `__text`/
+    /// `__KERN_0` planes, and per-stream `K<hash>_ne_<lane>` symbol
+    /// sets — must reproduce the ANEC artifacts byte-for-byte,
+    /// including the partially-shared `[A, B, A]` layering.
+    /// Weights regenerate the corpus pattern `w[i] = i + j*0x5555`.
+    #[test]
+    fn conv_sig_chain_dw_byte_identical() {
+        let _g = SIG_LOCK.lock().unwrap();
+        for (layers, n_blobs, asset, case) in [
+            (2usize, 2usize, "conv_sig2_dw_reference.hwx", "chain2_dw"),
+            (3, 3, "conv_sig3_dw_reference.hwx", "chain3_dw"),
+            (3, 2, "conv_sig3_pdw_reference.hwx", "chain3_pdw"),
+            (8, 8, "conv_sig8_dw_reference.hwx", "chain8_dw"),
+        ] {
+            let expect = std::fs::read(format!(
+                "{}/assets/{asset}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap();
+            let weights: Vec<Vec<u16>> = (0..layers)
+                .map(|i| {
+                    let j = (i % n_blobs) as u32;
+                    (0..64u32 * 64)
+                        .map(|e| (e + j * 0x5555) as u16)
+                        .collect()
+                })
+                .collect();
+            let wrefs: Vec<&[u16]> = weights.iter().map(|w| w.as_slice()).collect();
+            std::env::set_var("HWX_SIG_ANEC", "1");
+            let img = emit_conv_sig_n_dw(
+                layers,
+                &wrefs,
                 &format!("/tmp/ane_corpus/{case}/net.mil"),
                 &format!("/tmp/ane_corpus/{case}/out/net.macho"),
             )

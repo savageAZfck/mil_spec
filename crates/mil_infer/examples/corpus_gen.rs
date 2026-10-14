@@ -247,6 +247,11 @@ fn main() {
         ("chain5", 5, 1),
         ("chain2_dw", 2, 2),
         ("chain3_dw", 3, 3),
+        ("chain3_pdw", 3, 2),
+        ("chain4_dw", 4, 4),
+        ("chain5_dw", 5, 5),
+        ("chain6_dw", 6, 6),
+        ("chain8_dw", 8, 8),
     ] {
         let dir = root.join(tag);
         fs::create_dir_all(dir.join("out")).unwrap();

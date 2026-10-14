@@ -10,8 +10,8 @@
 
 use mil_infer::espresso::EspressoProgram;
 use mil_infer::hwx::{
-    emit_conv1x1, emit_conv_sig, emit_conv_sig_n, emit_elementwise2, emit_matmul, emit_unary_lut, ConvShape, EwOp,
-    LutOp, MmShape,
+    emit_conv1x1, emit_conv_sig, emit_conv_sig_n, emit_conv_sig_n_dw, emit_elementwise2,
+    emit_matmul, emit_unary_lut, ConvShape, EwOp, LutOp, MmShape,
 };
 use std::path::{Path, PathBuf};
 
@@ -181,12 +181,21 @@ fn main() {
             println!("emitted {} ({} bytes)", out.display(), img.len());
         }
         Some("emit-csn") => {
-            // emit-csn <layers> <weights.bin> <out.macho>  (conv->sig)^k
+            // emit-csn <layers> <weights.bin[,w2.bin,...]> <out.macho>
+            //   (conv->sig)^k — comma-separated list gives per-layer
+            //   distinct weight blobs (deduplicated into streams)
             let k: usize = a[2].parse().unwrap();
-            let w = load_weights(&a[3]);
             let out = PathBuf::from(&a[4]);
             let mil = format!("{}.mil", out.display());
-            let img = emit_conv_sig_n(k, &w, &mil, &out.display().to_string()).unwrap();
+            let wfiles: Vec<&str> = a[3].split(',').collect();
+            let img = if wfiles.len() == 1 {
+                let w = load_weights(wfiles[0]);
+                emit_conv_sig_n(k, &w, &mil, &out.display().to_string()).unwrap()
+            } else {
+                let ws: Vec<Vec<u16>> = wfiles.iter().map(|f| load_weights(f)).collect();
+                let wrefs: Vec<&[u16]> = ws.iter().map(|w| w.as_slice()).collect();
+                emit_conv_sig_n_dw(k, &wrefs, &mil, &out.display().to_string()).unwrap()
+            };
             std::fs::write(&out, &img).unwrap();
             println!("emitted {} ({} bytes)", out.display(), img.len());
         }
@@ -272,6 +281,38 @@ fn main() {
                 let mil = format!("{}/{name}/net.mil", dir.display());
                 let out = format!("{}/{name}/out/net.macho", dir.display());
                 let ours = emit_conv_sig_n(k, &w, &mil, &out).unwrap();
+                total += diff_report(&ours, &std::fs::read(&reff).unwrap(), name);
+            }
+            // distinct-weight chains — one __KERN_0 stream per blob
+            for (name, k, n_blobs) in [
+                ("chain2_dw", 2usize, 2usize),
+                ("chain3_dw", 3, 3),
+                ("chain3_pdw", 3, 2),
+                ("chain4_dw", 4, 4),
+                ("chain5_dw", 5, 5),
+                ("chain6_dw", 6, 6),
+                ("chain8_dw", 8, 8),
+            ] {
+                let reff = dir.join(name).join("out").join("net.macho");
+                if !reff.exists() {
+                    println!("  {name}: no reference, skipped");
+                    continue;
+                }
+                let ws: Vec<Vec<u16>> = (0..k)
+                    .map(|i| {
+                        let j = i % n_blobs;
+                        let f = if j == 0 {
+                            "weight.bin".to_string()
+                        } else {
+                            format!("weight{}.bin", j + 1)
+                        };
+                        load_weights(&dir.join(name).join("weights").join(f).display().to_string())
+                    })
+                    .collect();
+                let wrefs: Vec<&[u16]> = ws.iter().map(|w| w.as_slice()).collect();
+                let mil = format!("{}/{name}/net.mil", dir.display());
+                let out = format!("{}/{name}/out/net.macho", dir.display());
+                let ours = emit_conv_sig_n_dw(k, &wrefs, &mil, &out).unwrap();
                 total += diff_report(&ours, &std::fs::read(&reff).unwrap(), name);
             }
             for (name, shape) in [("mm32p", MmShape::N32), ("mm64p", MmShape::N64)] {
