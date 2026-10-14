@@ -2585,22 +2585,13 @@ impl MmShape {
 /// streams, no `__KERN_0`, and no relocations. The variable front
 /// matter (signature + `rt.version` + `LC_SYMTAB`) ends at `0x33f0`.
 const SKELETON_MM_ACT64: &[u8] = include_bytes!("../assets/mm_act64_skeleton.hwx");
-/// Signature-command offset inside `SKELETON_MM_ACT64` — everything
-/// from here to `__text` at `0x8000` is regenerated.
-const MM_ACT_TAIL_OFF: usize = 0x33f0;
 
 /// Emit a complete HWX image for `z = matmul(x, y, transpose_y)` with
 /// both operands activations. Unlike [`emit_matmul`] there is no
 /// weight stream: the `__text` record and all-zero const pools are
 /// copied verbatim and only the signature block is rebuilt.
 pub fn emit_mm_act(mil_path: &str, out_path: &str) -> Vec<u8> {
-    let skel = SKELETON_MM_ACT64;
-    let (entries, relocs) = tail_meta(skel);
-    let (mut img, text_off) =
-        build_tail_at(skel, MM_ACT_TAIL_OFF, &entries, &relocs, mil_path, out_path);
-    debug_assert_eq!(text_off, 0x8000);
-    img.extend_from_slice(&skel[0x8000..]);
-    img
+    emit_mm_part(MmPart::Act64, mil_path, out_path)
 }
 
 /// `matmul -> softmax` fused skeleton — the QK^T+softmax attention
@@ -2610,54 +2601,93 @@ pub fn emit_mm_act(mil_path: &str, out_path: &str) -> Vec<u8> {
 /// `__text` relocation whose `reloff` field sits inside the `__text`
 /// section entry at `0x2b0`.
 const SKELETON_MMSM64: &[u8] = include_bytes!("../assets/mmsm64_skeleton.hwx");
-const MMSM_TAIL_OFF: usize = 0x3488;
-const MMSM_RELOFF_FIELD: usize = 0x2b0;
 /// `softmax -> matmul` fused skeleton — the softmax+PV attention
 /// partition. Same envelope as `SKELETON_MMSM64` with an extra
 /// `__DATA/__bss` segment; sig at `0x3540`, `__text` section entry at
 /// `0x310` (`reloff` field `0x348`), record `0x570`.
 const SKELETON_SMMM64: &[u8] = include_bytes!("../assets/smmm64_skeleton.hwx");
-const SMMM_TAIL_OFF: usize = 0x3540;
-const SMMM_RELOFF_FIELD: usize = 0x348;
+/// `matmul -> mul -> add -> softmax` — the masked+scaled QK^T
+/// partition over `[1,64,1,64]` (a constant scale `mul` folds into the
+/// fused task; `mm -> add -> softmax` produces the identical record).
+const SKELETON_MMADDSM: &[u8] = include_bytes!("../assets/mmaddsm_skeleton.hwx");
+/// `matmul -> mul -> softmax` over `[1,64,1,64]` with a constant
+/// tensor scale operand.
+const SKELETON_MMMULSM: &[u8] = include_bytes!("../assets/mmmulsm_skeleton.hwx");
+/// 4-D activation-matmul over `[1,8,64,64]` — heads×seq attention
+/// shape. `0x384` record, no relocs.
+const SKELETON_MM4D: &[u8] = include_bytes!("../assets/mm4d_skeleton.hwx");
+/// `matmul -> softmax` over `[1,8,64,64]` — the 4-D QK^T+softmax
+/// partition.
+const SKELETON_MMSM4D: &[u8] = include_bytes!("../assets/mmsm4d_skeleton.hwx");
 
-/// Emit `p = softmax(matmul(x, y^T))` — both operands activations —
-/// byte-identically for the `[1,64,1,64]` skeleton family.
-pub fn emit_mm_sm(mil_path: &str, out_path: &str) -> Vec<u8> {
-    let skel = SKELETON_MMSM64;
+/// Attention-partition skeleton variants — the compositions ANEC
+/// accepts around a single matmul (two chained matmuls are refused:
+/// `CompilationFailure`). Each variant is a distinct envelope:
+/// signature offset, `__text` section-entry `reloff` field, and
+/// section layout all differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MmPart {
+    /// `matmul(x, y)` `[1,64,1,64]` — bare PV/QK partition.
+    Act64,
+    /// `matmul -> softmax` `[1,64,1,64]` — QK^T+softmax.
+    MmSm64,
+    /// `softmax -> matmul` `[1,64,1,64]`.
+    SmMm64,
+    /// `matmul -> [mul ->] add -> softmax` `[1,64,1,64]` — masked
+    /// QK^T+softmax (constant scale folds into the fused task).
+    MmAddSm64,
+    /// `matmul -> mul -> softmax` `[1,64,1,64]` — scaled.
+    MmMulSm64,
+    /// `matmul(x, y)` `[1,8,64,64]` — heads×seq PV/QK partition.
+    Act4d,
+    /// `matmul -> softmax` `[1,8,64,64]` — heads×seq QK^T+softmax.
+    MmSm4d,
+}
+
+impl MmPart {
+    /// `(skeleton, sig tail offset, __text section reloff field)`.
+    fn spec(self) -> (&'static [u8], usize, usize) {
+        match self {
+            MmPart::Act64 => (SKELETON_MM_ACT64, 0x33f0, 0),
+            MmPart::MmSm64 => (SKELETON_MMSM64, 0x3488, 0x2b0),
+            MmPart::SmMm64 => (SKELETON_SMMM64, 0x3540, 0x348),
+            MmPart::MmAddSm64 => (SKELETON_MMADDSM, 0x4288, 0x348),
+            MmPart::MmMulSm64 => (SKELETON_MMMULSM, 0x3488, 0x2b0),
+            MmPart::Act4d => (SKELETON_MM4D, 0x34a8, 0x348),
+            MmPart::MmSm4d => (SKELETON_MMSM4D, 0x3540, 0x348),
+        }
+    }
+}
+
+/// Emit an attention-partition HWX image byte-identically on its
+/// skeleton family. All variants place `__text` at fileoff `0x8000`;
+/// everything before the signature command is skeleton-verbatim.
+pub fn emit_mm_part(part: MmPart, mil_path: &str, out_path: &str) -> Vec<u8> {
+    let (skel, tail_off, reloff_field) = part.spec();
     let (entries, _) = tail_meta(skel);
-    let relocs = reloc_entries(skel, MMSM_RELOFF_FIELD);
+    let relocs = if reloff_field != 0 {
+        reloc_entries(skel, reloff_field)
+    } else {
+        Vec::new()
+    };
     let (mut img, text_off) = build_tail_at_reloc(
-        skel,
-        MMSM_TAIL_OFF,
-        &entries,
-        &relocs,
-        mil_path,
-        out_path,
-        MMSM_RELOFF_FIELD,
+        skel, tail_off, &entries, &relocs, mil_path, out_path, reloff_field,
     );
     debug_assert_eq!(text_off, 0x8000);
     img.extend_from_slice(&skel[0x8000..]);
     img
 }
 
+/// Emit `p = softmax(matmul(x, y^T))` — both operands activations —
+/// byte-identically for the `[1,64,1,64]` skeleton family.
+pub fn emit_mm_sm(mil_path: &str, out_path: &str) -> Vec<u8> {
+    emit_mm_part(MmPart::MmSm64, mil_path, out_path)
+}
+
 /// Emit `z = matmul(softmax(x), y^T)` — both operands activations —
 /// byte-identically for the `[1,64,1,64]` skeleton family.
 pub fn emit_sm_mm(mil_path: &str, out_path: &str) -> Vec<u8> {
-    let skel = SKELETON_SMMM64;
-    let (entries, _) = tail_meta(skel);
-    let relocs = reloc_entries(skel, SMMM_RELOFF_FIELD);
-    let (mut img, text_off) = build_tail_at_reloc(
-        skel,
-        SMMM_TAIL_OFF,
-        &entries,
-        &relocs,
-        mil_path,
-        out_path,
-        SMMM_RELOFF_FIELD,
-    );
-    debug_assert_eq!(text_off, 0x8000);
-    img.extend_from_slice(&skel[0x8000..]);
-    img
+    emit_mm_part(MmPart::SmMm64, mil_path, out_path)
 }
 
 /// Emit a complete HWX image for `z = matmul(x, w, transpose_y)` on a
@@ -3195,24 +3225,25 @@ mod tests {
 
     /// The activation-matmul attention family must likewise reproduce
     /// the ANEC artifacts byte-for-byte: `matmul(x, y)` with both
-    /// operands program inputs, `matmul -> softmax`, and
-    /// `softmax -> matmul` — the three partitions an attention block
-    /// splits into (ANEC refuses two chained matmuls in one program).
+    /// operands program inputs, `matmul -> softmax`,
+    /// `softmax -> matmul`, masked/scaled QK^T partitions, and the
+    /// 4-D heads×seq forms — the partitions an attention block splits
+    /// into (ANEC refuses two chained matmuls in one program).
     #[test]
     fn mm_act_byte_identical() {
         let _g = SIG_LOCK.lock().unwrap();
-        for (f, case) in [
-            (emit_mm_act as fn(&str, &str) -> Vec<u8>, "mm_act64"),
-            (emit_mm_sm, "mmsm64"),
-            (emit_sm_mm, "smmm64"),
+        for (part, case, dir) in [
+            (MmPart::Act64, "mm_act64", "mm_act"),
+            (MmPart::MmSm64, "mmsm64", "mmsm"),
+            (MmPart::SmMm64, "smmm64", "smmm"),
+            (MmPart::MmAddSm64, "mmaddsm", "mmaddsm"),
+            (MmPart::MmMulSm64, "mmmulsm", "mmmulsm"),
+            (MmPart::Act4d, "mm4d", "mm4d"),
+            (MmPart::MmSm4d, "mmsm4d", "mmsm4d"),
         ] {
-            let dir = match case {
-                "mm_act64" => "mm_act",
-                "mmsm64" => "mmsm",
-                _ => "smmm",
-            };
             std::env::set_var("HWX_SIG_ANEC", "1");
-            let img = f(
+            let img = emit_mm_part(
+                part,
                 &format!("/tmp/ane_attn/{dir}/net.mil"),
                 &format!("/tmp/ane_attn/{dir}/out/net.macho/net.macho"),
             );
