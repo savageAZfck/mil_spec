@@ -116,7 +116,9 @@ fn mil_int(text: &str, v: &str) -> Option<i64> {
             let p = l.find("val =").unwrap();
             let rest = &l[p + 5..];
             if let Some(a) = rest.find('(') {
-                if let Ok(n) = rest[a + 1..].trim_end_matches(')').trim().parse() {
+                let inner = rest[a + 1..].trim_end_matches(|c: char| !c.is_numeric() && c != '-');
+                let inner = inner.trim_end_matches(')').trim();
+                if let Ok(n) = inner.parse() {
                     return Some(n);
                 }
             }

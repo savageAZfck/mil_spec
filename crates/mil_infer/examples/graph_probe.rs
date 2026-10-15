@@ -108,7 +108,7 @@ fn main() {
         tensor<fp16, [1, 64, 1, 64]> vnew = add(x = vcache, y = ev)[name = string("vnew")];
         tensor<fp16, [1, 64, 1, 1]> s = matmul(x = q, y = knew, transpose_y = bt)[name = string("s")];
         tensor<fp16, [1, 64, 1, 1]> sm2 = add(x = s, y = msk)[name = string("sm2")];
-        tensor<fp16, [1, 64, 1, 1]> p = softmax(x = sm2, axis = int32(1))[name = string("p")];
+        tensor<fp16, [1, 64, 1, 1]> p = softmax(x = sm2, axis = ax1)[name = string("p")];
         tensor<fp16, [1, 1, 1, 64]> aout = matmul(x = p, y = vnew, transpose_x = bt)[name = string("aout")];
         tensor<fp16, [1, 1, 1, 64]> o = matmul(x = aout, y = Wo, transpose_y = bt)[name = string("o")];
         tensor<fp16, [1, 64, 1, 1]> r1 = add(x = x, y = o)[name = string("r1")];
