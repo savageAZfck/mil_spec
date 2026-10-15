@@ -195,9 +195,9 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
             .map(|(_, p)| p.clone())
     };
     let blob_f32 = |name: &str| -> Option<Vec<f32>> {
-        let path = blob_of(name)?;
+        blob_of(name)?;
         Some(
-            hwx::load_blob_u16(&hwx::resolve_blob(&mil_dir, &path))
+            hwx::load_mil_weight_u16(&text, &mil_dir, name)
                 .ok()?
                 .iter()
                 .map(|b| half::f16::from_bits(*b).to_f32())
@@ -243,8 +243,7 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
         let wname = arg_of(o, "weight")
             .or_else(|| arg_of(o, "y"))
             .ok_or("op without weight operand")?;
-        let path = blob_of(wname).ok_or_else(|| format!("`{wname}` is not a blob const"))?;
-        hwx::load_blob_u16(&hwx::resolve_blob(&mil_dir, &path))
+        hwx::load_mil_weight_u16(&text, &mil_dir, wname)
     };
 
     let mut nodes: Vec<Node> = Vec::new();

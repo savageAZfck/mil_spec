@@ -5285,14 +5285,19 @@ pub(crate) fn mil_ops(text: &str) -> (Vec<MilOp>, Vec<(String, String)>) {
                 Some((k.trim().to_string(), v.trim().to_string()))
             })
             .collect();
+        let result = lhs
+            .rsplit(|c: char| c == ' ' || c == '>')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if op.starts_with("constexpr_") {
+            blobs.push((result, "__constexpr__".to_string()));
+            continue;
+        }
         ops.push(MilOp {
             op: op.to_string(),
-            result: lhs
-                .rsplit(|c: char| c == ' ' || c == '>')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_string(),
+            result,
             shape,
             args,
         });
@@ -5344,19 +5349,296 @@ pub(crate) fn func_input_shapes(text: &str) -> Vec<(String, Vec<i64>)> {
     out
 }
 
-/// Load the `u16` payload of a weight blob — deadbeef-headered blobs
-/// carry data at byte 128; bare files are read from offset 0.
-pub(crate) fn load_blob_u16(path: &std::path::Path) -> Result<Vec<u16>, String> {
+#[derive(Clone, Debug)]
+struct BlobDecl {
+    dtype: String,
+    shape: Vec<usize>,
+    path: String,
+    offset: u64,
+}
+
+fn load_blob_bytes_at(
+    path: &std::path::Path,
+    offset: u64,
+    raw_len: usize,
+) -> Result<Vec<u8>, String> {
     let b = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let off = if b.len() > 132 && &b[64..68] == b"\xef\xbe\xad\xde" {
-        128
+    let off = offset as usize;
+    if off + 64 <= b.len() && &b[off..off + 4] == b"\xef\xbe\xad\xde" {
+        let sz = u64::from_le_bytes(b[off + 8..off + 16].try_into().unwrap()) as usize;
+        let doff = u64::from_le_bytes(b[off + 16..off + 24].try_into().unwrap()) as usize;
+        if doff + sz > b.len() {
+            return Err(format!("{}: truncated blob at {off}", path.display()));
+        }
+        return Ok(b[doff..doff + sz].to_vec());
+    }
+    if off == 0 && b.len() > 132 && &b[64..68] == b"\xef\xbe\xad\xde" {
+        let sz = u64::from_le_bytes(b[72..80].try_into().unwrap()) as usize;
+        let doff = u64::from_le_bytes(b[80..88].try_into().unwrap()) as usize;
+        if doff + sz <= b.len() {
+            return Ok(b[doff..doff + sz].to_vec());
+        }
+        return Ok(b[128..].to_vec());
+    }
+    if raw_len > 0 && off + raw_len <= b.len() {
+        Ok(b[off..off + raw_len].to_vec())
+    } else if off <= b.len() {
+        Ok(b[off..].to_vec())
     } else {
+        Err(format!(
+            "{}: offset {off} past EOF {}",
+            path.display(),
+            b.len()
+        ))
+    }
+}
+
+fn decode_blob_f32(d: &BlobDecl, mil_dir: &std::path::Path) -> Result<Vec<f32>, String> {
+    let numel: usize = if d.shape.is_empty() {
         0
+    } else {
+        d.shape.iter().product()
     };
-    Ok(b[off..]
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect())
+    let raw_len = match d.dtype.as_str() {
+        "int8" | "uint8" => numel,
+        "uint4" | "int4" => numel.div_ceil(2),
+        _ => numel * 2,
+    };
+    let raw = load_blob_bytes_at(&resolve_blob(mil_dir, &d.path), d.offset, raw_len)?;
+    Ok(match d.dtype.as_str() {
+        "int8" => raw.iter().map(|&b| (b as i8) as f32).collect(),
+        "uint8" => raw.iter().map(|&b| b as f32).collect(),
+        "uint4" => {
+            let mut v = Vec::with_capacity(raw.len() * 2);
+            for &b in &raw {
+                v.push((b & 0x0f) as f32);
+                v.push((b >> 4) as f32);
+            }
+            if numel > 0 {
+                v.truncate(numel);
+            }
+            v
+        }
+        "int4" => {
+            let s4 = |n: u8| (((n as i8) << 4) >> 4) as f32;
+            let mut v = Vec::with_capacity(raw.len() * 2);
+            for &b in &raw {
+                v.push(s4(b & 0x0f));
+                v.push(s4(b >> 4));
+            }
+            if numel > 0 {
+                v.truncate(numel);
+            }
+            v
+        }
+        _ => raw
+            .chunks_exact(2)
+            .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+            .collect(),
+    })
+}
+
+/// Resolve a MIL weight operand by name — supports direct `BLOBFILE`
+/// `const()` declarations (with `offset = uint64(...)` in multi-blob
+/// `weight.bin` files or bare files), `constexpr_blockwise_shift_scale`
+/// (per-channel int8, blockwise Q8_0 int8, blockwise Q4_0 uint4/int8
+/// with offset), and `constexpr_lut_to_dense` (palette4).
+pub(crate) fn load_mil_weight_u16(
+    text: &str,
+    mil_dir: &std::path::Path,
+    target: &str,
+) -> Result<Vec<u16>, String> {
+    let joined = {
+        let mut out = String::with_capacity(text.len());
+        for raw in text.lines() {
+            let line = raw.trim_end();
+            if out.ends_with(" =")
+                && line
+                    .trim_start()
+                    .starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            {
+                out.push(' ');
+                out.push_str(line.trim_start());
+            } else {
+                out.push('\n');
+                out.push_str(line);
+            }
+        }
+        out
+    };
+    let mut decls: std::collections::HashMap<String, BlobDecl> = std::collections::HashMap::new();
+    let mut cexprs: std::collections::HashMap<String, (String, Vec<(String, String)>)> =
+        std::collections::HashMap::new();
+    for raw in joined.lines() {
+        let line = raw.trim();
+        let Some(eq) = line.find(" = ") else { continue };
+        let (lhs, rhs) = line.split_at(eq);
+        let rhs = &rhs[3..];
+        let name = lhs
+            .rsplit(|c: char| c == ' ' || c == '>')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let dtype = lhs
+            .find("tensor<")
+            .and_then(|t| {
+                let after = &lhs[t + 7..];
+                after
+                    .find(|c: char| c == ',' || c == '>')
+                    .map(|e| after[..e].trim().to_string())
+            })
+            .unwrap_or_else(|| "fp16".to_string());
+        let shape: Vec<usize> = lhs
+            .find('[')
+            .and_then(|l| lhs.find(']').map(|r| (l, r)))
+            .map(|(l, r)| {
+                lhs[l + 1..r]
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<usize>().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        const BLOB_PFX: &str = "BLOBFILE(path = string(\"";
+        if let Some(bp) = rhs.find(BLOB_PFX) {
+            let rest = &rhs[bp + BLOB_PFX.len()..];
+            if let Some(end) = rest.find('"') {
+                let path = rest[..end].to_string();
+                let offset = rhs
+                    .find("offset = uint64(")
+                    .and_then(|p| {
+                        let a = &rhs[p + 16..];
+                        a.find(')').and_then(|e| a[..e].trim().parse::<u64>().ok())
+                    })
+                    .unwrap_or(0);
+                decls.insert(
+                    name,
+                    BlobDecl {
+                        dtype,
+                        shape,
+                        path,
+                        offset,
+                    },
+                );
+            }
+            continue;
+        }
+        let Some(paren) = rhs.find('(') else { continue };
+        let op = rhs[..paren].trim();
+        if op.starts_with("constexpr_") {
+            let close = rhs[paren..]
+                .find(")[")
+                .or_else(|| rhs[paren..].find(");"))
+                .map(|i| paren + i)
+                .unwrap_or(rhs.len());
+            let args: Vec<(String, String)> = rhs[paren + 1..close]
+                .split(',')
+                .filter_map(|a| {
+                    let (k, v) = a.split_once('=')?;
+                    Some((k.trim().to_string(), v.trim().to_string()))
+                })
+                .collect();
+            cexprs.insert(name, (op.to_string(), args));
+        }
+    }
+    if let Some(d) = decls.get(target) {
+        let numel: usize = if d.shape.is_empty() {
+            0
+        } else {
+            d.shape.iter().product()
+        };
+        let raw = load_blob_bytes_at(&resolve_blob(mil_dir, &d.path), d.offset, numel * 2)?;
+        return Ok(raw
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect());
+    }
+    if let Some((op, args)) = cexprs.get(target) {
+        let arg = |k: &str| -> Option<&str> {
+            args.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str())
+        };
+        match op.as_str() {
+            "constexpr_blockwise_shift_scale" => {
+                let dname = arg("data").ok_or("constexpr_blockwise_shift_scale missing data")?;
+                let sname = arg("scale").ok_or("constexpr_blockwise_shift_scale missing scale")?;
+                let dd = decls
+                    .get(dname)
+                    .ok_or_else(|| format!("data `{dname}` not a blob const"))?;
+                let sd = decls
+                    .get(sname)
+                    .ok_or_else(|| format!("scale `{sname}` not a blob const"))?;
+                let dv = decode_blob_f32(dd, mil_dir)?;
+                let sv = decode_blob_f32(sd, mil_dir)?;
+                let ov = match arg("offset") {
+                    Some(oname) => {
+                        let od = decls
+                            .get(oname)
+                            .ok_or_else(|| format!("offset `{oname}` not a blob const"))?;
+                        Some(decode_blob_f32(od, mil_dir)?)
+                    }
+                    None => None,
+                };
+                let mut out = Vec::with_capacity(dv.len());
+                if dd.shape.len() == sd.shape.len() && !dd.shape.is_empty() {
+                    let r = dd.shape.len();
+                    let mut d_str = vec![1usize; r];
+                    let mut s_str = vec![1usize; r];
+                    for m in (0..r - 1).rev() {
+                        d_str[m] = d_str[m + 1] * dd.shape[m + 1].max(1);
+                        s_str[m] = s_str[m + 1] * sd.shape[m + 1].max(1);
+                    }
+                    let blk: Vec<usize> = (0..r)
+                        .map(|m| (dd.shape[m].max(1) / sd.shape[m].max(1)).max(1))
+                        .collect();
+                    for (idx, &x) in dv.iter().enumerate() {
+                        let mut rem = idx;
+                        let mut s_idx = 0usize;
+                        for m in 0..r {
+                            let c = rem / d_str[m];
+                            rem %= d_str[m];
+                            let sc = (c / blk[m]).min(sd.shape[m].max(1) - 1);
+                            s_idx += sc * s_str[m];
+                        }
+                        let z = ov.as_ref().map(|o| o[s_idx]).unwrap_or(0.0);
+                        out.push(half::f16::from_f32((x - z) * sv[s_idx]).to_bits());
+                    }
+                } else {
+                    let blk = (dv.len() / sv.len().max(1)).max(1);
+                    for (idx, &x) in dv.iter().enumerate() {
+                        let s_idx = (idx / blk).min(sv.len() - 1);
+                        let z = ov.as_ref().map(|o| o[s_idx]).unwrap_or(0.0);
+                        out.push(half::f16::from_f32((x - z) * sv[s_idx]).to_bits());
+                    }
+                }
+                return Ok(out);
+            }
+            "constexpr_lut_to_dense" => {
+                let iname = arg("indices").ok_or("constexpr_lut_to_dense missing indices")?;
+                let lname = arg("lut").ok_or("constexpr_lut_to_dense missing lut")?;
+                let id = decls
+                    .get(iname)
+                    .ok_or_else(|| format!("indices `{iname}` not a blob const"))?;
+                let ld = decls
+                    .get(lname)
+                    .ok_or_else(|| format!("lut `{lname}` not a blob const"))?;
+                let codes = decode_blob_f32(id, mil_dir)?;
+                let lut = decode_blob_f32(ld, mil_dir)?;
+                let rows = id.shape.first().copied().unwrap_or(1).max(1);
+                let row_len = (codes.len() / rows).max(1);
+                let mut out = Vec::with_capacity(codes.len());
+                for (i, &c) in codes.iter().enumerate() {
+                    let r = (i / row_len).min(rows - 1);
+                    let k = (c as usize) & 0x0f;
+                    out.push(half::f16::from_f32(lut[r * 16 + k]).to_bits());
+                }
+                return Ok(out);
+            }
+            other => return Err(format!("unsupported constexpr `{other}`")),
+        }
+    }
+    Err(format!(
+        "weight `{target}` is not a blob or constexpr const"
+    ))
 }
 
 /// Resolve a `BLOBFILE` path — `@model_path/` prefixes and relative
@@ -5500,9 +5782,7 @@ fn emit_from_mil_inner(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String
     };
     let weights_of = |op: &MilOp| -> Result<Vec<u16>, String> {
         let wname = arg(op, "weight").ok_or("conv without weight operand")?;
-        let path =
-            blob_of(&wname).ok_or_else(|| format!("weight `{wname}` is not a blob const"))?;
-        load_blob_u16(&resolve_blob(&mil_dir, &path))
+        load_mil_weight_u16(&text, &mil_dir, &wname)
     };
     let names: Vec<&str> = ops.iter().map(|o| o.op.as_str()).collect();
     let elems = |o: &MilOp| -> u32 { o.shape.iter().map(|d| (*d).max(1) as u32).product() };
@@ -5671,7 +5951,7 @@ fn emit_from_mil_inner(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String
         // activation) or the parametric M=1 non-square emitter
         // (`[1,1,1,K] x [1,N,1,K]`, transpose_y).
         let y = arg(&ops[0], "y").unwrap_or_default();
-        if let Some(path) = blob_of(&y) {
+        if blob_of(&y).is_some() {
             let o = &ops[0].shape;
             let m = o.get(1).copied().unwrap_or(0) as usize;
             let n = o.get(3).copied().unwrap_or(0) as usize;
@@ -5688,7 +5968,7 @@ fn emit_from_mil_inner(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String
             } else {
                 xs.get(2).copied().unwrap_or(1).max(1) as usize
             };
-            let w = load_blob_u16(&resolve_blob(&mil_dir, &path))?;
+            let w = load_mil_weight_u16(&text, &mil_dir, &y)?;
             let ty = match arg(&ops[0], "transpose_y").as_deref() {
                 Some(v) => mil_scalar_bool(&text, v).unwrap_or(v == "true"),
                 None => false,
@@ -7638,5 +7918,120 @@ mod tests {
                 diffs.first().copied().unwrap_or(0)
             );
         }
+    }
+
+    #[test]
+    fn constexpr_dequant_folding_and_hw_exec() {
+        let dir = std::env::temp_dir().join(format!("deq_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (n, k) = (64usize, 64usize);
+        // 1) Q8_0 blockwise (block=32): int8 data [64, 64], fp16 scale [64, 2]
+        let q8: Vec<i8> = (0..n * k)
+            .map(|i| (((i * 37 + 11) % 251) as i32 - 125) as i8)
+            .collect();
+        let q8_bytes: Vec<u8> = q8.iter().map(|&c| c as u8).collect();
+        let sc8: Vec<f32> = (0..n * 2)
+            .map(|i| 0.002 * ((i * 13 % 47) as f32 + 1.0))
+            .collect();
+        let sc8_bytes: Vec<u8> = sc8
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+            .collect();
+
+        // 2) Q4_0 blockwise (block=32): uint4 packed nibbles [64, 64], fp16 scale [64, 2], uint4 offset=8 [64, 2]
+        let nibs: Vec<u8> = (0..n * k).map(|i| ((i * 29 + 5) % 16) as u8).collect();
+        let q4_packed: Vec<u8> = (0..n * k / 2)
+            .map(|j| nibs[2 * j] | (nibs[2 * j + 1] << 4))
+            .collect();
+        let off4_packed: Vec<u8> = vec![0x88u8; n]; // 64*2 nibbles = 64 bytes
+
+        // 3) Palette4: uint4 indices [64, 64], fp16 LUT [64, 1, 16, 1]
+        let lut_f32: Vec<f32> = (0..n * 16).map(|i| (i as f32 * 0.005) - 1.5).collect();
+        let lut_bytes: Vec<u8> = lut_f32
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+            .collect();
+
+        // Pack all blobs into a single deadbeef weight.bin at distinct offsets
+        let mut wb = mil_spec::WeightBin::new();
+        let o_q8 = wb.put("q8", mil_spec::DType::Int8, &[64, 64], &q8_bytes);
+        let o_sc8 = wb.put("sc8", mil_spec::DType::Fp16, &[64, 2], &sc8_bytes);
+        let o_q4 = wb.put("q4", mil_spec::DType::Uint4, &[64, 64], &q4_packed);
+        let o_off4 = wb.put("off4", mil_spec::DType::Uint4, &[64, 2], &off4_packed);
+        let o_lut = wb.put("lut", mil_spec::DType::Fp16, &[64, 1, 16, 1], &lut_bytes);
+        std::fs::write(dir.join("weight.bin"), wb.finish()).unwrap();
+
+        let mil = format!(
+            r#"program(1.3)
+{{
+    func main<ios18>(tensor<fp16, [1, 1, 1, 64]> x) {{
+        tensor<int8, [64, 64]> W8_q = const()[val = tensor<int8, [64, 64]>(BLOBFILE(path = string("weight.bin"), offset = uint64({o_q8})))];
+        tensor<fp16, [64, 2]> W8_s = const()[val = tensor<fp16, [64, 2]>(BLOBFILE(path = string("weight.bin"), offset = uint64({o_sc8})))];
+        tensor<fp16, [64, 64]> W8 = constexpr_blockwise_shift_scale(data = W8_q, scale = W8_s)[name = string("W8")];
+        tensor<uint4, [64, 64]> W4_q = const()[val = tensor<uint4, [64, 64]>(BLOBFILE(path = string("weight.bin"), offset = uint64({o_q4})))];
+        tensor<uint4, [64, 2]> W4_o = const()[val = tensor<uint4, [64, 2]>(BLOBFILE(path = string("weight.bin"), offset = uint64({o_off4})))];
+        tensor<fp16, [64, 64]> W4 = constexpr_blockwise_shift_scale(data = W4_q, scale = W8_s, offset = W4_o)[name = string("W4")];
+        tensor<fp16, [64, 1, 16, 1]> Wp_l = const()[val = tensor<fp16, [64, 1, 16, 1]>(BLOBFILE(path = string("weight.bin"), offset = uint64({o_lut})))];
+        tensor<fp16, [64, 64]> Wp = constexpr_lut_to_dense(indices = W4_q, lut = Wp_l)[name = string("Wp")];
+        tensor<bool, []> bt = const()[val = bool(true)];
+        tensor<fp16, [1, 1, 1, 64]> z = matmul(x = x, y = W4, transpose_y = bt)[name = string("z")];
+    }} -> (z);
+}}
+"#
+        );
+        let mil_path = dir.join("m.mil");
+        std::fs::write(&mil_path, &mil).unwrap();
+
+        let got8 = load_mil_weight_u16(&mil, &dir, "W8").unwrap();
+        let got4 = load_mil_weight_u16(&mil, &dir, "W4").unwrap();
+        let gotp = load_mil_weight_u16(&mil, &dir, "Wp").unwrap();
+        assert_eq!(got8.len(), n * k);
+        assert_eq!(got4.len(), n * k);
+        assert_eq!(gotp.len(), n * k);
+        for r in 0..n {
+            for c in 0..k {
+                let idx = r * k + c;
+                let s = half::f16::from_f32(sc8[r * 2 + c / 32]).to_f32();
+                let w8_ref = half::f16::from_f32(q8[idx] as f32 * s).to_bits();
+                let w4_ref = half::f16::from_f32((nibs[idx] as f32 - 8.0) * s).to_bits();
+                let wp_ref = half::f16::from_f32(lut_f32[r * 16 + nibs[idx] as usize]).to_bits();
+                assert_eq!(got8[idx], w8_ref, "W8[{r},{c}]");
+                assert_eq!(got4[idx], w4_ref, "W4[{r},{c}]");
+                assert_eq!(gotp[idx], wp_ref, "Wp[{r},{c}]");
+            }
+        }
+
+        // Emit HWX through emit_from_mil and execute on ANE
+        let hwx_path = dir.join("m.macho");
+        let img = emit_from_mil(mil_path.to_str().unwrap(), hwx_path.to_str().unwrap()).unwrap();
+        std::fs::write(&hwx_path, &img).unwrap();
+        let mut prog = crate::espresso::EspressoProgram::load_precompiled(&hwx_path, &[]).unwrap();
+        let xv: Vec<f32> = (0..k).map(|i| (i as f32 * 0.03) - 0.9).collect();
+        let xd = prog.input_descs[0].clone();
+        for i in 0..k {
+            let o = xd.offset(0, 0, 0, 0, i as u64);
+            prog.input_mut(0)[o..o + 2].copy_from_slice(&half::f16::from_f32(xv[i]).to_le_bytes());
+        }
+        prog.eval().unwrap();
+        let zd = prog.output_descs[0].clone();
+        let zb = prog.output(0);
+        for j in 0..n {
+            let o = zd.offset(0, 0, j as u64, 0, 0);
+            let hw = half::f16::from_bits(u16::from_le_bytes([zb[o], zb[o + 1]])).to_f32();
+            let want: f32 = (0..k)
+                .map(|i| {
+                    let x16 = half::f16::from_f32(xv[i]).to_f32();
+                    let w16 = half::f16::from_bits(got4[j * k + i]).to_f32();
+                    x16 * w16
+                })
+                .sum();
+            assert!(
+                (hw - want).abs() < 0.02 + want.abs() * 0.02,
+                "z[{j}]: hw={hw} want={want}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
