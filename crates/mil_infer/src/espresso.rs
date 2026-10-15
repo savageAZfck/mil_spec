@@ -175,6 +175,43 @@ impl Objc {
         }
     }
 
+    /// `NSDictionary dictionaryWithObjects:forKeys:count:` for one pair.
+    fn one_dict(&self, key: &str, val: Id) -> Id {
+        unsafe {
+            let k = self.ns_string(key);
+            msg!((*const Id, *const Id, usize) -> Id)(
+                self.ns_dict,
+                selp("dictionaryWithObjects:forKeys:count:"),
+                &val as *const Id,
+                &k as *const Id,
+                1,
+            )
+        }
+    }
+
+    /// `dictionaryWithObjects:forKeys:count:` over (key, u64) pairs.
+    fn num_dict(&self, pairs: &[(&str, u64)]) -> Id {
+        unsafe {
+            let keys: Vec<Id> = pairs.iter().map(|(k, _)| self.ns_string(k)).collect();
+            let vals: Vec<Id> = pairs.iter().map(|(_, v)| self.ns_int(*v)).collect();
+            msg!((*const Id, *const Id, usize) -> Id)(
+                self.ns_dict,
+                selp("dictionaryWithObjects:forKeys:count:"),
+                vals.as_ptr(),
+                keys.as_ptr(),
+                pairs.len(),
+            )
+        }
+    }
+
+    /// `NSMutableDictionary setObject:forKey:`.
+    fn dict_set(&self, dict: Id, key: &str, val: Id) {
+        unsafe {
+            let k = self.ns_string(key);
+            msg!((Id, Id) -> ())(dict, selp("setObject:forKey:"), val, k);
+        }
+    }
+
     /// `objectForKey:` on an NSDictionary (returns null for missing keys).
     fn dict_get(&self, dict: Id, key: &str) -> Id {
         if dict.is_null() {
@@ -355,7 +392,21 @@ impl EspressoProgram {
     /// own `NetworkStatusList` descriptors.
     pub fn load(dir: &Path) -> Result<Self, EspError> {
         let pool = unsafe { objc_autoreleasePoolPush() };
-        let r = Self::load_inner(dir);
+        let r = Self::load_inner(dir, false, &[]);
+        unsafe { objc_autoreleasePoolPop(pool) };
+        r
+    }
+
+    /// Load a bare `.hwx`/`.macho` file as a precompiled model:
+    /// `modelAtURL:` on the file plus `loadModel` options
+    /// `{ANEFModelType: ANEFModelPreCompiled}` — the trigger aned uses
+    /// for OS-shipped Espresso packages (found via the
+    /// `kANEFModelPreCompiledValue` error path).
+    /// `extra`: additional numeric `loadModel` option keys
+    /// (`kANEFIntermediateBufferSizeHint`, `kANEFSkipPreparePhaseKey`, ...).
+    pub fn load_precompiled(hwx: &Path, extra: &[(&str, u64)]) -> Result<Self, EspError> {
+        let pool = unsafe { objc_autoreleasePoolPush() };
+        let r = Self::load_inner(hwx, true, extra);
         unsafe { objc_autoreleasePoolPop(pool) };
         r
     }
@@ -414,11 +465,11 @@ impl EspressoProgram {
         }
     }
 
-    fn load_inner(dir: &Path) -> Result<Self, EspError> {
+    fn load_inner(path: &Path, precompiled: bool, extra: &[(&str, u64)]) -> Result<Self, EspError> {
         let objc = Objc::open()?;
         let io = IoApi::open()?;
         unsafe {
-            let url = objc.ns_url(dir);
+            let url = objc.ns_url(path);
             let key = objc.ns_string("probe");
             let model = msg!((Id, Id) -> Id)(objc.ane_model, selp("modelAtURL:key:"), url, key);
             if model.is_null() {
@@ -431,7 +482,23 @@ impl EspressoProgram {
                 return Err(EspError::Msg("_ANEClient sharedConnection nil".into()));
             }
             retain(client);
-            let opts = objc.empty_dict();
+            let opts = if precompiled {
+                let mut keys: Vec<Id> = vec![objc.ns_string("kANEFModelType")];
+                let mut vals: Vec<Id> = vec![objc.ns_string("kANEFModelPreCompiled")];
+                for (k, v) in extra {
+                    keys.push(objc.ns_string(k));
+                    vals.push(objc.ns_int(*v));
+                }
+                msg!((*const Id, *const Id, usize) -> Id)(
+                    objc.ns_dict,
+                    selp("dictionaryWithObjects:forKeys:count:"),
+                    vals.as_ptr(),
+                    keys.as_ptr(),
+                    keys.len(),
+                )
+            } else {
+                objc.empty_dict()
+            };
             let mut err: Id = std::ptr::null_mut();
             let f = msg!((Id, Id, u64, *mut Id) -> bool);
             let ok = f(

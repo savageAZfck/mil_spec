@@ -319,9 +319,16 @@ impl Anec {
                 })
             }
         };
+        let entry: &'static str = match std::env::var("ANEC_ENTRY").as_deref() {
+            Ok("online") => "ANECCompileOnline",
+            Ok("offline") => "ANECCompileOffline",
+            Ok("jit") => "ANECCompileJIT",
+            Ok("fc") => "ANECCompileWithFunctionCall",
+            _ => "ANECCompile",
+        };
         Ok(Anec {
             validate: get("ANECValidate")?,
-            compile: get("ANECCompile")?,
+            compile: get(entry)?,
         })
     }
 
