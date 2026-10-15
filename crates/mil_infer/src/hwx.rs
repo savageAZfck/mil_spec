@@ -4788,6 +4788,39 @@ fn mil_ops(text: &str) -> (Vec<MilOp>, Vec<(String, String)>) {
     (ops, blobs)
 }
 
+/// Parse the `func main<...>(tensor<fp16, [dims]> name, ...)` signature
+/// into `(name, shape)` pairs — operand shapes for ops whose inputs are
+/// function parameters (matmul's M lives on `x`, not the result).
+fn func_input_shapes(text: &str) -> Vec<(String, Vec<i64>)> {
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if !line.contains("func ") {
+            continue;
+        }
+        let mut rest = line;
+        while let Some(t) = rest.find("tensor<") {
+            let after = &rest[t + 7..];
+            let Some(l) = after.find('[') else { break };
+            let Some(r) = after[l..].find(']') else { break };
+            let shape: Vec<i64> = after[l + 1..l + r]
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
+            let name = after[l + r + 1..]
+                .trim_start_matches(|c: char| c == '>' || c == ' ' || c == ',')
+                .split(|c: char| c == ' ' || c == ',' || c == ')')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            out.push((name, shape));
+            rest = &after[l + r + 1..];
+        }
+        break;
+    }
+    out
+}
+
 /// Load the `u16` payload of a weight blob — deadbeef-headered blobs
 /// carry data at byte 128; bare files are read from offset 0.
 fn load_blob_u16(path: &std::path::Path) -> Result<Vec<u16>, String> {
@@ -4955,26 +4988,29 @@ fn emit_from_mil_inner(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String
     match names.as_slice() {
         ["conv"] => {
             let o = &ops[0];
-            let (c, w) = (
+            let (c, h, w) = (
                 o.shape.get(1).copied().unwrap_or(0),
                 o.shape.get(2).copied().unwrap_or(1),
+                o.shape.get(3).copied().unwrap_or(1),
             );
-            // `[1,Cout,1,1]` conv1x1 with both dims >=32 goes through
+            // `[1,Cout,1,W]` conv1x1 with both dims >=32 goes through
             // the parametric emitter — byte-verified against ANEC for
             // every square `C` in 32..=4096 and a dense non-square
-            // `(Cin,Cout)` grid (Cin comes from the weight's element
-            // count, `[Cout,Cin,1,1]`). The square 713..=720 variant
-            // window still errors cleanly.
-            if w == 1 && c >= 32 {
+            // `(Cin,Cout)` grid, plus the spatial W sweep (W is the
+            // sequence dim: the emitted program is an M=W channel-major
+            // matvec). The square 713..=720 variant window still errors
+            // cleanly.
+            if h == 1 && c >= 32 {
                 let weights = weights_of(o)?;
                 let cout = c as usize;
                 if weights.len() % cout == 0 {
                     let cin = weights.len() / cout;
                     if cin >= 32 {
-                        return emit_conv1x1_ns(cin, cout, &weights, mil_path, out_path);
+                        return emit_conv1x1_w(cin, cout, w as usize, &weights, mil_path, out_path);
                     }
                 }
             }
+            let w = h;
             let shape = match (c, w) {
                 (64, 5) => ConvShape::C64W5,
                 (64, 8) => ConvShape::C64W8,
@@ -5112,6 +5148,19 @@ fn emit_from_mil_inner(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String
             let o = &ops[0].shape;
             let m = o.get(1).copied().unwrap_or(0) as usize;
             let n = o.get(3).copied().unwrap_or(0) as usize;
+            // ANEC's matmul grammar carries the sequence dim on the
+            // *input*: `x=[1,1,M,K]` (or 2-D `[M,K]`), `z=[1,1,1,N]`.
+            let xname = arg(&ops[0], "x").unwrap_or_default();
+            let xs = func_input_shapes(&text)
+                .into_iter()
+                .find(|(n, _)| n == &xname)
+                .map(|(_, s)| s)
+                .unwrap_or_default();
+            let seq = if xs.len() == 2 {
+                xs[0].max(1) as usize
+            } else {
+                xs.get(2).copied().unwrap_or(1).max(1) as usize
+            };
             let w = load_blob_u16(&resolve_blob(&mil_dir, &path))?;
             let ty = match arg(&ops[0], "transpose_y").as_deref() {
                 Some(v) => mil_scalar_bool(&text, v).unwrap_or(v == "true"),
@@ -5120,7 +5169,15 @@ fn emit_from_mil_inner(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String
             if m == 1 && ty && n >= 32 && w.len() % n == 0 {
                 let k = w.len() / n;
                 if k >= 32 {
-                    return emit_matmul_ns(k, n, &w, mil_path, out_path);
+                    if seq == 1 {
+                        return emit_matmul_ns(k, n, &w, mil_path, out_path);
+                    }
+                    // M>1 `[M,K]x[K,N]`: the conv1x1 spatial task is the
+                    // same math with the channel-major contract — x as
+                    // `[K,M]` (one 64B-stride channel row per K), z as
+                    // `[N,M]` positions — which is also how interior
+                    // buffers flow through conv chains anyway.
+                    return emit_conv1x1_w(k, n, seq, &w, mil_path, out_path);
                 }
             }
             let shape = match m {
