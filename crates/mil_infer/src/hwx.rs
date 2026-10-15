@@ -4955,6 +4955,49 @@ const SKELETON_AV256X64: &[u8] = include_bytes!("../assets/attnv_256x64_skeleton
 const SKELETON_AV1024X64: &[u8] = include_bytes!("../assets/attnv_1024x64_skeleton.hwx");
 const SKELETON_AV1024X128: &[u8] = include_bytes!("../assets/attnv_1024x128_skeleton.hwx");
 
+/// Outer product `z[c][j] = e[c]·r[j]` — `matmul(x=e[1,T,1,1],
+/// y=r[1,1,1,K])` → `z[1,T,1,K]`. With `e` a one-hot this scatters row
+/// `r` into row `t` of a `[1,T,1,K]` frame — the on-device KV-cache row
+/// append (`cache += outer(e_t, kv_t)` via a flat ew add).
+const SKELETON_OUTER64: &[u8] = include_bytes!("../assets/outer64_skeleton.hwx");
+
+/// Emit the outer-product row scatter for `t=k=64` (the shape whose
+/// record was reverse-verified; other sizes pending decode).
+pub fn emit_outer(mil_path: &str, out_path: &str) -> Vec<u8> {
+    let (entries, relocs) = tail_meta(SKELETON_OUTER64);
+    // __text at 0x8000 like the attnv family
+    rebuild_tail_at_text(
+        SKELETON_OUTER64,
+        0x33f0,
+        0x8000,
+        &entries,
+        &relocs,
+        mil_path,
+        out_path,
+    )
+    .expect("outer64 tail fits under __text")
+}
+
+/// Packed 4-D elementwise add `z = x + y` on `[1,64,1,64]` — element
+/// `(c,j)` at `c*128+j*2`, byte-identical layout to the outer-product
+/// output and the `avw`/`attn_v` cache frames, so it drops into the
+/// KV-append slot (`cache += outer(e_t, kv_t)` in place via aliasing).
+const SKELETON_ADD4D64: &[u8] = include_bytes!("../assets/add4d64_skeleton.hwx");
+
+pub fn emit_add4d64(mil_path: &str, out_path: &str) -> Vec<u8> {
+    let (entries, relocs) = tail_meta(SKELETON_ADD4D64);
+    rebuild_tail_at_text(
+        SKELETON_ADD4D64,
+        0x33f0,
+        0x8000,
+        &entries,
+        &relocs,
+        mil_path,
+        out_path,
+    )
+    .expect("add4d tail fits under __text")
+}
+
 /// Emit the attn·V matvec for `(t, d)` pairs on the skeleton table.
 pub fn emit_attn_v(t: u32, d: u32, mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> {
     let skel = match (t, d) {
