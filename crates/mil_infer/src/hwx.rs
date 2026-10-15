@@ -5017,6 +5017,24 @@ pub fn emit_maskadd64(mil_path: &str, out_path: &str) -> Vec<u8> {
     .expect("maskadd tail fits under __text")
 }
 
+/// Layout repack `transpose(x=[1,64,1,1], perm=[0,2,3,1])` →
+/// `z[1,1,1,64]` — strided channel-planes → contiguous w-packed.
+/// Adapts `emit_matmul_ns` (channel-strided out) onto the contiguous
+/// vector operands `emit_avw`/`emit_outer` expect.
+const SKELETON_REPACK64: &[u8] = include_bytes!("../assets/repack64_skeleton.hwx");
+
+pub fn emit_repack64(mil_path: &str, out_path: &str) -> Vec<u8> {
+    let (entries, relocs) = tail_meta(SKELETON_REPACK64);
+    rebuild_tail_at(
+        SKELETON_REPACK64,
+        0x25f0,
+        &entries,
+        &relocs,
+        mil_path,
+        out_path,
+    )
+}
+
 /// Emit the attn·V matvec for `(t, d)` pairs on the skeleton table.
 pub fn emit_attn_v(t: u32, d: u32, mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> {
     let skel = match (t, d) {

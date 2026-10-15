@@ -10,7 +10,7 @@
 //!   o = out·Wo                    matmul_ns
 use mil_infer::espresso::EspressoProgram;
 use mil_infer::hwx::{
-    emit_add4d64, emit_attn_v, emit_avw, emit_maskadd64, emit_matmul_ns, emit_outer,
+    emit_add4d64, emit_attn_v, emit_avw, emit_maskadd64, emit_matmul_ns, emit_outer, emit_repack64,
     emit_softmax_ch,
 };
 use std::path::Path;
@@ -50,6 +50,13 @@ fn main() {
     let mut av = load(emit_add4d64("/tmp/ha.mil", &p), &p);
     let p = format!("/tmp/hp_s_{pid}.macho");
     let mut sc = load(emit_avw(t_max as u32, d as u32, "/tmp/hs.mil", &p), &p);
+    // repacks: strided proj outputs -> contiguous vector operands
+    let p = format!("/tmp/hp_rq_{pid}.macho");
+    let mut rq = load(emit_repack64("/tmp/hpq.mil", &p), &p);
+    let p = format!("/tmp/hp_rk_{pid}.macho");
+    let mut rk = load(emit_repack64("/tmp/hpk.mil", &p), &p);
+    let p = format!("/tmp/hp_rv_{pid}.macho");
+    let mut rv = load(emit_repack64("/tmp/hpv.mil", &p), &p);
     let p = format!("/tmp/hp_mk_{pid}.macho");
     let mut mk_ = load(emit_maskadd64("/tmp/hk.mil", &p), &p);
     let p = format!("/tmp/hp_sm_{pid}.macho");
@@ -103,8 +110,12 @@ fn main() {
     // outer outputs -> add input1
     ak.adopt_input(1, ok.output_surf(0)).expect("k tmp");
     av.adopt_input(1, ov.output_surf(0)).expect("v tmp");
-    // scores avw: a=q proj output adopted; v=K cache frame adopted
-    sc.adopt_input(0, pq.output_surf(0)).expect("q");
+    // repack wiring: proj z (strided) -> repack in; repack z (contig)
+    rq.adopt_input(0, pq.output_surf(0)).expect("q->rq");
+    rk.adopt_input(0, pk.output_surf(0)).expect("k->rk");
+    rv.adopt_input(0, pv.output_surf(0)).expect("v->rv");
+    // scores avw: a=q repacked (contiguous); v=K cache frame
+    sc.adopt_input(0, rq.output_surf(0)).expect("q");
     sc.adopt_input(1, ak.output_surf(0)).expect("K");
     // scores += mask in-place, then softmax in-place on scores surface
     let scores = sc.output_surf(0);
@@ -117,10 +128,9 @@ fn main() {
     ao.adopt_input(1, av.output_surf(0)).expect("V");
     // out-proj: x = attn output
     po.adopt_input(0, ao.output_surf(0)).expect("Wo in");
-    // e_t one-hot mask = outer input0; kv vectors = outer input1 adopted
-    // from proj outputs
-    ok.adopt_input(1, pk.output_surf(0)).expect("k row");
-    ov.adopt_input(1, pv.output_surf(0)).expect("v row");
+    // e_t one-hot mask = outer input0; kv rows = repacked proj outs
+    ok.adopt_input(1, rk.output_surf(0)).expect("k row");
+    ov.adopt_input(1, rv.output_surf(0)).expect("v row");
 
     // --- run a few decode steps ---
     let (dq, de, dr, dkc, dvc, dz) = (
@@ -173,24 +183,74 @@ fn main() {
                 }
             }
         }
+        {
+            let dm = mk_.input_descs[1].clone();
+            let b = mk_.input_mut(1);
+            for i in 0..t_max {
+                let o = dm.offset(0, 0, i as u64, 0, 0);
+                if o + 2 <= b.len() {
+                    b[o..o + 2].copy_from_slice(
+                        &f16(if i <= step { 0.0 } else { -30000.0 }).to_le_bytes(),
+                    );
+                }
+            }
+        }
         pq.eval().unwrap();
         pk.eval().unwrap();
         pv.eval().unwrap();
+        rq.eval().unwrap();
+        rk.eval().unwrap();
+        rv.eval().unwrap();
         ok.eval().unwrap();
         ov.eval().unwrap();
         ak.eval().unwrap();
         av.eval().unwrap();
         sc.eval().unwrap();
+        if std::env::var("HP_DIAG").is_ok() {
+            let ss = sc.output(0);
+            let dss = sc.output_descs[0].clone();
+            let mut sv = Vec::new();
+            for c in 0..8u64 {
+                let o = dss.offset(0, 0, c, 0, 0);
+                sv.push(f32_of(u16::from_le_bytes([ss[o], ss[o + 1]])));
+            }
+            println!("  raw scores[0..8]: {:?}", sv);
+            let kk = ak.input_bytes(0);
+            let mut kv = Vec::new();
+            for t in 0..4usize {
+                let o = t * 128;
+                kv.push(f32_of(u16::from_le_bytes([kk[o], kk[o + 1]])));
+            }
+            println!("  Kcache row heads: {:?}", kv);
+            let oz = ok.output(0);
+            let doz = ok.output_descs[0].clone();
+            let mut ov_ = Vec::new();
+            for c in 0..6u64 {
+                let o = doz.offset(0, 0, c, 0, 0);
+                ov_.push(f32_of(u16::from_le_bytes([oz[o], oz[o + 1]])));
+            }
+            println!("  outer z row heads: {:?}", ov_);
+            let rkout = rk.output(0);
+            let drk = rk.output_descs[0].clone();
+            let mut rv_ = Vec::new();
+            for w in 0..6u64 {
+                let o = drk.offset(0, 0, 0, 0, w);
+                rv_.push(f32_of(u16::from_le_bytes([rkout[o], rkout[o + 1]])));
+            }
+            println!("  rk out[0..6]: {:?}", rv_);
+        }
+        mk_.eval().unwrap();
         sm.eval().unwrap();
         ao.eval().unwrap();
         po.eval().unwrap();
         // CPU ref: update cache rows, then attention over rows 0..=step
-        let mm = |w: u8| {
+        // z[j] = sum_k v[k]·W[j,k] — W is [N,K] row-major
+        let mm = |w: u8, v: &[f32]| {
             (0..d)
-                .map(|j| (0..d).map(|i| x[i] * wload(w, i, j)).sum::<f32>())
+                .map(|j| (0..d).map(|k| v[k] * wload(w, j, k)).sum::<f32>())
                 .collect::<Vec<f32>>()
         };
-        let (qr, kr, vr) = (mm(b'q'), mm(b'k'), mm(b'v'));
+        let (qr, kr, vr) = (mm(b'q', &x), mm(b'k', &x), mm(b'v', &x));
         kref[step] = kr.clone();
         vref[step] = vr.clone();
         let sc_r: Vec<f32> = (0..t_max)
@@ -200,18 +260,109 @@ fn main() {
             .iter()
             .cloned()
             .fold(f32::NEG_INFINITY, f32::max);
-        // NOTE: softmax runs over all t_max lanes incl. unwritten zero rows
-        let den: f32 = sc_r.iter().map(|v| (v - mx).exp()).sum();
-        let p: Vec<f32> = sc_r.iter().map(|v| (v - mx).exp() / den).collect();
+        // causal: only written rows 0..=step contribute (masked lanes → 0)
+        let den: f32 = sc_r[..=step].iter().map(|v| (v - mx).exp()).sum();
+        let p: Vec<f32> = (0..t_max)
+            .map(|t| {
+                if t <= step {
+                    (sc_r[t] - mx).exp() / den
+                } else {
+                    0.0
+                }
+            })
+            .collect();
         let out: Vec<f32> = (0..d)
             .map(|j| (0..t_max).map(|t| p[t] * vref[t][j]).sum())
             .collect();
-        let oref: Vec<f32> = (0..d)
-            .map(|j| (0..d).map(|i| out[i] * wload(b'o', i, j)).sum())
-            .collect();
+        let oref = mm(b'o', &out);
+        if std::env::var("HP_DIAG").is_ok() {
+            // p surface (post-softmax, strided) and V cache row 0
+            let sp = sm.output(0);
+            let mut pv_ = Vec::new();
+            for t in 0..6usize {
+                let o = t * 64;
+                pv_.push(f32_of(u16::from_le_bytes([sp[o], sp[o + 1]])));
+            }
+            let kk2 = av.input_bytes(0);
+            let mut vv_ = Vec::new();
+            for j in 0..6usize {
+                let o = j * 2;
+                vv_.push(f32_of(u16::from_le_bytes([kk2[o], kk2[o + 1]])));
+            }
+            println!("  p[0..6]: {:?} | V row0: {:?}", pv_, vv_);
+            let zp = pv.output(0);
+            let dzp = pv.output_descs[0].clone();
+            let mut pvz = Vec::new();
+            for c in 0..6u64 {
+                let o = dzp.offset(0, 0, c, 0, 0);
+                pvz.push(f32_of(u16::from_le_bytes([zp[o], zp[o + 1]])));
+            }
+            println!(
+                "  pv z strided[0..6]: {:?} | vr ref[0..6]: {:?}",
+                pvz,
+                &vr[..6]
+            );
+            let zr = rv.output(0);
+            let dzr = rv.output_descs[0].clone();
+            let mut rvz = Vec::new();
+            for w in 0..6u64 {
+                let o = dzr.offset(0, 0, 0, 0, w);
+                rvz.push(f32_of(u16::from_le_bytes([zr[o], zr[o + 1]])));
+            }
+            println!("  rv out contig[0..6]: {:?}", rvz);
+            let za = ao.output(0);
+            let dza = ao.output_descs[0].clone();
+            let mut hv = Vec::new();
+            for j in 0..6u64 {
+                let o = dza.offset(0, 0, 0, 0, j);
+                hv.push(f32_of(u16::from_le_bytes([za[o], za[o + 1]])));
+            }
+            println!("  attnV out[0..6] hw: {:?} ref: {:?}", hv, &out[..6]);
+            let sq = pq.output(0);
+            let dzq = pq.output_descs[0].clone();
+            let mut v = Vec::new();
+            for c in 0..8u64 {
+                let o = dzq.offset(0, 0, c, 0, 0);
+                v.push(f32_of(u16::from_le_bytes([sq[o], sq[o + 1]])));
+            }
+            println!("  q proj z[0..8] strided: {:?}", v);
+            let mut v2 = Vec::new();
+            for w in 0..8u64 {
+                let o = (w * 2) as usize;
+                v2.push(f32_of(u16::from_le_bytes([sq[o], sq[o + 1]])));
+            }
+            println!("  q proj z[0..8] contig:  {:?}", v2);
+            println!("  q ref[0..8]: {:?}", &qr[..8]);
+            let ss = sc.output(0);
+            let dss = sc.output_descs[0].clone();
+            let mut sv = Vec::new();
+            for c in 0..8u64 {
+                let o = dss.offset(0, 0, c, 0, 0);
+                sv.push(f32_of(u16::from_le_bytes([ss[o], ss[o + 1]])));
+            }
+            println!("  scores[0..8]: {:?} ref: {:?}", sv, &sc_r[..8]);
+        }
         let z = po.output(0);
+        if std::env::var("HP_DIAG").is_ok() {
+            let mut a = Vec::new();
+            let mut b = Vec::new();
+            for j in 0..8u64 {
+                let o = dz.offset(0, 0, j, 0, 0);
+                a.push(f32_of(u16::from_le_bytes([z[o], z[o + 1]])));
+            }
+            for j in 0..8u64 {
+                let o = dz.offset(0, 0, 0, 0, j);
+                b.push(f32_of(u16::from_le_bytes([z[o], z[o + 1]])));
+            }
+            println!(
+                "  po z strided: {:?} | contig: {:?} | oref: {:?}",
+                a,
+                b,
+                &oref[..8]
+            );
+        }
         for j in 0..d {
-            let o = dz.offset(0, 0, 0, 0, j as u64);
+            let o = dz.offset(0, 0, j as u64, 0, 0);
             if o + 2 > z.len() {
                 bad += 1;
                 continue;
@@ -228,3 +379,4 @@ fn main() {
     }
     println!("HEAD-SLICE mismatches: {}", bad);
 }
+// diag appended below main via flag
