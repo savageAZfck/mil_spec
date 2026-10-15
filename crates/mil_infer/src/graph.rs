@@ -24,9 +24,9 @@
 
 use crate::espresso::{EspressoProgram, SharedSurface, TensorDesc};
 use crate::hwx::{
-    self, emit_add4d, emit_attn_v, emit_avw, emit_conv1x1_w, emit_elementwise2, emit_matmul_ns,
-    emit_outer_t, emit_relu, emit_repack, emit_sigmoid_strided, emit_softmax, emit_softmax_ch,
-    emit_unary_lut, EwOp, LutOp, MilOp,
+    self, emit_add4d, emit_attn_v, emit_avw, emit_conv1x1_w, emit_conv_act, emit_conv_chain,
+    emit_elementwise2, emit_matmul_ns, emit_outer_t, emit_relu, emit_repack, emit_sigmoid_strided,
+    emit_softmax, emit_softmax_ch, emit_unary_lut, EwOp, FusedAct, LutOp, MilOp,
 };
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -222,6 +222,34 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
                 .unwrap_or(1e-5);
             let fold_gamma = arg_of(&o, "w").and_then(&blob_f32).is_some();
             flat.extend(expand_rms(&o, eps, fold_gamma));
+        } else if o.op == "silu" {
+            let x = arg_of(&o, "x").unwrap_or("x").to_string();
+            let sig = format!("{}_sig", o.result);
+            flat.push(MilOp {
+                op: "sigmoid".into(),
+                result: sig.clone(),
+                shape: o.shape.clone(),
+                args: vec![("x".into(), x.clone())],
+            });
+            flat.push(MilOp {
+                op: "mul".into(),
+                result: o.result.clone(),
+                shape: o.shape.clone(),
+                args: vec![("x".into(), x), ("y".into(), sig)],
+            });
+        } else if o.op == "conv" && arg_of(&o, "bias").is_some() {
+            let bname = arg_of(&o, "bias").unwrap().to_string();
+            let mut c_op = o.clone();
+            c_op.result = format!("{}_nb", o.result);
+            c_op.args.retain(|(k, _)| k != "bias");
+            let c_res = c_op.result.clone();
+            flat.push(c_op);
+            flat.push(MilOp {
+                op: "add".into(),
+                result: o.result,
+                shape: o.shape,
+                args: vec![("x".into(), c_res), ("y".into(), bname)],
+            });
         } else {
             flat.push(o);
         }
@@ -245,6 +273,131 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
             .ok_or("op without weight operand")?;
         hwx::load_mil_weight_u16(&text, &mil_dir, wname)
     };
+
+    // ---- fusion pass: conv+act (C=64) and k-deep conv1x1 chains -----
+    let mut func_outs = Vec::new();
+    for line in text.lines() {
+        let l = line.trim();
+        if let Some(p) = l.find("-> (") {
+            for nm in l[p + 4..]
+                .trim_end_matches(|c| c == ')' || c == ';')
+                .split(',')
+            {
+                func_outs.push(nm.trim().to_string());
+            }
+        }
+    }
+    let mut use_cnt: HashMap<String, usize> = HashMap::new();
+    for o in &flat {
+        for (_, v) in &o.args {
+            *use_cnt.entry(v.clone()).or_insert(0) += 1;
+        }
+    }
+    let is_1x1 = |s: &[i64]| s.len() == 4 && s[0] == 1 && s[2] == 1 && s[3] == 1 && s[1] >= 32;
+    let mut fused = Vec::with_capacity(flat.len());
+    let mut fi = 0usize;
+    while fi < flat.len() {
+        let o = &flat[fi];
+        // 1) 64->64 conv + silu (`g = conv; gs = sigmoid(g); y = mul(g, gs)`)
+        if o.op == "conv"
+            && o.shape == [1, 64, 1, 1]
+            && !func_outs.contains(&o.result)
+            && weights_of(o).map(|w| w.len() == 64 * 64).unwrap_or(false)
+        {
+            if fi + 2 < flat.len()
+                && flat[fi + 1].op == "sigmoid"
+                && arg_of(&flat[fi + 1], "x") == Some(o.result.as_str())
+                && !func_outs.contains(&flat[fi + 1].result)
+                && use_cnt.get(&o.result) == Some(&2)
+                && use_cnt.get(&flat[fi + 1].result) == Some(&1)
+                && flat[fi + 2].op == "mul"
+                && ((arg_of(&flat[fi + 2], "x") == Some(o.result.as_str())
+                    && arg_of(&flat[fi + 2], "y") == Some(flat[fi + 1].result.as_str()))
+                    || (arg_of(&flat[fi + 2], "y") == Some(o.result.as_str())
+                        && arg_of(&flat[fi + 2], "x") == Some(flat[fi + 1].result.as_str())))
+            {
+                fused.push(MilOp {
+                    op: "__conv_act".into(),
+                    result: flat[fi + 2].result.clone(),
+                    shape: vec![1, 64, 1, 1],
+                    args: vec![
+                        ("x".into(), arg_of(o, "x").unwrap_or("x").to_string()),
+                        (
+                            "weight".into(),
+                            arg_of(o, "weight").unwrap_or_default().to_string(),
+                        ),
+                        ("act".into(), "silu".into()),
+                    ],
+                });
+                fi += 3;
+                continue;
+            }
+            if fi + 1 < flat.len()
+                && matches!(
+                    flat[fi + 1].op.as_str(),
+                    "sigmoid" | "tanh" | "relu" | "gelu"
+                )
+                && arg_of(&flat[fi + 1], "x") == Some(o.result.as_str())
+                && use_cnt.get(&o.result) == Some(&1)
+            {
+                fused.push(MilOp {
+                    op: "__conv_act".into(),
+                    result: flat[fi + 1].result.clone(),
+                    shape: vec![1, 64, 1, 1],
+                    args: vec![
+                        ("x".into(), arg_of(o, "x").unwrap_or("x").to_string()),
+                        (
+                            "weight".into(),
+                            arg_of(o, "weight").unwrap_or_default().to_string(),
+                        ),
+                        ("act".into(), flat[fi + 1].op.clone()),
+                    ],
+                });
+                fi += 2;
+                continue;
+            }
+        }
+        // 2) k >= 2 consecutive 1x1 convs -> single multi-task emit_conv_chain
+        if o.op == "conv"
+            && is_1x1(&o.shape)
+            && !func_outs.contains(&o.result)
+            && use_cnt.get(&o.result) == Some(&1)
+        {
+            let mut end = fi + 1;
+            while end < flat.len()
+                && flat[end].op == "conv"
+                && is_1x1(&flat[end].shape)
+                && arg_of(&flat[end], "x") == Some(flat[end - 1].result.as_str())
+            {
+                let res = &flat[end].result;
+                end += 1;
+                if func_outs.contains(res) || use_cnt.get(res) != Some(&1) {
+                    break;
+                }
+            }
+            if end - fi >= 2 {
+                let mut args = vec![("x".into(), arg_of(o, "x").unwrap_or("x").to_string())];
+                for (k_idx, co_op) in flat[fi..end].iter().enumerate() {
+                    args.push((
+                        format!("w{k_idx}"),
+                        arg_of(co_op, "weight").unwrap_or_default().to_string(),
+                    ));
+                    args.push((format!("c{k_idx}"), co_op.shape[1].to_string()));
+                }
+                fused.push(MilOp {
+                    op: "__conv_chain".into(),
+                    result: flat[end - 1].result.clone(),
+                    shape: flat[end - 1].shape.clone(),
+                    args,
+                });
+                fi = end;
+                continue;
+            }
+        }
+        fused.push(o.clone());
+        fi += 1;
+    }
+    let flat = fused;
 
     let mut nodes: Vec<Node> = Vec::new();
     let mut created: Vec<usize> = Vec::new(); // node creation order
@@ -393,6 +546,93 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
                 prod.insert(o.result.clone(), (idx, Cur::Contig(elems)));
                 wants.push((idx, vec![(x, Cur::Strided(elems))]));
             }
+            "reshape" | "cast" => {
+                let x = arg_of(o, "x").unwrap_or("x").to_string();
+                if let Some(&pc) = prod.get(x.as_str()) {
+                    prod.insert(o.result.clone(), pc);
+                } else {
+                    let img =
+                        emit_repack(elems, mil_path, &format!("{out_dir}/.tmpr_{}", o.result))?;
+                    let idx = push_prog(&mut nodes, &mut created, o.result.clone(), img, out_dir)?;
+                    prod.insert(o.result.clone(), (idx, Cur::Contig(elems)));
+                    wants.push((idx, vec![(x, Cur::Strided(elems))]));
+                }
+            }
+            "__conv_act" => {
+                let x = arg_of(o, "x").unwrap_or("x").to_string();
+                let w = weights_of(o)?;
+                let act = match arg_of(o, "act").unwrap_or("sigmoid") {
+                    "tanh" => FusedAct::Tanh,
+                    "relu" => FusedAct::Relu,
+                    "gelu" => FusedAct::Gelu,
+                    "silu" => FusedAct::Silu,
+                    _ => FusedAct::Sigmoid,
+                };
+                let img =
+                    emit_conv_act(act, &w, mil_path, &format!("{out_dir}/.tmpca_{}", o.result))?;
+                let idx = push_prog(&mut nodes, &mut created, o.result.clone(), img, out_dir)?;
+                prod.insert(o.result.clone(), (idx, Cur::Strided(64)));
+                wants.push((idx, vec![(x, Cur::Strided(64))]));
+            }
+            "__conv_chain" => {
+                let x = arg_of(o, "x").unwrap_or("x").to_string();
+                let k = (o.args.len() - 1) / 2;
+                let mut shapes = Vec::with_capacity(k);
+                let mut flat_w = Vec::new();
+                let mut offs = Vec::with_capacity(k);
+                for ti in 0..k {
+                    let wname = arg_of(o, &format!("w{ti}")).unwrap();
+                    let cout: usize = arg_of(o, &format!("c{ti}")).unwrap().parse().unwrap();
+                    let w = hwx::load_mil_weight_u16(&text, &mil_dir, wname)?;
+                    let cin = w.len() / cout;
+                    shapes.push((cin, cout));
+                    flat_w.extend_from_slice(&w);
+                    offs.push((128 + ti * (cin * cout * 2 + 64)) as u64);
+                }
+                let cin0 = shapes[0].0 as u32;
+                let cout_last = shapes[k - 1].1 as u32;
+                let img = emit_conv_chain(
+                    &shapes,
+                    &flat_w,
+                    &offs,
+                    &o.result,
+                    mil_path,
+                    &format!("{out_dir}/.tmpcc_{}", o.result),
+                )?;
+                let idx = push_prog(&mut nodes, &mut created, o.result.clone(), img, out_dir)?;
+                prod.insert(o.result.clone(), (idx, Cur::Strided(cout_last)));
+                wants.push((idx, vec![(x, Cur::Strided(cin0))]));
+            }
+            "conv" => {
+                let x = arg_of(o, "x").unwrap_or("x").to_string();
+                let w = weights_of(o)?;
+                let cout = o.shape.get(1).copied().unwrap_or(0).max(1) as usize;
+                let spatial = (o.shape.get(2).copied().unwrap_or(1).max(1)
+                    * o.shape.get(3).copied().unwrap_or(1).max(1))
+                    as usize;
+                if cout < 32 || w.len() % cout != 0 || w.len() / cout < 32 {
+                    return Err(format!(
+                        "conv {:?} weight len {} unsupported",
+                        o.shape,
+                        w.len()
+                    ));
+                }
+                let cin = w.len() / cout;
+                let img = emit_conv1x1_w(
+                    cin,
+                    cout,
+                    spatial,
+                    &w,
+                    mil_path,
+                    &format!("{out_dir}/.tmpc_{}", o.result),
+                )?;
+                let idx = push_prog(&mut nodes, &mut created, o.result.clone(), img, out_dir)?;
+                prod.insert(
+                    o.result.clone(),
+                    (idx, Cur::Strided((cout * spatial) as u32)),
+                );
+                wants.push((idx, vec![(x, Cur::Strided((cin * spatial) as u32))]));
+            }
             "matmul" => {
                 let (x, y) = (
                     arg_of(o, "x").unwrap_or("x").to_string(),
@@ -444,28 +684,39 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
                         } else {
                             xs.get(2).copied().unwrap_or(1).max(1) as usize
                         };
-                        let img = if seq == 1 || m == 1 {
-                            emit_matmul_ns(
-                                k,
-                                n,
-                                &w,
-                                mil_path,
-                                &format!("{out_dir}/.tmpm_{}", o.result),
-                            )?
+                        let x_strided = match prod.get(x.as_str()) {
+                            Some((_, Cur::Strided(_))) => true,
+                            Some(_) => false,
+                            None => xs.get(1).copied().unwrap_or(1) > 1,
+                        };
+                        let (img, want_cur) = if x_strided || (seq > 1 && m != 1) {
+                            (
+                                emit_conv1x1_w(
+                                    k,
+                                    n,
+                                    seq,
+                                    &w,
+                                    mil_path,
+                                    &format!("{out_dir}/.tmpm_{}", o.result),
+                                )?,
+                                Cur::Strided((k * seq) as u32),
+                            )
                         } else {
-                            emit_conv1x1_w(
-                                k,
-                                n,
-                                seq,
-                                &w,
-                                mil_path,
-                                &format!("{out_dir}/.tmpm_{}", o.result),
-                            )?
+                            (
+                                emit_matmul_ns(
+                                    k,
+                                    n,
+                                    &w,
+                                    mil_path,
+                                    &format!("{out_dir}/.tmpm_{}", o.result),
+                                )?,
+                                Cur::Contig(k as u32),
+                            )
                         };
                         let idx =
                             push_prog(&mut nodes, &mut created, o.result.clone(), img, out_dir)?;
-                        prod.insert(o.result.clone(), (idx, Cur::Strided(n as u32)));
-                        wants.push((idx, vec![(x, Cur::Contig(k as u32))]));
+                        prod.insert(o.result.clone(), (idx, Cur::Strided((n * seq) as u32)));
+                        wants.push((idx, vec![(x, want_cur)]));
                         continue;
                     }
                     return Err(format!("matmul const x{xs:?} -> {:?} unsupported", o.shape));
@@ -1103,6 +1354,105 @@ mod tests {
         let dy = rt.out_desc(yn);
         let zb = rt.output(yn);
         for j in 0..d {
+            let o = dy.offset(0, 0, j as u64, 0, 0);
+            let hw = f16::from_bits(u16::from_le_bytes([zb[o], zb[o + 1]])).to_f32();
+            assert!(
+                (hw - yr[j]).abs() < 0.03 + yr[j].abs() * 0.05,
+                "y[{j}]: hw={hw} ref={}",
+                yr[j]
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn graph_fuses_conv_chain_and_conv_silu() {
+        let dir = std::env::temp_dir().join(format!("graph_fuse_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mk = |tag: u8, rows: usize, cols: usize| -> Vec<f32> {
+            (0..rows * cols)
+                .map(|i| {
+                    f16::from_f32(((i * 11 + tag as usize * 7) % 23) as f32 / 64.0 - 0.17).to_f32()
+                })
+                .collect()
+        };
+        let w1 = mk(1, 96, 64);
+        let w2 = mk(2, 64, 96);
+        let w3 = mk(3, 64, 64);
+        for (name, v) in [("w1.bin", &w1), ("w2.bin", &w2), ("w3.bin", &w3)] {
+            let b: Vec<u8> = v
+                .iter()
+                .flat_map(|&x| f16::from_f32(x).to_le_bytes())
+                .collect();
+            std::fs::write(dir.join(name), b).unwrap();
+        }
+        // 2-op conv chain (64->96->64) + fused conv+silu (64->64 + sigmoid + mul) + residual add
+        let mil = format!(
+            r#"program(1.3)
+{{
+    func main<ios18>(tensor<fp16, [1, 64, 1, 1]> x) {{
+        tensor<fp16, [96, 64, 1, 1]> W1 = const()[val = tensor<fp16, [96, 64, 1, 1]>(BLOBFILE(path = string("{d}/w1.bin"), offset = uint64(0)))];
+        tensor<fp16, [64, 96, 1, 1]> W2 = const()[val = tensor<fp16, [64, 96, 1, 1]>(BLOBFILE(path = string("{d}/w2.bin"), offset = uint64(0)))];
+        tensor<fp16, [64, 64, 1, 1]> W3 = const()[val = tensor<fp16, [64, 64, 1, 1]>(BLOBFILE(path = string("{d}/w3.bin"), offset = uint64(0)))];
+        tensor<fp16, [1, 96, 1, 1]> c1 = conv(weight = W1, x = x)[name = string("c1")];
+        tensor<fp16, [1, 64, 1, 1]> c2 = conv(weight = W2, x = c1)[name = string("c2")];
+        tensor<fp16, [1, 64, 1, 1]> g = conv(weight = W3, x = c2)[name = string("g")];
+        tensor<fp16, [1, 64, 1, 1]> gs = sigmoid(x = g)[name = string("gs")];
+        tensor<fp16, [1, 64, 1, 1]> gsl = mul(x = g, y = gs)[name = string("gsl")];
+        tensor<fp16, [1, 64, 1, 1]> y = add(x = c2, y = gsl)[name = string("y")];
+    }} -> (y);
+}}"#,
+            d = dir.display()
+        );
+        let mil_path = dir.join("m.mil");
+        std::fs::write(&mil_path, &mil).unwrap();
+        let plan = compile_graph(
+            mil_path.to_str().unwrap(),
+            dir.join("out").to_str().unwrap(),
+        )
+        .unwrap();
+        // 6 logical ops (c1, c2, g, gs, gsl, y) fused into 3 ANE programs:
+        // node 0 = __conv_chain(c1->c2), node 1 = __conv_act(g->gs->gsl), node 2 = add(c2, gsl)
+        assert_eq!(
+            plan.nodes.len(),
+            3,
+            "expected 3 fused nodes, got {}",
+            plan.nodes.len()
+        );
+
+        let mut rt = GraphRuntime::load(plan).unwrap();
+        let xv: Vec<f32> = (0..64)
+            .map(|i| f16::from_f32(((i * 5 + 3) % 13) as f32 / 16.0 - 0.35).to_f32())
+            .collect();
+        let xc = xv.clone();
+        rt.write_ext("x", move |b, desc| {
+            for i in 0..64 {
+                let o = desc.offset(0, 0, i as u64, 0, 0);
+                b[o..o + 2].copy_from_slice(&f16::from_f32(xc[i]).to_le_bytes());
+            }
+        });
+        rt.run().unwrap();
+
+        let mm = |w: &[f32], v: &[f32], rows: usize, cols: usize| -> Vec<f32> {
+            (0..rows)
+                .map(|r| (0..cols).map(|c| v[c] * w[r * cols + c]).sum())
+                .collect()
+        };
+        let c1r = mm(&w1, &xv, 96, 64);
+        let c2r = mm(&w2, &c1r, 64, 96);
+        let gr = mm(&w3, &c2r, 64, 64);
+        let yr: Vec<f32> = c2r
+            .iter()
+            .zip(&gr)
+            .map(|(a, g)| a + g / (1.0 + (-g).exp()))
+            .collect();
+
+        let yn = rt.out_node("y").unwrap();
+        let dy = rt.out_desc(yn);
+        let zb = rt.output(yn);
+        for j in 0..64 {
             let o = dy.offset(0, 0, j as u64, 0, 0);
             let hw = f16::from_bits(u16::from_le_bytes([zb[o], zb[o + 1]])).to_f32();
             assert!(

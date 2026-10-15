@@ -1194,10 +1194,9 @@ fn conv_chan_params(c: usize, kern_sz: usize) -> (u32, usize, bool) {
     let table = crate::conv_chan_table::CONV_CHAN_TABLE;
     if (32..=4096).contains(&c) {
         let v = table[c - 32];
-        if v == u32::MAX {
-            return (u32::MAX, 0, false);
+        if v != u32::MAX {
+            return (v & 0xfff, ((v >> 12) & 0xf) as usize, v & 0x10000 != 0);
         }
-        return (v & 0xfff, ((v >> 12) & 0xf) as usize, v & 0x10000 != 0);
     }
     conv_ns_fallback(c, c, kern_sz)
 }
@@ -1999,18 +1998,6 @@ pub fn emit_conv_chain(
             }
         }
     }
-    // intermediates strictly larger than buffer `b` that precede it in
-    // the pool order (feeds the descriptor-id decrement).
-    let narrow_before = |b: usize| -> u32 {
-        if !reordered {
-            return 0;
-        }
-        let sz = isz[b];
-        (0..n_int)
-            .filter(|&m| isz[m] > sz && chain_narrow(shapes[m].1))
-            .count() as u32
-    };
-
     // ---- __text: header + task records ------------------------------
     // The task-table header's +0x10 hi16 encodes the x descriptor id.
     // Empirically (all corpus chains): 0x62 when the first intermediate
@@ -2226,11 +2213,15 @@ pub fn emit_conv_chain(
                 } else {
                     0x55
                 }
-            } else if i == 0 {
-                0x55 - narrow_before(i)
             } else {
-                // 0x56 less out-at-offset-0 and displaced-by-narrow.
-                0x56 - (out_off == 0) as u32 - narrow_before(i)
+                // Word offset of task `i+1`'s completion descriptor:
+                // 0x53 base + 1 if task `i+1` carries the f128 word
+                // (`!chain_narrow(co_{i+1})`) + 1 if task `i+1`'s input
+                // descriptor is long (`out_off != 0`) + 1 if task
+                // `i+1`'s output descriptor is long (`pool_off[i+1] != 0`).
+                0x53 + (out_off != 0) as u32
+                    + (pool_off[i + 1] != 0) as u32
+                    + (!chain_narrow(shapes[i + 1].1)) as u32
             };
             push(&mut rec, (oid << 16) | (i as u32 + 1));
             push(&mut rec, desc_flag(shapes[i].1));
@@ -5203,6 +5194,7 @@ pub fn emit_matmul(
 
 /// A compute op extracted from MIL text: op type, result shape, and
 /// the operand names we inspect (`x`/`y`/`weight`).
+#[derive(Clone, Debug)]
 pub(crate) struct MilOp {
     pub(crate) op: String,
     /// Result tensor name (the lhs identifier).
@@ -6101,7 +6093,20 @@ fn emit_from_mil_inner(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String
         return Err("chain layers have non-uniform aux-op patterns".into());
     }
     match aux {
-        [] => Err("plain conv chains are not on a covered family".into()),
+        [] => {
+            let mut shapes = Vec::with_capacity(k);
+            let mut flat_w = Vec::new();
+            let mut offs = Vec::with_capacity(k);
+            for (i, (o, _)) in layers.iter().enumerate() {
+                let cout = o.shape.get(1).copied().unwrap_or(0).max(1) as usize;
+                let cin = ws[i].len() / cout;
+                shapes.push((cin, cout));
+                flat_w.extend_from_slice(&ws[i]);
+                offs.push((128 + i * (cin * cout * 2 + 64)) as u64);
+            }
+            let out_name = &layers.last().unwrap().0.result;
+            emit_conv_chain(&shapes, &flat_w, &offs, out_name, mil_path, out_path)
+        }
         ["sigmoid"] => emit_conv_act_n_dw(FusedAct::Sigmoid, k, &wrefs, mil_path, out_path),
         ["tanh"] => emit_conv_act_n_dw(FusedAct::Tanh, k, &wrefs, mil_path, out_path),
         ["relu"] => emit_conv_act_n_dw(FusedAct::Relu, k, &wrefs, mil_path, out_path),
@@ -8272,6 +8277,48 @@ mod tests {
                 }
             }
         }
+
+        // Verify C in 713..=720 (the 59-symbol ANEC window) executes on
+        // ANE hardware via the standard 43-symbol parametric emitter.
+        let c716 = 716usize;
+        let w716: Vec<u16> = (0..c716 * c716)
+            .map(|i| half::f16::from_f32((((i * 13 + 5) % 61) as f32 - 30.0) * 0.002).to_bits())
+            .collect();
+        let p716 = root.join("c716.macho");
+        let img716 = emit_conv1x1_dyn(
+            c716,
+            &w716,
+            root.join("c716.mil").to_str().unwrap(),
+            p716.to_str().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&p716, &img716).unwrap();
+        let mut prog716 = crate::espresso::EspressoProgram::load_precompiled(&p716, &[]).unwrap();
+        let d_in = prog716.input_descs[0].clone();
+        for c in 0..c716 {
+            let o = d_in.offset(0, 0, c as u64, 0, 0);
+            let v = half::f16::from_f32(((c % 19) as f32 - 9.0) * 0.05).to_le_bytes();
+            prog716.input_mut(0)[o..o + 2].copy_from_slice(&v);
+        }
+        prog716.eval().unwrap();
+        let d_out = prog716.output_descs[0].clone();
+        let b_out = prog716.output(0);
+        for j in (0..c716).step_by(64) {
+            let o = d_out.offset(0, 0, j as u64, 0, 0);
+            let hw = half::f16::from_bits(u16::from_le_bytes([b_out[o], b_out[o + 1]])).to_f32();
+            let want: f32 = (0..c716)
+                .map(|i| {
+                    let xv = half::f16::from_f32(((i % 19) as f32 - 9.0) * 0.05).to_f32();
+                    let wv = half::f16::from_bits(w716[j * c716 + i]).to_f32();
+                    xv * wv
+                })
+                .sum();
+            assert!(
+                (hw - want).abs() < 0.03 + want.abs() * 0.03,
+                "c716[{j}]: hw={hw} want={want}"
+            );
+        }
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }
