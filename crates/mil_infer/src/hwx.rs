@@ -1110,6 +1110,30 @@ fn rebuild_tail_at(
     img
 }
 
+/// [`rebuild_tail_at`] for families whose `__text` section sits deeper
+/// than `0x4000` (the attnv family keeps it at `0x8000`). The emitted
+/// tail must still fit below `src_text_off` — the load-command
+/// `fileoff` is not patched, so the splice offset must match.
+fn rebuild_tail_at_text(
+    skel: &[u8],
+    tail_off: usize,
+    src_text_off: usize,
+    entries: &[(String, u8, u8, u16, u64)],
+    relocs: &[[u8; 8]],
+    mil_path: &str,
+    out_path: &str,
+) -> Result<Vec<u8>, String> {
+    let (mut img, text_off) = build_tail_at(skel, tail_off, entries, relocs, mil_path, out_path);
+    if text_off > src_text_off {
+        return Err(format!(
+            "tail ({text_off:#x}) overflows __text fileoff {src_text_off:#x}"
+        ));
+    }
+    img.resize(src_text_off, 0);
+    img.extend_from_slice(&skel[src_text_off..]);
+    Ok(img)
+}
+
 /// Emit a complete HWX image for `z = conv1x1(x, w)` on a skeleton
 /// family. `weights` is the raw `[C,C]` fp16 matrix (row-major `u16`
 /// elements); it is interleaved per [`weight_interleave`] into
@@ -4873,6 +4897,80 @@ pub fn emit_avw(r: u32, k: u32, mil_path: &str, out_path: &str) -> Vec<u8> {
     img
 }
 
+/// Standalone `softmax(x=[1,1,1,T], axis=-1)` — the attention score
+/// normalizer. ANEC lowers it to a multi-task record (exp / reduce /
+/// broadcast-divide sub-tasks); the record layout differs across T
+/// regimes, so we carry per-T skeletons. A decode pipeline keeps the
+/// score window padded to a fixed T_max with masked `-inf` lanes, so
+/// one size covers all cache lengths.
+const SKELETON_SM64: &[u8] = include_bytes!("../assets/sm64_skeleton.hwx");
+const SKELETON_SM256: &[u8] = include_bytes!("../assets/sm256_skeleton.hwx");
+const SKELETON_SM1024: &[u8] = include_bytes!("../assets/sm1024_skeleton.hwx");
+
+/// Emit a standalone softmax over `n` elements for n ∈ {64, 256, 1024}.
+/// Sig tail at `0x2688`, `__text` at `0x4000` on this family.
+pub fn emit_softmax(n: u32, mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> {
+    let skel = match n {
+        64 => SKELETON_SM64,
+        256 => SKELETON_SM256,
+        1024 => SKELETON_SM1024,
+        _ => return Err(format!("softmax n={n} not in {{64,256,1024}}")),
+    };
+    let (entries, relocs) = tail_meta(skel);
+    Ok(rebuild_tail_at(
+        skel, 0x2688, &entries, &relocs, mil_path, out_path,
+    ))
+}
+
+/// Channel-axis softmax `softmax(x=[1,T,1,1], axis=1)` — the attention
+/// score normalizer in **strided** layout: `x[t]`/`z[t]` sit at byte
+/// `t*64`, matching `emit_avw`'s output planes exactly, so the score
+/// surface adopts straight into this program's input.
+const SKELETON_SMC64: &[u8] = include_bytes!("../assets/smc64_skeleton.hwx");
+const SKELETON_SMC256: &[u8] = include_bytes!("../assets/smc256_skeleton.hwx");
+const SKELETON_SMC1024: &[u8] = include_bytes!("../assets/smc1024_skeleton.hwx");
+
+/// Emit channel-axis softmax over `t` positions for t ∈ {64,256,1024}.
+pub fn emit_softmax_ch(t: u32, mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> {
+    let skel = match t {
+        64 => SKELETON_SMC64,
+        256 => SKELETON_SMC256,
+        1024 => SKELETON_SMC1024,
+        _ => return Err(format!("softmax_ch t={t} not in {{64,256,1024}}")),
+    };
+    let (entries, relocs) = tail_meta(skel);
+    Ok(rebuild_tail_at(
+        skel, 0x2688, &entries, &relocs, mil_path, out_path,
+    ))
+}
+
+/// Attention output contraction `z[j] = Σ_t s[t]·v[t][j]`, emitted as
+/// `matmul(x=s[1,1,T,1], y=v[1,1,T,D], transpose_x)`. `s[t]` reads at
+/// `t*64` — byte-identical to the channel-axis softmax output, so the
+/// chain `scores → softmax → attn·V` adopts surfaces end to end.
+const SKELETON_AV64X32: &[u8] = include_bytes!("../assets/attnv_64x32_skeleton.hwx");
+const SKELETON_AV64X64: &[u8] = include_bytes!("../assets/attnv_64x64_skeleton.hwx");
+const SKELETON_AV64X128: &[u8] = include_bytes!("../assets/attnv_64x128_skeleton.hwx");
+const SKELETON_AV256X64: &[u8] = include_bytes!("../assets/attnv_256x64_skeleton.hwx");
+const SKELETON_AV1024X64: &[u8] = include_bytes!("../assets/attnv_1024x64_skeleton.hwx");
+const SKELETON_AV1024X128: &[u8] = include_bytes!("../assets/attnv_1024x128_skeleton.hwx");
+
+/// Emit the attn·V matvec for `(t, d)` pairs on the skeleton table.
+pub fn emit_attn_v(t: u32, d: u32, mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> {
+    let skel = match (t, d) {
+        (64, 32) => SKELETON_AV64X32,
+        (64, 64) => SKELETON_AV64X64,
+        (64, 128) => SKELETON_AV64X128,
+        (256, 64) => SKELETON_AV256X64,
+        (1024, 64) => SKELETON_AV1024X64,
+        (1024, 128) => SKELETON_AV1024X128,
+        _ => return Err(format!("attn_v (t={t},d={d}) not on skeleton table")),
+    };
+    let (entries, relocs) = tail_meta(skel);
+    // this family keeps __text at fileoff 0x8000, not 0x4000
+    rebuild_tail_at_text(skel, 0x34a8, 0x8000, &entries, &relocs, mil_path, out_path)
+}
+
 /// Emit `p = softmax(matmul(x, y^T))` — both operands activations —
 /// byte-identically for the `[1,64,1,64]` skeleton family.
 pub fn emit_mm_sm(mil_path: &str, out_path: &str) -> Vec<u8> {
@@ -5293,6 +5391,10 @@ fn emit_from_mil_inner(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String
                 mil_path,
                 out_path,
             ))
+        }
+        ["softmax"] => {
+            let n = elems(&ops[0]) as u32;
+            return emit_softmax(n, mil_path, out_path);
         }
         ["relu"] => return Ok(emit_relu(mil_path, out_path)),
         ["sigmoid"] => {
