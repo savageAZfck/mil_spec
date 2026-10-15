@@ -1,0 +1,14 @@
+program(1.3)
+{
+    func main<ios18>(tensor<fp16, [1, 64, 1, 1]> x) {
+            tensor<fp16, [32, 64, 1, 1]> w0 = const()[val = tensor<fp16, [32, 64, 1, 1]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(64)))];
+            tensor<fp16, [64, 32, 1, 1]> w1 = const()[val = tensor<fp16, [64, 32, 1, 1]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(4224)))];
+            tensor<int32, [2]> st = const()[val = tensor<int32, [2]>([1, 1])];
+            string pt = const()[val = string("valid")];
+            tensor<int32, [4]> pd = const()[val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<int32, [2]> dl = const()[val = tensor<int32, [2]>([1, 1])];
+            int32 gr = const()[val = int32(1)];
+            tensor<fp16, [1, 32, 1, 1]> y1 = conv(x = x, weight = w0, strides = st, pad_type = pt, pad = pd, dilations = dl, groups = gr)[name = string("y1")];
+            tensor<fp16, [1, 64, 1, 1]> y2 = conv(x = y1, weight = w1, strides = st, pad_type = pt, pad = pd, dilations = dl, groups = gr)[name = string("y2")];
+    } -> (y2);
+}
