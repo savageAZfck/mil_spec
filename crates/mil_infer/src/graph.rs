@@ -22,18 +22,19 @@
 //!   rms_norm              expanded: mul -> repack -> ones-matvec ->
 //!                         host rsqrt -> mul(x,rvec) -> mul(gamma)?
 
-use crate::espresso::EspressoProgram;
+use crate::espresso::{EspressoProgram, SharedSurface, TensorDesc};
 use crate::hwx::{
     self, emit_add4d, emit_attn_v, emit_avw, emit_conv1x1_w, emit_elementwise2, emit_matmul_ns,
     emit_outer_t, emit_relu, emit_repack, emit_sigmoid_strided, emit_softmax, emit_softmax_ch,
     emit_unary_lut, EwOp, LutOp, MilOp,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 /// Physical tensor currency — byte-level layouts that must match for
 /// zero-copy surface adoption.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Cur {
     /// One fp16 per 64B channel plane (`[1,N,1,1]`, plane_stride 64).
     Strided(u32),
@@ -56,14 +57,15 @@ pub enum BindSrc {
 /// Host-side step between evals.
 #[derive(Clone, Debug)]
 pub enum HostOp {
-    /// Read `src` node's output channel 0 (a partial-sum vector),
-    /// compute `rsqrt(sum/n + eps)`, broadcast it strided into every
-    /// surface bound to external input `ext`.
+    /// Read `src` surface (`n` elements), compute `rsqrt(mean(x^2) + eps)`
+    /// (scaled by `gamma` when present), and broadcast it strided into
+    /// external input `ext` for the downstream ANE `mul(x, rvec)`.
     RsqrtBroadcast {
-        src: usize,
+        src: BindSrc,
         ext: String,
         n: u32,
         eps: f32,
+        gamma: Option<Vec<f32>>,
     },
 }
 
@@ -130,53 +132,33 @@ fn mil_int(text: &str, v: &str) -> Option<i64> {
 /// Expand `rms_norm(x, w, d, eps)` into the verified primitive
 /// sub-plan. Returns the extra ops to splice in place; the host
 /// rsqrt node is recorded via `hosts`.
-fn expand_rms(o: &MilOp, eps: f32) -> Vec<MilOp> {
+fn expand_rms(o: &MilOp, eps: f32, fold_gamma: bool) -> Vec<MilOp> {
     let x = arg_of(o, "x").unwrap_or("x").to_string();
-    let n: i64 = o.shape.iter().map(|d| (*d).max(1)).product();
+    let mut bcast_args = vec![
+        ("x".into(), x.clone()),
+        ("eps".into(), format!("__eps_{}", eps)),
+    ];
+    if fold_gamma {
+        if let Some(g) = arg_of(o, "w") {
+            bcast_args.push(("w".into(), g.to_string()));
+        }
+    }
     let mut v = vec![
-        MilOp {
-            op: "mul".into(),
-            result: format!("{}_sq", o.result),
-            shape: o.shape.clone(),
-            args: vec![("x".into(), x.clone()), ("y".into(), x)],
-        },
-        MilOp {
-            op: "transpose".into(),
-            result: format!("{}_sqc", o.result),
-            shape: vec![1, 1, 1, n],
-            args: vec![("x".into(), format!("{}_sq", o.result))],
-        },
-        MilOp {
-            op: "matmul".into(),
-            result: format!("{}_ss", o.result),
-            shape: vec![1, 32, 1, 1],
-            args: vec![
-                ("x".into(), format!("{}_sqc", o.result)),
-                ("y".into(), format!("{}_ones", o.result)),
-                ("transpose_y".into(), "__true".into()),
-            ],
-        },
         // marker consumed by the emitter loop: host rsqrt broadcast
         MilOp {
             op: "__rsqrt_bcast".into(),
             result: format!("{}_rvec", o.result),
             shape: o.shape.clone(),
-            args: vec![
-                ("x".into(), format!("{}_ss", o.result)),
-                ("eps".into(), format!("__eps_{}", eps)),
-            ],
+            args: bcast_args,
         },
         MilOp {
             op: "mul".into(),
             result: format!("{}_xn", o.result),
             shape: o.shape.clone(),
-            args: vec![
-                ("x".into(), arg_of(o, "x").unwrap_or("x").to_string()),
-                ("y".into(), format!("{}_rvec", o.result)),
-            ],
+            args: vec![("x".into(), x), ("y".into(), format!("{}_rvec", o.result))],
         },
     ];
-    if let Some(g) = arg_of(o, "w") {
+    if let Some(g) = arg_of(o, "w").filter(|_| !fold_gamma) {
         v.push(MilOp {
             op: "mul".into(),
             result: o.result.clone(),
@@ -238,7 +220,8 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
                     })
                 })
                 .unwrap_or(1e-5);
-            flat.extend(expand_rms(&o, eps));
+            let fold_gamma = arg_of(&o, "w").and_then(&blob_f32).is_some();
+            flat.extend(expand_rms(&o, eps, fold_gamma));
         } else {
             flat.push(o);
         }
@@ -273,11 +256,11 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
     let mut ext_uses: Vec<(String, usize, usize)> = Vec::new();
     let mut const_fills: Vec<(String, Vec<f32>)> = Vec::new();
 
-    let mut push_prog = |nodes: &mut Vec<Node>,
-                         created: &mut Vec<usize>,
-                         name: String,
-                         img: Vec<u8>,
-                         out_dir: &str|
+    let push_prog = |nodes: &mut Vec<Node>,
+                     created: &mut Vec<usize>,
+                     name: String,
+                     img: Vec<u8>,
+                     out_dir: &str|
      -> Result<usize, String> {
         let idx = nodes.len();
         let path = format!("{out_dir}/n{idx}_{name}.macho");
@@ -299,19 +282,21 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
             "__rsqrt_bcast" => {
                 // host node: rvec surfaces are externals on consumers
                 let src = arg_of(o, "x").unwrap();
-                let src_idx = prod
-                    .get(src)
-                    .ok_or_else(|| format!("rsqrt src `{src}` has no producer"))?
-                    .0;
+                let src_bind = match prod.get(src) {
+                    Some((idx, _)) => BindSrc::Out(*idx),
+                    None => BindSrc::Ext(src.to_string()),
+                };
                 let eps = arg_of(o, "eps")
                     .and_then(|v| v.strip_prefix("__eps_"))
                     .and_then(|v| v.parse::<f32>().ok())
                     .unwrap_or(1e-5);
+                let gamma = arg_of(o, "w").and_then(&blob_f32);
                 nodes.push(Node::Host(HostOp::RsqrtBroadcast {
-                    src: src_idx,
+                    src: src_bind,
                     ext: o.result.clone(),
                     n: elems,
                     eps,
+                    gamma,
                 }));
                 created.push(nodes.len() - 1);
                 // rvec is virtual — consumers see it as an external
@@ -546,12 +531,15 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
     // adapters created during binding eval immediately before their
     // consumer: eval order = for each created node, its adapters first.
     let mut pre: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut adapters: HashMap<(usize, Cur), usize> = HashMap::new();
     for (nidx, ws) in &wants {
         let mut bs = Vec::new();
         for (port, (name, want)) in ws.iter().enumerate() {
             if let Some((pn, have)) = prod.get(name.as_str()).copied() {
                 let src = if have == *want {
                     pn
+                } else if let Some(&aidx) = adapters.get(&(pn, *want)) {
+                    aidx
                 } else {
                     match (have, *want) {
                         (Cur::Strided(n), Cur::Contig(m)) if n == m => {
@@ -568,6 +556,7 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
                                 zero: Vec::new(),
                             });
                             pre.entry(*nidx).or_default().push(aidx);
+                            adapters.insert((pn, *want), aidx);
                             aidx
                         }
                         _ => {
@@ -637,53 +626,43 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
 pub struct GraphRuntime {
     pub progs: Vec<Option<EspressoProgram>>,
     pub plan: Plan,
+    /// One shared surface per node output (Rc: aliased nodes share the
+    /// bound input surface — e.g. in-place KV-cache adds).
+    bufs: Vec<Option<Rc<SharedSurface>>>,
+    /// External input surfaces by name.
+    ext_bufs: HashMap<String, Rc<SharedSurface>>,
+    /// Producer output descs cached from each node's first load.
+    out_descs: Vec<Option<TensorDesc>>,
+    ext_descs: HashMap<String, TensorDesc>,
+    /// Ext writes recorded before the surface materialized (first
+    /// consumer bind creates it).
+    pending: HashMap<String, Vec<ExtWrite>>,
+    /// Resident node indices, oldest first.
+    lru: VecDeque<usize>,
 }
 
+type ExtWrite = Rc<dyn Fn(&mut [u8], &TensorDesc)>;
+
 impl GraphRuntime {
-    /// Load every node program, apply aliases/zero-init, then wire the
-    /// adopted surfaces and const fills.
+    /// Wire the plan without loading every program: surfaces are
+    /// runtime-owned and programs load lazily on first eval, with
+    /// LRU-style eviction whenever `loadModel` reports resource
+    /// exhaustion (the ANE residency pool is finite).
     pub fn load(plan: Plan) -> Result<Self, String> {
-        let mut progs: Vec<Option<EspressoProgram>> = Vec::new();
-        for n in &plan.nodes {
-            match n {
-                Node::Prog { path, .. } => progs.push(Some(
-                    EspressoProgram::load_precompiled(path, &[])
-                        .map_err(|e| format!("{}: {e:?}", path.display()))?,
-                )),
-                Node::Host(_) => progs.push(None),
-            }
-        }
-        for (i, n) in plan.nodes.iter().enumerate() {
-            if let Node::Prog { alias, zero, .. } = n {
-                let p = progs[i].as_mut().unwrap();
-                for (o, ii) in alias {
-                    p.alias_out_to_in(*o, *ii);
-                }
-                for ii in zero {
-                    for b in p.input_mut(*ii).iter_mut() {
-                        *b = 0;
-                    }
-                }
-            }
-        }
-        for (i, n) in plan.nodes.iter().enumerate() {
-            if let Node::Prog { binds, .. } = n {
-                for (port, b) in binds.iter().enumerate() {
-                    if let BindSrc::Out(src) = b {
-                        let s = progs[*src].as_ref().unwrap().output_surf(0);
-                        progs[i]
-                            .as_mut()
-                            .unwrap()
-                            .adopt_input(port, s)
-                            .map_err(|e| format!("bind node{i} port{port}: {e:?}"))?;
-                    }
-                }
-            }
-        }
-        let mut rt = Self { progs, plan };
+        let n = plan.nodes.len();
+        let mut rt = Self {
+            progs: (0..n).map(|_| None).collect(),
+            bufs: vec![None; n],
+            out_descs: vec![None; n],
+            ext_bufs: HashMap::new(),
+            ext_descs: HashMap::new(),
+            pending: HashMap::new(),
+            lru: VecDeque::new(),
+            plan,
+        };
         let fills = rt.plan.const_fills.clone();
-        for (name, vals) in &fills {
-            rt.write_ext(name, |b, d| {
+        for (name, vals) in fills {
+            rt.write_ext(&name, move |b, d| {
                 for (i, v) in vals.iter().enumerate() {
                     let o = d.offset(0, 0, i as u64, 0, 0);
                     if o + 2 <= b.len() {
@@ -695,28 +674,179 @@ impl GraphRuntime {
         Ok(rt)
     }
 
-    /// Write external input `name` into every bound port via `f(bytes,
-    /// desc)`.
-    pub fn write_ext(&mut self, name: &str, f: impl Fn(&mut [u8], &crate::espresso::TensorDesc)) {
-        let uses: Vec<(usize, usize)> = self
-            .plan
-            .externals
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, u)| u.clone())
-            .unwrap_or_default();
-        for (ni, port) in uses {
-            let p = self.progs[ni].as_mut().unwrap();
-            let d = p.input_descs[port].clone();
-            f(p.input_mut(port), &d);
+    fn touch(&mut self, i: usize) {
+        if let Some(p) = self.lru.iter().position(|v| *v == i) {
+            self.lru.remove(p);
+        }
+        self.lru.push_back(i);
+    }
+
+    /// The shared surface backing node `i`'s output, honoring in-place
+    /// aliases (`add`'s out aliases its cache input).
+    fn node_surf(&self, i: usize) -> Option<Rc<SharedSurface>> {
+        if let Node::Prog { alias, binds, .. } = &self.plan.nodes[i] {
+            for (o, ii) in alias {
+                if *o == 0 {
+                    return self.port_surf(i, *ii);
+                }
+            }
+            let _ = binds;
+        }
+        self.bufs[i].clone()
+    }
+
+    /// The surface bound to node `i` input port `p`.
+    fn port_surf(&self, i: usize, p: usize) -> Option<Rc<SharedSurface>> {
+        if let Node::Prog { binds, .. } = &self.plan.nodes[i] {
+            match binds.get(p)? {
+                BindSrc::Ext(name) => self.ext_bufs.get(name).cloned(),
+                BindSrc::Out(src) => self.node_surf(*src),
+            }
+        } else {
+            None
         }
     }
 
+    /// Materialize the ext surface for `name` using `desc`, apply
+    /// pending writes.
+    fn ext_surface(&mut self, name: &str, desc: &TensorDesc) -> Result<Rc<SharedSurface>, String> {
+        if let Some(s) = self.ext_bufs.get(name) {
+            return Ok(s.clone());
+        }
+        let surf = SharedSurface::new(desc.bytes()).map_err(|e| format!("ext {name}: {e:?}"))?;
+        for b in surf.bytes_mut().iter_mut() {
+            *b = 0;
+        }
+        let rc = Rc::new(surf);
+        self.ext_descs.insert(name.to_string(), desc.clone());
+        if let Some(ws) = self.pending.remove(name) {
+            for w in ws {
+                w(rc.bytes_mut(), desc);
+            }
+        }
+        self.ext_bufs.insert(name.to_string(), rc.clone());
+        Ok(rc)
+    }
+
+    /// Load program `i` and bind all ports to runtime surfaces.
+    fn load_node(&mut self, i: usize) -> Result<(), String> {
+        let Node::Prog {
+            path,
+            binds,
+            alias,
+            zero,
+            ..
+        } = &self.plan.nodes[i]
+        else {
+            return Ok(());
+        };
+        let path = path.clone();
+        let binds = binds.clone();
+        let alias = alias.clone();
+        let _ = zero.clone(); // fresh SharedSurfaces are zeroed at creation
+        let mut p = EspressoProgram::load_precompiled(&path, &[])
+            .map_err(|e| format!("{}: {e:?}", path.display()))?;
+        // producer output desc + surface
+        if self.out_descs[i].is_none() {
+            self.out_descs[i] = p.output_descs.first().cloned();
+        }
+        let aliased = alias.iter().any(|(o, _)| *o == 0);
+        if !aliased {
+            if self.bufs[i].is_none() {
+                let bytes = self.out_descs[i]
+                    .as_ref()
+                    .map(|d| d.bytes())
+                    .unwrap_or(16384);
+                self.bufs[i] = Some(Rc::new(
+                    SharedSurface::new(bytes).map_err(|e| format!("n{i} out: {e:?}"))?,
+                ));
+            }
+            let s = self.bufs[i].clone().unwrap();
+            p.adopt_output(0, s.as_ptr())
+                .map_err(|e| format!("n{i} adopt out: {e:?}"))?;
+        }
+        // input ports
+        for (port, b) in binds.iter().enumerate() {
+            let surf = match b {
+                BindSrc::Out(src) => self.node_surf(*src),
+                BindSrc::Ext(name) => {
+                    let d = p.input_descs[port].clone();
+                    Some(self.ext_surface(name, &d)?)
+                }
+            };
+            if let Some(s) = surf {
+                p.adopt_input(port, s.as_ptr())
+                    .map_err(|e| format!("bind node{i} port{port}: {e:?}"))?;
+            }
+        }
+        // in-place aliases: out port rides the input's surface
+        for (o, ii) in &alias {
+            if let Some(s) = self.port_surf(i, *ii) {
+                p.adopt_output(*o, s.as_ptr())
+                    .map_err(|e| format!("n{i} alias: {e:?}"))?;
+                if *o == 0 {
+                    self.bufs[i] = Some(s);
+                }
+            }
+        }
+        self.progs[i] = Some(p);
+        self.touch(i);
+        Ok(())
+    }
+
+    /// Ensure node `i`'s program is resident; on resource exhaustion
+    /// evict the least-recently-used resident program and retry.
+    fn ensure(&mut self, i: usize) -> Result<(), String> {
+        if self.progs[i].is_some() {
+            self.touch(i);
+            return Ok(());
+        }
+        loop {
+            match self.load_node(i) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if !e.contains("no ANE resources") {
+                        return Err(e);
+                    }
+                    // Bélády-optimal for cyclic DAG execution: the node
+                    // that ran most recently has its next use furthest
+                    // in the future (`N - 1` steps away).
+                    let victim = self
+                        .lru
+                        .iter()
+                        .rposition(|v| *v != i)
+                        .map(|p| self.lru.remove(p).unwrap());
+                    match victim {
+                        Some(v) => self.progs[v] = None,
+                        None => return Err(e),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Write external input `name` into its shared surface via
+    /// `f(bytes, desc)`; defers if no consumer has materialized it yet.
+    pub fn write_ext(
+        &mut self,
+        name: &str,
+        f: impl Fn(&mut [u8], &crate::espresso::TensorDesc) + 'static,
+    ) {
+        if let (Some(s), Some(d)) = (self.ext_bufs.get(name), self.ext_descs.get(name)) {
+            f(s.bytes_mut(), d);
+            return;
+        }
+        self.pending
+            .entry(name.to_string())
+            .or_default()
+            .push(Rc::new(f));
+    }
+
     pub fn output(&self, i: usize) -> &[u8] {
-        self.progs[i].as_ref().unwrap().output(0)
+        self.bufs[i].as_ref().map(|s| s.bytes()).unwrap_or(&[])
     }
     pub fn out_desc(&self, i: usize) -> crate::espresso::TensorDesc {
-        self.progs[i].as_ref().unwrap().output_descs[0].clone()
+        self.out_descs[i].clone().unwrap_or_default()
     }
     /// Node index by node/result name (internal intermediates too).
     pub fn node_named(&self, name: &str) -> Option<usize> {
@@ -734,34 +864,76 @@ impl GraphRuntime {
             .map(|(_, i)| *i)
     }
 
-    /// Execute the whole graph once in scheduled order (host ops run
-    /// their scalar bridge inline).
+    /// Execute the whole graph once in scheduled order; programs load
+    /// lazily and are evicted LRU-first under ANE residency pressure.
     pub fn run(&mut self) -> Result<(), String> {
         for i in self.plan.order.clone() {
             match &self.plan.nodes[i] {
-                Node::Prog { .. } => self.progs[i]
-                    .as_ref()
-                    .unwrap()
-                    .eval()
-                    .map_err(|e| format!("node {i}: {e:?}"))?,
-                Node::Host(HostOp::RsqrtBroadcast { src, ext, n, eps }) => {
-                    let (src, ext, n, eps) = (*src, ext.clone(), *n, *eps);
-                    let d = self.out_desc(src);
-                    let sum = half::f16::from_bits(u16::from_le_bytes([
-                        self.output(src)[d.offset(0, 0, 0, 0, 0)],
-                        self.output(src)[d.offset(0, 0, 0, 0, 0) + 1],
-                    ]))
-                    .to_f32();
+                Node::Prog { .. } => {
+                    self.ensure(i)?;
+                    self.progs[i]
+                        .as_ref()
+                        .unwrap()
+                        .eval()
+                        .map_err(|e| format!("node {i}: {e:?}"))?
+                }
+                Node::Host(HostOp::RsqrtBroadcast {
+                    src,
+                    ext,
+                    n,
+                    eps,
+                    gamma,
+                }) => {
+                    let (src, ext, n, eps, gamma) =
+                        (src.clone(), ext.clone(), *n, *eps, gamma.clone());
+                    let (surf, d) = match &src {
+                        BindSrc::Out(idx) => {
+                            (self.bufs[*idx].clone().unwrap(), self.out_desc(*idx))
+                        }
+                        BindSrc::Ext(name) => {
+                            if !self.ext_bufs.contains_key(name) {
+                                if let Some((_, uses)) =
+                                    self.plan.externals.iter().find(|(nm, _)| nm == name)
+                                {
+                                    if let Some(&(ni, _)) = uses.first() {
+                                        self.ensure(ni)?;
+                                    }
+                                }
+                            }
+                            (
+                                self.ext_bufs.get(name).unwrap().clone(),
+                                self.ext_descs.get(name).unwrap().clone(),
+                            )
+                        }
+                    };
+                    let b = surf.bytes();
+                    let sum: f32 = (0..n as u64)
+                        .map(|i| {
+                            let o = if d.k > 1 {
+                                d.offset(0, 0, i, 0, 0)
+                            } else {
+                                d.offset(0, 0, 0, 0, i)
+                            };
+                            let v =
+                                half::f16::from_bits(u16::from_le_bytes([b[o], b[o + 1]])).to_f32();
+                            v * v
+                        })
+                        .sum();
                     let r = (sum / n as f32 + eps).sqrt().recip();
-                    self.write_ext(&ext, |b, d| {
+                    self.write_ext(&ext, move |b, d| {
                         for i in 0..d.k.max(d.w) {
                             let o = if d.k > 1 {
                                 d.offset(0, 0, i, 0, 0)
                             } else {
                                 d.offset(0, 0, 0, 0, i)
                             };
+                            let g = gamma
+                                .as_ref()
+                                .and_then(|gv| gv.get(i as usize).copied())
+                                .unwrap_or(1.0);
                             if o + 2 <= b.len() {
-                                b[o..o + 2].copy_from_slice(&half::f16::from_f32(r).to_le_bytes());
+                                b[o..o + 2]
+                                    .copy_from_slice(&half::f16::from_f32(r * g).to_le_bytes());
                             }
                         }
                     });

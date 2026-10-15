@@ -7,18 +7,18 @@
 
 use half::f16;
 use mil_infer::graph::{compile_graph, GraphRuntime};
-use std::path::Path;
 
 const T_MAX: usize = 256;
 const D: usize = 64;
 const FF: usize = 256;
+const LAYERS: usize = 2;
 const EPS: f32 = 1e-5;
 
 fn f32_of(h: u16) -> f32 {
     f16::from_bits(h).to_f32()
 }
 fn wload(tag: u8, i: usize, j: usize) -> f32 {
-    ((i * 7 + j * 3 + tag as usize * 11) % 17) as f32 / 64.0 - 0.13
+    f16::from_f32(((i * 7 + j * 3 + tag as usize * 11) % 17) as f32 / 64.0 - 0.13).to_f32()
 }
 fn blob(path: &str, vals: &[u16]) {
     let b: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -30,49 +30,27 @@ fn main() {
     let dir = format!("/tmp/gp_{pid}");
     std::fs::create_dir_all(&dir).unwrap();
 
-    // weights -> blob files
-    blob(
-        &format!("{dir}/wq.bin"),
-        &(0..D * D)
-            .map(|i| f16::from_f32(wload(b'q', i / D, i % D)).to_bits())
-            .collect::<Vec<_>>(),
-    );
-    blob(
-        &format!("{dir}/wk.bin"),
-        &(0..D * D)
-            .map(|i| f16::from_f32(wload(b'k', i / D, i % D)).to_bits())
-            .collect::<Vec<_>>(),
-    );
-    blob(
-        &format!("{dir}/wv.bin"),
-        &(0..D * D)
-            .map(|i| f16::from_f32(wload(b'v', i / D, i % D)).to_bits())
-            .collect::<Vec<_>>(),
-    );
-    blob(
-        &format!("{dir}/wo.bin"),
-        &(0..D * D)
-            .map(|i| f16::from_f32(wload(b'o', i / D, i % D)).to_bits())
-            .collect::<Vec<_>>(),
-    );
-    blob(
-        &format!("{dir}/wup.bin"),
-        &(0..FF * D)
-            .map(|i| f16::from_f32(wload(b'u', i / D, i % D)).to_bits())
-            .collect::<Vec<_>>(),
-    );
-    blob(
-        &format!("{dir}/wg.bin"),
-        &(0..FF * D)
-            .map(|i| f16::from_f32(wload(b'g', i / D, i % D)).to_bits())
-            .collect::<Vec<_>>(),
-    );
-    blob(
-        &format!("{dir}/wdn.bin"),
-        &(0..D * FF)
-            .map(|i| f16::from_f32(wload(b'd', i / FF, i % FF)).to_bits())
-            .collect::<Vec<_>>(),
-    );
+    // weights -> blob files (per-layer: tag base = b'A' + layer*8)
+    for l in 0..LAYERS {
+        let tag = (b'A' + (l * 8) as u8) as u32;
+        let mkw = |name: &str, rows: usize, cols: usize, off: u8| {
+            blob(
+                &format!("{dir}/{name}{l}.bin"),
+                &(0..rows * cols)
+                    .map(|i| {
+                        f16::from_f32(wload((tag + off as u32) as u8, i / cols, i % cols)).to_bits()
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        };
+        mkw("wq", D, D, 0);
+        mkw("wk", D, D, 1);
+        mkw("wv", D, D, 2);
+        mkw("wo", D, D, 3);
+        mkw("wup", FF, D, 4);
+        mkw("wg", FF, D, 5);
+        mkw("wdn", D, FF, 6);
+    }
     blob(
         &format!("{dir}/gam.bin"),
         &vec![f16::from_f32(1.0).to_bits(); D],
@@ -85,64 +63,31 @@ fn main() {
             .collect::<Vec<_>>(),
     );
 
-    let mil = format!(
-        r#"program(1.3)
-{{
-    func main<ios18>(tensor<fp16, [1, 64, 1, 1]> x,
-                     tensor<fp16, [1, 256, 1, 1]> e_t,
-                     tensor<fp16, [1, 256, 1, 1]> msk,
-                     tensor<fp16, [1, 256, 1, 64]> kcache,
-                     tensor<fp16, [1, 256, 1, 64]> vcache,
-                     tensor<fp16, [1, 64, 1, 1]> cos_t,
-                     tensor<fp16, [1, 64, 1, 1]> sin_t) {{
-        tensor<fp16, [64, 64]> Wq = const()[val = tensor<fp16, [64, 64]>(BLOBFILE(path = string("{dir}/wq.bin"), offset = uint64(0)))];
-        tensor<fp16, [64, 64]> Wk = const()[val = tensor<fp16, [64, 64]>(BLOBFILE(path = string("{dir}/wk.bin"), offset = uint64(0)))];
-        tensor<fp16, [64, 64]> Wv = const()[val = tensor<fp16, [64, 64]>(BLOBFILE(path = string("{dir}/wv.bin"), offset = uint64(0)))];
-        tensor<fp16, [64, 64]> Wo = const()[val = tensor<fp16, [64, 64]>(BLOBFILE(path = string("{dir}/wo.bin"), offset = uint64(0)))];
-        tensor<fp16, [256, 64]> Wu = const()[val = tensor<fp16, [128, 64]>(BLOBFILE(path = string("{dir}/wup.bin"), offset = uint64(0)))];
-        tensor<fp16, [256, 64]> Wg = const()[val = tensor<fp16, [128, 64]>(BLOBFILE(path = string("{dir}/wg.bin"), offset = uint64(0)))];
-        tensor<fp16, [64, 256]> Wd = const()[val = tensor<fp16, [64, 128]>(BLOBFILE(path = string("{dir}/wdn.bin"), offset = uint64(0)))];
-        tensor<fp16, [64]> gam1 = const()[val = tensor<fp16, [64]>(BLOBFILE(path = string("{dir}/gam.bin"), offset = uint64(0)))];
-        tensor<fp16, [64]> gam2 = const()[val = tensor<fp16, [64]>(BLOBFILE(path = string("{dir}/gam.bin"), offset = uint64(0)))];
-        tensor<int32, []> ax1 = const()[val = int32(1)];
-        tensor<bool, []> bt = const()[val = bool(true)];
-
-        tensor<fp16, [64, 64]> Perm = const()[val = tensor<fp16, [64, 64]>(BLOBFILE(path = string("{dir}/perm.bin"), offset = uint64(0)))];
-        tensor<fp16, [1, 64, 1, 1]> xn1 = rms_norm(x = x, w = gam1, eps = fp16(0.00001))[name = string("xn1")];
-        tensor<fp16, [1, 1, 1, 64]> q = matmul(x = xn1, y = Wq, transpose_y = bt)[name = string("q")];
-        tensor<fp16, [1, 1, 1, 64]> kk = matmul(x = xn1, y = Wk, transpose_y = bt)[name = string("kk")];
-        tensor<fp16, [1, 1, 1, 64]> vv = matmul(x = xn1, y = Wv, transpose_y = bt)[name = string("vv")];
-        // RoPE: v_r = v*cos_t + perm(v)*sin_t   (sign folded into sin_t)
-        tensor<fp16, [1, 1, 1, 64]> qp = matmul(x = q, y = Perm, transpose_y = bt)[name = string("qp")];
-        tensor<fp16, [1, 64, 1, 1]> qc = mul(x = q, y = cos_t)[name = string("qc")];
-        tensor<fp16, [1, 64, 1, 1]> qps = mul(x = qp, y = sin_t)[name = string("qps")];
-        tensor<fp16, [1, 64, 1, 1]> qr = add(x = qc, y = qps)[name = string("qr")];
-        tensor<fp16, [1, 1, 1, 64]> kp = matmul(x = kk, y = Perm, transpose_y = bt)[name = string("kp")];
-        tensor<fp16, [1, 64, 1, 1]> kc = mul(x = kk, y = cos_t)[name = string("kc")];
-        tensor<fp16, [1, 64, 1, 1]> kps = mul(x = kp, y = sin_t)[name = string("kps")];
-        tensor<fp16, [1, 64, 1, 1]> kr = add(x = kc, y = kps)[name = string("kr")];
-        tensor<fp16, [1, 256, 1, 64]> ek = matmul(x = e_t, y = kr, transpose_x = bt)[name = string("ek")];
-        tensor<fp16, [1, 256, 1, 64]> ev = matmul(x = e_t, y = vv, transpose_x = bt)[name = string("ev")];
-        tensor<fp16, [1, 256, 1, 64]> knew = add(x = kcache, y = ek)[name = string("knew")];
-        tensor<fp16, [1, 256, 1, 64]> vnew = add(x = vcache, y = ev)[name = string("vnew")];
-        tensor<fp16, [1, 256, 1, 1]> s = matmul(x = qr, y = knew, transpose_y = bt)[name = string("s")];
-        tensor<fp16, [1, 256, 1, 1]> sm2 = add(x = s, y = msk)[name = string("sm2")];
-        tensor<fp16, [1, 256, 1, 1]> p = softmax(x = sm2, axis = ax1)[name = string("p")];
-        tensor<fp16, [1, 1, 1, 64]> aout = matmul(x = p, y = vnew, transpose_x = bt)[name = string("aout")];
-        tensor<fp16, [1, 1, 1, 64]> o = matmul(x = aout, y = Wo, transpose_y = bt)[name = string("o")];
-        tensor<fp16, [1, 64, 1, 1]> r1 = add(x = x, y = o)[name = string("r1")];
-        tensor<fp16, [1, 64, 1, 1]> xn2 = rms_norm(x = r1, w = gam2, eps = fp16(0.00001))[name = string("xn2")];
-        tensor<fp16, [1, 1, 1, 256]> u = matmul(x = xn2, y = Wu, transpose_y = bt)[name = string("u")];
-        tensor<fp16, [1, 1, 1, 256]> g = matmul(x = xn2, y = Wg, transpose_y = bt)[name = string("g")];
-        tensor<fp16, [1, 256, 1, 1]> gs = sigmoid(x = g)[name = string("gs")];
-        tensor<fp16, [1, 256, 1, 1]> gsl = mul(x = g, y = gs)[name = string("gsl")];
-        tensor<fp16, [1, 256, 1, 1]> fu = mul(x = u, y = gsl)[name = string("fu")];
-        tensor<fp16, [1, 1, 1, 64]> dn = matmul(x = fu, y = Wd, transpose_y = bt)[name = string("dn")];
-        tensor<fp16, [1, 64, 1, 1]> y = add(x = r1, y = dn)[name = string("y")];
-    }} -> (y);
-}}
-"#
-    );
+    // ---- generate the MIL: LAYERS stacked transformer layers --------
+    let mut mil = String::from("program(1.3)\n{\n    func main<ios18>(tensor<fp16, [1, 64, 1, 1]> x,\n                     tensor<fp16, [1, 256, 1, 1]> e_t,\n                     tensor<fp16, [1, 256, 1, 1]> msk,\n");
+    for l in 0..LAYERS {
+        mil.push_str(&format!(
+            "                     tensor<fp16, [1, 256, 1, 64]> kcache{l},\n                     tensor<fp16, [1, 256, 1, 64]> vcache{l},\n"
+        ));
+    }
+    mil.push_str("                     tensor<fp16, [1, 64, 1, 1]> cos_t,\n                     tensor<fp16, [1, 64, 1, 1]> sin_t) {\n");
+    for l in 0..LAYERS {
+        mil.push_str(&format!(
+            "        tensor<fp16, [64, 64]> Wq{l} = const()[val = tensor<fp16, [64, 64]>(BLOBFILE(path = string(\"{dir}/wq{l}.bin\"), offset = uint64(0)))];\n        tensor<fp16, [64, 64]> Wk{l} = const()[val = tensor<fp16, [64, 64]>(BLOBFILE(path = string(\"{dir}/wk{l}.bin\"), offset = uint64(0)))];\n        tensor<fp16, [64, 64]> Wv{l} = const()[val = tensor<fp16, [64, 64]>(BLOBFILE(path = string(\"{dir}/wv{l}.bin\"), offset = uint64(0)))];\n        tensor<fp16, [64, 64]> Wo{l} = const()[val = tensor<fp16, [64, 64]>(BLOBFILE(path = string(\"{dir}/wo{l}.bin\"), offset = uint64(0)))];\n        tensor<fp16, [256, 64]> Wu{l} = const()[val = tensor<fp16, [256, 64]>(BLOBFILE(path = string(\"{dir}/wup{l}.bin\"), offset = uint64(0)))];\n        tensor<fp16, [256, 64]> Wg{l} = const()[val = tensor<fp16, [256, 64]>(BLOBFILE(path = string(\"{dir}/wg{l}.bin\"), offset = uint64(0)))];\n        tensor<fp16, [64, 256]> Wd{l} = const()[val = tensor<fp16, [64, 256]>(BLOBFILE(path = string(\"{dir}/wdn{l}.bin\"), offset = uint64(0)))];\n        tensor<fp16, [64]> gam1_{l} = const()[val = tensor<fp16, [64]>(BLOBFILE(path = string(\"{dir}/gam.bin\"), offset = uint64(0)))];\n        tensor<fp16, [64]> gam2_{l} = const()[val = tensor<fp16, [64]>(BLOBFILE(path = string(\"{dir}/gam.bin\"), offset = uint64(0)))];\n"
+        ));
+    }
+    mil.push_str(&format!("        tensor<int32, []> ax1 = const()[val = int32(1)];\n        tensor<bool, []> bt = const()[val = bool(true)];\n        tensor<fp16, [64, 64]> Perm = const()[val = tensor<fp16, [64, 64]>(BLOBFILE(path = string(\"{dir}/perm.bin\"), offset = uint64(0)))];\n"));
+    for l in 0..LAYERS {
+        let xin = if l == 0 {
+            "x".to_string()
+        } else {
+            format!("y{}", l - 1)
+        };
+        mil.push_str(&format!(
+            "        tensor<fp16, [1, 64, 1, 1]> xn1_{l} = rms_norm(x = {xin}, w = gam1_{l}, eps = fp16(0.00001))[name = string(\"xn1_{l}\")];\n        tensor<fp16, [1, 1, 1, 64]> q{l} = matmul(x = xn1_{l}, y = Wq{l}, transpose_y = bt)[name = string(\"q{l}\")];\n        tensor<fp16, [1, 1, 1, 64]> kk{l} = matmul(x = xn1_{l}, y = Wk{l}, transpose_y = bt)[name = string(\"kk{l}\")];\n        tensor<fp16, [1, 1, 1, 64]> vv{l} = matmul(x = xn1_{l}, y = Wv{l}, transpose_y = bt)[name = string(\"vv{l}\")];\n        tensor<fp16, [1, 1, 1, 64]> qp{l} = matmul(x = q{l}, y = Perm, transpose_y = bt)[name = string(\"qp{l}\")];\n        tensor<fp16, [1, 64, 1, 1]> qc{l} = mul(x = q{l}, y = cos_t)[name = string(\"qc{l}\")];\n        tensor<fp16, [1, 64, 1, 1]> qps{l} = mul(x = qp{l}, y = sin_t)[name = string(\"qps{l}\")];\n        tensor<fp16, [1, 64, 1, 1]> qr{l} = add(x = qc{l}, y = qps{l})[name = string(\"qr{l}\")];\n        tensor<fp16, [1, 1, 1, 64]> kp{l} = matmul(x = kk{l}, y = Perm, transpose_y = bt)[name = string(\"kp{l}\")];\n        tensor<fp16, [1, 64, 1, 1]> kc{l} = mul(x = kk{l}, y = cos_t)[name = string(\"kc{l}\")];\n        tensor<fp16, [1, 64, 1, 1]> kps{l} = mul(x = kp{l}, y = sin_t)[name = string(\"kps{l}\")];\n        tensor<fp16, [1, 64, 1, 1]> kr{l} = add(x = kc{l}, y = kps{l})[name = string(\"kr{l}\")];\n        tensor<fp16, [1, 256, 1, 64]> ek{l} = matmul(x = e_t, y = kr{l}, transpose_x = bt)[name = string(\"ek{l}\")];\n        tensor<fp16, [1, 256, 1, 64]> ev{l} = matmul(x = e_t, y = vv{l}, transpose_x = bt)[name = string(\"ev{l}\")];\n        tensor<fp16, [1, 256, 1, 64]> knew{l} = add(x = kcache{l}, y = ek{l})[name = string(\"knew{l}\")];\n        tensor<fp16, [1, 256, 1, 64]> vnew{l} = add(x = vcache{l}, y = ev{l})[name = string(\"vnew{l}\")];\n        tensor<fp16, [1, 256, 1, 1]> s{l} = matmul(x = qr{l}, y = knew{l}, transpose_y = bt)[name = string(\"s{l}\")];\n        tensor<fp16, [1, 256, 1, 1]> sm2_{l} = add(x = s{l}, y = msk)[name = string(\"sm2_{l}\")];\n        tensor<fp16, [1, 256, 1, 1]> p{l} = softmax(x = sm2_{l}, axis = ax1)[name = string(\"p{l}\")];\n        tensor<fp16, [1, 1, 1, 64]> aout{l} = matmul(x = p{l}, y = vnew{l}, transpose_x = bt)[name = string(\"aout{l}\")];\n        tensor<fp16, [1, 1, 1, 64]> o{l} = matmul(x = aout{l}, y = Wo{l}, transpose_y = bt)[name = string(\"o{l}\")];\n        tensor<fp16, [1, 64, 1, 1]> r1_{l} = add(x = {xin}, y = o{l})[name = string(\"r1_{l}\")];\n        tensor<fp16, [1, 64, 1, 1]> xn2_{l} = rms_norm(x = r1_{l}, w = gam2_{l}, eps = fp16(0.00001))[name = string(\"xn2_{l}\")];\n        tensor<fp16, [1, 1, 1, 256]> u{l} = matmul(x = xn2_{l}, y = Wu{l}, transpose_y = bt)[name = string(\"u{l}\")];\n        tensor<fp16, [1, 1, 1, 256]> g{l} = matmul(x = xn2_{l}, y = Wg{l}, transpose_y = bt)[name = string(\"g{l}\")];\n        tensor<fp16, [1, 256, 1, 1]> gs{l} = sigmoid(x = g{l})[name = string(\"gs{l}\")];\n        tensor<fp16, [1, 256, 1, 1]> gsl{l} = mul(x = g{l}, y = gs{l})[name = string(\"gsl{l}\")];\n        tensor<fp16, [1, 256, 1, 1]> fu{l} = mul(x = u{l}, y = gsl{l})[name = string(\"fu{l}\")];\n        tensor<fp16, [1, 1, 1, 64]> dn{l} = matmul(x = fu{l}, y = Wd{l}, transpose_y = bt)[name = string(\"dn{l}\")];\n        tensor<fp16, [1, 64, 1, 1]> y{l} = add(x = r1_{l}, y = dn{l})[name = string(\"y{l}\")];\n"
+        ));
+    }
+    mil.push_str(&format!("    }} -> (y{});\n}}\n", LAYERS - 1));
     let mil_path = format!("{dir}/layer.mil");
     std::fs::write(&mil_path, &mil).unwrap();
 
@@ -165,8 +110,8 @@ fn main() {
     let mut rt = GraphRuntime::load(plan).unwrap_or_else(|e| panic!("load: {e}"));
 
     // --- decode loop ---------------------------------------------------
-    let mut kref: Vec<Vec<f32>> = vec![vec![0.0; D]; T_MAX];
-    let mut vref: Vec<Vec<f32>> = vec![vec![0.0; D]; T_MAX];
+    let mut kref: Vec<Vec<Vec<f32>>> = vec![vec![vec![0.0; D]; T_MAX]; LAYERS];
+    let mut vref: Vec<Vec<Vec<f32>>> = vec![vec![vec![0.0; D]; T_MAX]; LAYERS];
     let mut bad = 0usize;
     for step in 0..3usize {
         let x: Vec<f32> = (0..D)
@@ -229,7 +174,9 @@ fn main() {
         let t0 = std::time::Instant::now();
         rt.run().expect("run");
         if std::env::var("GP_DIAG").is_ok() {
-            for nm in ["q", "qp", "qr", "kk", "kp", "kr", "s", "p"] {
+            for nm in [
+                "q0", "qp0", "qr0", "kk0", "kp0", "kr0", "s0", "p0", "y0", "q1", "kr1", "p1",
+            ] {
                 if let Some(ni) = rt.node_named(nm) {
                     let d = rt.out_desc(ni);
                     let b = rt.output(ni);
@@ -263,61 +210,67 @@ fn main() {
                 .sqrt()
                 .recip()
         };
-        let xnr: Vec<f32> = x.iter().map(|a| a * rms(&x)).collect();
-        let mut qr = mm(b'q', &xnr, D, D);
-        let mut kr = mm(b'k', &xnr, D, D);
-        let vr = mm(b'v', &xnr, D, D);
-        // rope: r[i] = v[i]*cos + v[i^half]*sin_signed
-        let rope = |v: &mut Vec<f32>| {
-            let orig = v.clone();
-            for i in 0..D {
-                v[i] = orig[i] * cosv[i] + orig[i ^ half] * sinv[i];
-            }
-        };
-        rope(&mut qr);
-        rope(&mut kr);
-        kref[step] = kr;
-        vref[step] = vr;
-        let sc_r: Vec<f32> = (0..T_MAX)
-            .map(|t| (0..D).map(|i| qr[i] * kref[t][i]).sum())
-            .collect();
-        let mx = sc_r[..=step]
-            .iter()
-            .cloned()
-            .fold(f32::NEG_INFINITY, f32::max);
-        let den: f32 = sc_r[..=step].iter().map(|v| (v - mx).exp()).sum();
-        let p: Vec<f32> = (0..T_MAX)
-            .map(|t| {
-                if t <= step {
-                    (sc_r[t] - mx).exp() / den
-                } else {
-                    0.0
+        let mut x_cur = x.clone();
+        for l in 0..LAYERS {
+            let tag = |off: u8| (b'A' + (l * 8) as u8).wrapping_add(off);
+            let xnr: Vec<f32> = x_cur.iter().map(|a| a * rms(&x_cur)).collect();
+            let mut qr = mm(tag(0), &xnr, D, D);
+            let mut kr = mm(tag(1), &xnr, D, D);
+            let vr = mm(tag(2), &xnr, D, D);
+            // rope: r[i] = v[i]*cos + v[i^half]*sin_signed
+            let rope = |v: &mut Vec<f32>| {
+                let orig = v.clone();
+                for i in 0..D {
+                    v[i] = orig[i] * cosv[i] + orig[i ^ half] * sinv[i];
                 }
-            })
-            .collect();
-        let out: Vec<f32> = (0..D)
-            .map(|j| (0..T_MAX).map(|t| p[t] * vref[t][j]).sum())
-            .collect();
-        let attn = mm(b'o', &out, D, D);
-        let r1r: Vec<f32> = x.iter().zip(&attn).map(|(a, b)| a + b).collect();
-        let xn2r: Vec<f32> = r1r.iter().map(|a| a * rms(&r1r)).collect();
-        let upr = mm(b'u', &xn2r, FF, D);
-        let gr = mm(b'g', &xn2r, FF, D);
-        let slr: Vec<f32> = upr
-            .iter()
-            .zip(&gr)
-            .map(|(u, g)| u * g / (1.0 + (-g).exp()))
-            .collect();
-        let dr = mm(b'd', &slr, D, FF);
-        let yr: Vec<f32> = r1r.iter().zip(&dr).map(|(a, b)| a + b).collect();
+            };
+            rope(&mut qr);
+            rope(&mut kr);
+            kref[l][step] = kr;
+            vref[l][step] = vr;
+            let sc_r: Vec<f32> = (0..T_MAX)
+                .map(|t| (0..D).map(|i| qr[i] * kref[l][t][i]).sum())
+                .collect();
+            let mx = sc_r[..=step]
+                .iter()
+                .cloned()
+                .fold(f32::NEG_INFINITY, f32::max);
+            let den: f32 = sc_r[..=step].iter().map(|v| (v - mx).exp()).sum();
+            let p: Vec<f32> = (0..T_MAX)
+                .map(|t| {
+                    if t <= step {
+                        (sc_r[t] - mx).exp() / den
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            let out: Vec<f32> = (0..D)
+                .map(|j| (0..T_MAX).map(|t| p[t] * vref[l][t][j]).sum())
+                .collect();
+            let attn = mm(tag(3), &out, D, D);
+            let r1r: Vec<f32> = x_cur.iter().zip(&attn).map(|(a, b)| a + b).collect();
+            let xn2r: Vec<f32> = r1r.iter().map(|a| a * rms(&r1r)).collect();
+            let upr = mm(tag(4), &xn2r, FF, D);
+            let gr = mm(tag(5), &xn2r, FF, D);
+            let slr: Vec<f32> = upr
+                .iter()
+                .zip(&gr)
+                .map(|(u, g)| u * g / (1.0 + (-g).exp()))
+                .collect();
+            let dr = mm(tag(6), &slr, D, FF);
+            x_cur = r1r.iter().zip(&dr).map(|(a, b)| a + b).collect();
+        }
+        let yr = x_cur;
 
-        let yn = rt.out_node("y").expect("y node");
+        let yn = rt.out_node(&format!("y{}", LAYERS - 1)).expect("y node");
         let dy = rt.out_desc(yn);
         let zb = rt.output(yn);
+        let ymax = yr.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
         for j in 0..D {
             let o = dy.offset(0, 0, j as u64, 0, 0);
             let hw = f32_of(u16::from_le_bytes([zb[o], zb[o + 1]]));
-            if (hw - yr[j]).abs() > yr[j].abs() * 0.05 + 0.03 {
+            if (hw - yr[j]).abs() > yr[j].abs() * 0.05 + ymax * 0.01 {
                 bad += 1;
                 if bad < 8 {
                     println!("step{step} y[{j}]: hw={hw:.4} ref={:.4}", yr[j]);

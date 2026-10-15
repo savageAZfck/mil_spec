@@ -367,6 +367,66 @@ pub struct Surface {
     owned: bool,
 }
 
+/// A runtime-owned IOSurface that outlives any program bound to it —
+/// the substrate for lazy program residency: `GraphRuntime` holds one
+/// `Rc<SharedSurface>` per tensor edge, adopts it onto producer output
+/// and consumer input ports at (re)load time, and may freely unload
+/// programs without losing data (persistent KV-cache surfaces included).
+pub struct SharedSurface {
+    io: IoApi,
+    surf: Id,
+    len: usize,
+}
+
+impl SharedSurface {
+    /// Allocate `bytes` of zeroed surface memory.
+    pub fn new(bytes: usize) -> Result<Self, EspError> {
+        let objc = Objc::open()?;
+        let io = IoApi::open()?;
+        let surf = unsafe {
+            let f = msg!((usize, usize, usize) -> Id);
+            f(
+                objc.ane_surf,
+                selp("createIOSurfaceWithWidth:pixel_size:height:"),
+                bytes / 2,
+                2,
+                1,
+            )
+        };
+        if surf.is_null() {
+            return Err(EspError::Msg("createIOSurface failed".into()));
+        }
+        Ok(Self {
+            io,
+            surf,
+            len: bytes,
+        })
+    }
+
+    /// Raw `IOSurfaceRef` for `adopt_input` / `adopt_output`.
+    pub fn as_ptr(&self) -> *mut c_void {
+        self.surf
+    }
+
+    /// Read-only view of the surface bytes.
+    pub fn bytes(&self) -> &[u8] {
+        let p = unsafe { (self.io.get_base)(self.surf) } as *const u8;
+        unsafe { std::slice::from_raw_parts(p, self.len) }
+    }
+
+    /// Mutable view of the surface bytes.
+    pub fn bytes_mut(&self) -> &mut [u8] {
+        let p = unsafe { (self.io.get_base)(self.surf) } as *mut u8;
+        unsafe { std::slice::from_raw_parts_mut(p, self.len) }
+    }
+}
+
+impl Drop for SharedSurface {
+    fn drop(&mut self) {
+        unsafe { (self.io.cf_release)(self.surf) };
+    }
+}
+
 /// A precompiled Espresso package loaded into `aned`, buffers bound.
 pub struct EspressoProgram {
     objc: Objc,
@@ -815,6 +875,19 @@ fn err_desc(err: Id) -> String {
 
 impl Drop for EspressoProgram {
     fn drop(&mut self) {
+        unsafe {
+            let opts = self.objc.empty_dict();
+            let mut err: Id = std::ptr::null_mut();
+            let f = msg!((Id, Id, u64, *mut Id) -> bool);
+            let _ = f(
+                self.client,
+                selp("unloadModel:options:qos:error:"),
+                self.model,
+                opts,
+                0,
+                &mut err,
+            );
+        }
         for s in self.inputs.iter().chain(self.outputs.iter()) {
             if s.owned {
                 release(s.wrap);
