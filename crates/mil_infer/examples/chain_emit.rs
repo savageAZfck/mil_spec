@@ -13,7 +13,10 @@ fn weights_of(mil_dir_weights: &str, k: usize) -> Vec<u16> {
     for i in 0..k {
         let base = 128 + i * 0x2040;
         for j in 0..0x1000 {
-            w.push(u16::from_le_bytes([raw[base + 2 * j], raw[base + 2 * j + 1]]));
+            w.push(u16::from_le_bytes([
+                raw[base + 2 * j],
+                raw[base + 2 * j + 1],
+            ]));
         }
     }
     w
@@ -22,9 +25,24 @@ fn weights_of(mil_dir_weights: &str, k: usize) -> Vec<u16> {
 fn main() {
     std::env::set_var("HWX_SIG_ANEC", "1");
     let mut cases: Vec<(usize, String, String, String)> = vec![
-        (2, "crates/mil_infer/assets/chain/c64k2.hwx".into(), "/tmp/chain/c64k2/weights/weight.bin".into(), "y2".into()),
-        (3, "crates/mil_infer/assets/chain/c64k3.hwx".into(), "/tmp/chain/c64k3/weights/weight.bin".into(), "y3".into()),
-        (4, "crates/mil_infer/assets/chain/c64k4.hwx".into(), "/tmp/chain/c64k4/weights/weight.bin".into(), "y4".into()),
+        (
+            2,
+            "crates/mil_infer/assets/chain/c64k2.hwx".into(),
+            "/tmp/chain/c64k2/weights/weight.bin".into(),
+            "y2".into(),
+        ),
+        (
+            3,
+            "crates/mil_infer/assets/chain/c64k3.hwx".into(),
+            "/tmp/chain/c64k3/weights/weight.bin".into(),
+            "y3".into(),
+        ),
+        (
+            4,
+            "crates/mil_infer/assets/chain/c64k4.hwx".into(),
+            "/tmp/chain/c64k4/weights/weight.bin".into(),
+            "y4".into(),
+        ),
     ];
     for k in [5usize, 6, 8] {
         let h = format!("/tmp/chain568/c64k{k}/out/net.macho");
@@ -61,8 +79,7 @@ fn main() {
             };
             let k = cs.len() - 1;
             let raw = fs::read(d.join("weights/weight.bin")).unwrap();
-            let shapes: Vec<(usize, usize)> =
-                cs.windows(2).map(|w| (w[0], w[1])).collect();
+            let shapes: Vec<(usize, usize)> = cs.windows(2).map(|w| (w[0], w[1])).collect();
             // walk the per-task record headers for data offsets
             let mut ws = Vec::new();
             let mut offs = Vec::new();
@@ -101,7 +118,12 @@ fn main() {
                 }
             };
             let img = mil_infer::hwx::emit_conv_chain(
-                &shapes, &ws, &offs, &format!("y{k}"), &milp, &outp,
+                &shapes,
+                &ws,
+                &offs,
+                &format!("y{k}"),
+                &milp,
+                &outp,
             )
             .unwrap();
             if img == want {
@@ -119,7 +141,11 @@ fn main() {
                         shown += 1;
                     }
                 }
-                println!("{name}: {shown} u32 diffs ({} vs {} bytes)", img.len(), want.len());
+                println!(
+                    "{name}: {shown} u32 diffs ({} vs {} bytes)",
+                    img.len(),
+                    want.len()
+                );
             }
         }
     }
@@ -159,8 +185,7 @@ fn main() {
                 format!("/tmp/chain568/c64k{k}/out/net.macho"),
             )
         };
-        let img =
-            mil_infer::hwx::emit_conv_chain64(*k, &w, yname, &mil, &outp).unwrap();
+        let img = mil_infer::hwx::emit_conv_chain64(*k, &w, yname, &mil, &outp).unwrap();
         if img == want {
             println!("k{k}: BYTE-IDENTICAL ({} bytes)", img.len());
             continue;

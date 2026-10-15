@@ -8,6 +8,9 @@ fn main() {
             args.get(3).map(|s| s.as_str()).unwrap_or("h16"),
         )
         .unwrap();
-    println!("status={} dram={:?} err={:?}", v.status, v.dram_usage, v.errors);
+    println!(
+        "status={} dram={:?} err={:?}",
+        v.status, v.dram_usage, v.errors
+    );
     println!("DETAIL:\n{}", v.detail);
 }

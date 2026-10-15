@@ -59,8 +59,8 @@ pub use ane_decode::Decoder;
 /// `aned`/`_ANEClient` load, for supported graph shapes.
 mod conv_chan_table;
 mod conv_ns_table;
-mod mm_ns_table;
 pub mod hwx;
+mod mm_ns_table;
 pub use hwx::{EwOp, FusedAct};
 
 /// Which hardware units the model is allowed to use.

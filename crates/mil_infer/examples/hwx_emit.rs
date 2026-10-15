@@ -11,8 +11,8 @@
 use mil_infer::espresso::EspressoProgram;
 use mil_infer::hwx::{
     emit_conv1x1, emit_conv_act_n, emit_conv_act_n_dw, emit_conv_sig, emit_conv_sig_n,
-    emit_conv_sig_n_dw, emit_elementwise2, FusedAct,
-    emit_matmul, emit_unary_lut, ConvShape, EwOp, LutOp, MmShape,
+    emit_conv_sig_n_dw, emit_elementwise2, emit_matmul, emit_unary_lut, ConvShape, EwOp, FusedAct,
+    LutOp, MmShape,
 };
 use std::path::{Path, PathBuf};
 
@@ -287,7 +287,12 @@ fn main() {
                     println!("  {name}: no reference, skipped");
                     continue;
                 }
-                let w = load_weights(&dir.join(name).join("weights/weight.bin").display().to_string());
+                let w = load_weights(
+                    &dir.join(name)
+                        .join("weights/weight.bin")
+                        .display()
+                        .to_string(),
+                );
                 let mil = format!("{}/{name}/net.mil", dir.display());
                 let out = format!("{}/{name}/out/net.macho", dir.display());
                 let ours = emit_conv_sig_n(k, &w, &mil, &out).unwrap();

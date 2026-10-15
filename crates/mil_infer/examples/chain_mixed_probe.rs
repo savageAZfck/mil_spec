@@ -50,14 +50,20 @@ fn main() {
     }
     mil += "            tensor<int32, [2]> st = const()[val = tensor<int32, [2]>([1, 1])];\n            string pt = const()[val = string(\"valid\")];\n            tensor<int32, [4]> pd = const()[val = tensor<int32, [4]>([0, 0, 0, 0])];\n            tensor<int32, [2]> dl = const()[val = tensor<int32, [2]>([1, 1])];\n            int32 gr = const()[val = int32(1)];\n";
     for (i, w) in cs.windows(2).enumerate() {
-        let (inp, outp) = (if i == 0 { "x".into() } else { format!("y{i}") }, format!("y{}", i + 1));
+        let (inp, outp) = (
+            if i == 0 { "x".into() } else { format!("y{i}") },
+            format!("y{}", i + 1),
+        );
         mil += &format!("            tensor<fp16, [1, {}, 1, 1]> {outp} = conv(x = {inp}, weight = w{i}, strides = st, pad_type = pt, pad = pd, dilations = dl, groups = gr)[name = string(\"{outp}\")];\n", w[1]);
     }
     mil += &format!("    }} -> (y{k});\n}}\n");
     fs::write(dir.join("net.mil"), &mil).unwrap();
     let anec = Anec::open().expect("ANEC");
     match anec.compile(&dir.join("net.mil"), &dir.join("out"), "h16") {
-        Ok(v) => println!("{dir:?}: status={} dram={:?} errs={:?}", v.status, v.dram_usage, v.errors),
+        Ok(v) => println!(
+            "{dir:?}: status={} dram={:?} errs={:?}",
+            v.status, v.dram_usage, v.errors
+        ),
         Err(e) => println!("ERR {e}"),
     }
 }

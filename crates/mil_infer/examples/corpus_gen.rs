@@ -91,13 +91,19 @@ fn conv_act_chain_mil(k: usize, n_blobs: usize, act: &str) -> String {
         let (wn, cn) = (format!("w{i}"), NAMES[i].to_string());
         s += &format!("            tensor<fp16, [64, 64, 1, 1]> {wn} = const()[val = tensor<fp16, [64, 64, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/{blob}\"), offset = uint64(64)))];\n");
         s += &format!("            tensor<fp16, [1, 64, 1, 1]> {cn} = conv(x = {inp}, weight = {wn}, strides = st, pad_type = pt, pad = pd, dilations = dl, groups = gr)[name = string(\"{cn}\")];\n");
-        let sn = if i + 1 == k { "z".into() } else { format!("s{i}") };
+        let sn = if i + 1 == k {
+            "z".into()
+        } else {
+            format!("s{i}")
+        };
         let call = if act == "gelu" {
             format!("gelu(x = {cn}, mode = gmode)")
         } else {
             format!("{act}(x = {cn})")
         };
-        s += &format!("            tensor<fp16, [1, 64, 1, 1]> {sn} = {call}[name = string(\"{sn}\")];\n");
+        s += &format!(
+            "            tensor<fp16, [1, 64, 1, 1]> {sn} = {call}[name = string(\"{sn}\")];\n"
+        );
         inp = sn;
     }
     s += "    } -> (z);\n}\n";
@@ -124,7 +130,11 @@ fn conv_silu_chain_mil(k: usize, n_blobs: usize) -> String {
         let (wn, cn) = (format!("w{i}"), NAMES[i].to_string());
         s += &format!("            tensor<fp16, [64, 64, 1, 1]> {wn} = const()[val = tensor<fp16, [64, 64, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/{blob}\"), offset = uint64(64)))];\n");
         s += &format!("            tensor<fp16, [1, 64, 1, 1]> {cn} = conv(x = {inp}, weight = {wn}, strides = st, pad_type = pt, pad = pd, dilations = dl, groups = gr)[name = string(\"{cn}\")];\n");
-        let sn = if i + 1 == k { "z".into() } else { format!("s{i}") };
+        let sn = if i + 1 == k {
+            "z".into()
+        } else {
+            format!("s{i}")
+        };
         s += &format!("            tensor<fp16, [1, 64, 1, 1]> g{i} = sigmoid(x = {cn})[name = string(\"g{i}\")];\n");
         s += &format!("            tensor<fp16, [1, 64, 1, 1]> {sn} = mul(x = {cn}, y = g{i})[name = string(\"{sn}\")];\n");
         inp = sn;
@@ -154,7 +164,11 @@ fn conv_sm_chain_mil(k: usize, n_blobs: usize) -> String {
         let (wn, cn) = (format!("w{i}"), NAMES[i].to_string());
         s += &format!("            tensor<fp16, [64, 64, 1, 1]> {wn} = const()[val = tensor<fp16, [64, 64, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/{blob}\"), offset = uint64(64)))];\n");
         s += &format!("            tensor<fp16, [1, 64, 1, 1]> {cn} = conv(x = {inp}, weight = {wn}, strides = st, pad_type = pt, pad = pd, dilations = dl, groups = gr)[name = string(\"{cn}\")];\n");
-        let sn = if i + 1 == k { "z".into() } else { format!("s{i}") };
+        let sn = if i + 1 == k {
+            "z".into()
+        } else {
+            format!("s{i}")
+        };
         s += &format!("            tensor<fp16, [1, 64, 1, 1]> {sn} = softmax(x = {cn}, axis = ax)[name = string(\"{sn}\")];\n");
         inp = sn;
     }

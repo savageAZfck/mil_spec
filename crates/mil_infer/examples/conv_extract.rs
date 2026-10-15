@@ -80,7 +80,11 @@ fn main() {
         }
     }
     let anec = Anec::open().expect("ANEC unavailable");
-    let mut pf = fs::OpenOptions::new().create(true).append(true).open(&params).unwrap();
+    let mut pf = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&params)
+        .unwrap();
     for c in lo..=hi {
         if have.contains(&c) {
             continue;

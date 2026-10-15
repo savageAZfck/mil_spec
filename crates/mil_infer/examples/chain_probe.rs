@@ -19,16 +19,18 @@ fn weight_blob(data: &[u8]) -> Vec<u8> {
 }
 
 fn chain_mil(c: u32, k: usize) -> String {
-    let mut s = format!(
-        "program(1.3)\n{{\n    func main<ios18>(tensor<fp16, [1, {c}, 1, 1]> x) {{\n"
-    );
+    let mut s =
+        format!("program(1.3)\n{{\n    func main<ios18>(tensor<fp16, [1, {c}, 1, 1]> x) {{\n");
     for i in 0..k {
         let rec = 64 + i * (64 + (c * c * 2) as usize);
         s += &format!("            tensor<fp16, [{c}, {c}, 1, 1]> w{i} = const()[val = tensor<fp16, [{c}, {c}, 1, 1]>(BLOBFILE(path = string(\"@model_path/weights/weight.bin\"), offset = uint64({rec})))];\n");
     }
     s += "            tensor<int32, [2]> st = const()[val = tensor<int32, [2]>([1, 1])];\n            string pt = const()[val = string(\"valid\")];\n            tensor<int32, [4]> pd = const()[val = tensor<int32, [4]>([0, 0, 0, 0])];\n            tensor<int32, [2]> dl = const()[val = tensor<int32, [2]>([1, 1])];\n            int32 gr = const()[val = int32(1)];\n";
     for i in 0..k {
-        let (inp, outp) = (if i == 0 { "x".into() } else { format!("y{i}") }, format!("y{}", i + 1));
+        let (inp, outp) = (
+            if i == 0 { "x".into() } else { format!("y{i}") },
+            format!("y{}", i + 1),
+        );
         s += &format!("            tensor<fp16, [1, {c}, 1, 1]> {outp} = conv(x = {inp}, weight = w{i}, strides = st, pad_type = pt, pad = pd, dilations = dl, groups = gr)[name = string(\"{outp}\")];\n");
     }
     s += &format!("    }} -> (y{k});\n}}\n");
@@ -64,7 +66,10 @@ fn main() {
         fs::write(dir.join("net.mil"), chain_mil(c, k)).unwrap();
         let v = anec.compile(&dir.join("net.mil"), &dir.join("out"), "h16");
         match v {
-            Ok(v) => println!("c{c}k{k}: status={} dram={:?} errs={:?}", v.status, v.dram_usage, v.errors),
+            Ok(v) => println!(
+                "c{c}k{k}: status={} dram={:?} errs={:?}",
+                v.status, v.dram_usage, v.errors
+            ),
             Err(e) => println!("c{c}k{k}: ERR {e}"),
         }
     }

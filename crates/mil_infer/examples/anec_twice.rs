@@ -8,7 +8,9 @@ fn main() {
     let mil = std::env::args().nth(1).unwrap();
     let out = std::env::args().nth(2).unwrap();
     for round in 0..3 {
-        let v = anec.compile(Path::new(&mil), Path::new(&out), "h16").unwrap();
+        let v = anec
+            .compile(Path::new(&mil), Path::new(&out), "h16")
+            .unwrap();
         println!("round {round}: status={}", v.status);
     }
 }

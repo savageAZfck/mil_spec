@@ -51,7 +51,11 @@ fn main() {
                         .position(|(a, b)| a != b)
                         .map(|i| i as i64)
                         .unwrap_or(-1);
-                    fail.push(format!("c{c}: first diff {d:#x} len {:#x}/{:#x}", img.len(), want.len()));
+                    fail.push(format!(
+                        "c{c}: first diff {d:#x} len {:#x}/{:#x}",
+                        img.len(),
+                        want.len()
+                    ));
                 }
                 Err(e) => fail.push(format!("c{c}: {e}")),
             }

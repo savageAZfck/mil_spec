@@ -58,8 +58,11 @@ fn main() {
         fn walk(d: &Path, out: &mut Vec<std::path::PathBuf>) {
             if let Ok(rd) = std::fs::read_dir(d) {
                 for e in rd.flatten() {
-                    if e.file_type().map(|t| t.is_dir()).unwrap_or(false) { walk(&e.path(), out); }
-                    else if e.file_name().to_string_lossy().contains("macho") { out.push(e.path()); }
+                    if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        walk(&e.path(), out);
+                    } else if e.file_name().to_string_lossy().contains("macho") {
+                        out.push(e.path());
+                    }
                 }
             }
         }

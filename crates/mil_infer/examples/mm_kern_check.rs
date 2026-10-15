@@ -4,7 +4,10 @@
 fn main() {
     let mut a = std::env::args().skip(1);
     let d = std::fs::read(a.next().unwrap()).unwrap();
-    let (k, n): (usize, usize) = (a.next().unwrap().parse().unwrap(), a.next().unwrap().parse().unwrap());
+    let (k, n): (usize, usize) = (
+        a.next().unwrap().parse().unwrap(),
+        a.next().unwrap().parse().unwrap(),
+    );
     // __kern_0 section fileoff: locate via the __KERN_0 segment (foff at +48)
     let mut off = 0x20usize;
     let mut kern_fo = 0xc000usize;

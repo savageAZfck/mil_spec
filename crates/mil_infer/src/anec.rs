@@ -187,7 +187,11 @@ fn dset_str(d: *mut c_void, k: &str, v: &str) {
 
 fn dset_num(d: *mut c_void, k: &str, v: i64) {
     unsafe {
-        let n = CFNumberCreate(std::ptr::null(), CF_NUMBER_SINT64, &v as *const i64 as *const c_void);
+        let n = CFNumberCreate(
+            std::ptr::null(),
+            CF_NUMBER_SINT64,
+            &v as *const i64 as *const c_void,
+        );
         CFDictionarySetValue(d, cfstr(k) as *const c_void, n);
     }
 }

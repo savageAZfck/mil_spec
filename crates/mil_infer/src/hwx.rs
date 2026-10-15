@@ -394,14 +394,25 @@ const TYPE_SYMS: &[&str] = &[
 ];
 
 fn layout_desc(name: &str, base: u32, n: u32) -> String {
+    layout_desc_w(name, base, n, 1)
+}
+
+/// W-aware form: section bytes `stride64 * c` at `{b1}`, dim `c` at
+/// `n`, channel stride `stride64` at `{b2}`/`{b3}`, spatial dim `w`
+/// at `h`. For `w == 1` this reduces to the `s64`/`h=1` shape every
+/// W=1 corpus artifact carries.
+fn layout_desc_w(name: &str, base: u32, c: u32, w: u32) -> String {
+    let stride64 = ((w as usize * 2 + 63) & !63) as u32;
     format!(
-        "{name}:t{base}=ar1;0;1;{b1}=s{ns}n:ar1;0;{n};{b2}=s64c:ar1;0;1;{b3}=s64h:ar1;0;1;{b4}=s2w:5",
+        "{name}:t{base}=ar1;0;1;{b1}=s{ns}n:ar1;0;{c};{b2}=s{st}c:ar1;0;1;{b3}=s{st}h:ar1;0;{w};{b4}=s2w:5",
         base = base,
         b1 = base + 1,
-        ns = 64 * n,
-        n = n,
+        ns = stride64 * c,
+        c = c,
         b2 = base + 2,
+        st = stride64,
         b3 = base + 3,
+        w = w,
         b4 = base + 4,
     )
 }
@@ -877,8 +888,10 @@ fn tail_meta(skel: &[u8]) -> (Vec<(String, u8, u8, u16, u64)>, Vec<[u8; 8]>) {
 /// field pair at `reloff_field` (header `0x218` on single-section
 /// skeletons; the `__text` section entry on multi-section families).
 fn reloc_entries(skel: &[u8], reloff_field: usize) -> Vec<[u8; 8]> {
-    let reloff = u32::from_le_bytes(skel[reloff_field..reloff_field + 4].try_into().unwrap()) as usize;
-    let n = u32::from_le_bytes(skel[reloff_field + 4..reloff_field + 8].try_into().unwrap()) as usize;
+    let reloff =
+        u32::from_le_bytes(skel[reloff_field..reloff_field + 4].try_into().unwrap()) as usize;
+    let n =
+        u32::from_le_bytes(skel[reloff_field + 4..reloff_field + 8].try_into().unwrap()) as usize;
     (0..n)
         .map(|i| skel[reloff + 8 * i..reloff + 8 * i + 8].try_into().unwrap())
         .collect()
@@ -1147,6 +1160,38 @@ pub fn emit_conv1x1_ns(
     mil_path: &str,
     out_path: &str,
 ) -> Result<Vec<u8>, String> {
+    emit_conv1x1_w(cin, cout, 1, weights, mil_path, out_path)
+}
+
+/// Spatial form: `z = conv1x1(x, w)` with x `[1,Cin,1,W]` →
+/// `z [1,Cout,1,W]`. W scaling (decoded from an ANEC W-sweep at
+/// fixed C=64 plus non-square and narrow probes):
+/// - DRAM per-channel row stride `stride64 = align(W*2, 64)`; SRAM
+///   row stride `stride16 = align(W*2, 16)`.
+/// - in/out section bytes `= stride64 * C` (replaces `C*64` — the
+///   W=1 case, since `align(2,64) == 64`); segment vmsizes page-round.
+/// - Descriptor blobs: `W` at `0xc2c`/`0x1974`, `stride64` at
+///   `0xc50`/`0xc58`/`0x1998`/`0x19a0`, section bytes at the `0xc48`
+///   / `0x1990` groups.
+/// - Task record: `W` at `0x104`/`0x114`, `stride64` at `0x138`
+///   (`0x134` narrow) and `0x17c` (`0x178` narrow), `stride16` at
+///   `0x154` (`0x150`), `(cin+pad16)*stride16` at the `cx` group.
+/// - `W > 64` clears the task flag's low bits (`0x200004` →
+///   `0x200000` at `0x124`).
+///
+/// Since the input is channel-major `[Cin, W]`, `W` is the sequence/
+/// batch dim: `conv1x1(x=[K,M], w[K,N])` computes `x[m] @ w^T`
+/// per position — the M>1 matvec ANEC's own matmul template gets a
+/// different (undecoded) record for. Requires `cin >= 32`,
+/// `cout >= 32`.
+pub fn emit_conv1x1_w(
+    cin: usize,
+    cout: usize,
+    w: usize,
+    weights: &[u16],
+    mil_path: &str,
+    out_path: &str,
+) -> Result<Vec<u8>, String> {
     if cin < 32 || cout < 32 {
         return Err(format!(
             "conv1x1 dyn: (Cin={cin},Cout={cout}) below the C>=32 template regimes"
@@ -1181,8 +1226,13 @@ pub fn emit_conv1x1_ns(
         9..=16 => 4,
         _ => 5,
     };
-    let slot_in = (cin * 64 + 0x3fff) & !0x3fff;
-    let slot_out = (cout * 64 + 0x3fff) & !0x3fff;
+    // W-scaled strides: DRAM rows 64-byte aligned, SRAM rows 16-byte.
+    let stride64 = (w * 2 + 63) & !63;
+    let stride16 = (w * 2 + 15) & !15;
+    let in_sz = stride64 * cin;
+    let out_sz = stride64 * cout;
+    let slot_in = (in_sz + 0x3fff) & !0x3fff;
+    let slot_out = (out_sz + 0x3fff) & !0x3fff;
     let const_va = 0x3000_0000u64;
     let data_va = const_va + slot_in as u64;
     let text_va = data_va + slot_out as u64;
@@ -1194,11 +1244,11 @@ pub fn emit_conv1x1_ns(
     let mut pre = SKELETON_CONV32[..CONV_TAIL_OFF].to_vec();
     put_u64(&mut pre, 0x88, slot_in as u64); // __const seg vmsize
     put_u64(&mut pre, 0xd0, const_va); // __const sect addr
-    put_u64(&mut pre, 0xd8, (cin * 64) as u64); // __const sect size
+    put_u64(&mut pre, 0xd8, in_sz as u64); // __const sect size
     put_u64(&mut pre, 0x118, data_va); // __data seg vmaddr
     put_u64(&mut pre, 0x120, slot_out as u64); // __data seg vmsize
     put_u64(&mut pre, 0x168, data_va); // __data sect addr
-    put_u64(&mut pre, 0x170, (cout * 64) as u64); // __data sect size
+    put_u64(&mut pre, 0x170, out_sz as u64); // __data sect size
     put_u64(&mut pre, 0x1b0, text_va); // __TEXT seg vmaddr
     put_u64(&mut pre, 0x200, text_va); // __text sect addr
     put_u64(&mut pre, 0x208, textlen as u64); // __text sect size
@@ -1220,16 +1270,20 @@ pub fn emit_conv1x1_ns(
     put_u32(&mut pre, 0xb7c, if narrow { 0x73 } else { 0x74 });
     put_u32(&mut pre, 0xbe8, f14 as u32);
     // cmd4 blobs 2 @0xbf8 / 3 @0x1940: input/output dims + section byte
-    // sizes — the 0xc?? group is the x-side (cin*64), 0x19?? the z-side
-    for &o in &[0xc24usize] {
-        put_u32(&mut pre, o, cin as u32);
-    }
+    // sizes — the 0xc?? group is the x-side (stride64*cin + row stride),
+    // 0x19?? the z-side
+    put_u32(&mut pre, 0xc24, cin as u32);
+    put_u32(&mut pre, 0xc2c, w as u32);
     put_u32(&mut pre, 0x196c, cout as u32);
+    put_u32(&mut pre, 0x1974, w as u32);
+    for &o in &[0xc50usize, 0xc58, 0x1998, 0x19a0] {
+        put_u32(&mut pre, o, stride64 as u32);
+    }
     for &o in &[0xc48usize, 0xc68, 0xc78] {
-        put_u32(&mut pre, o, (cin * 64) as u32);
+        put_u32(&mut pre, o, in_sz as u32);
     }
     for &o in &[0x1990usize, 0x19b0, 0x19c0] {
-        put_u32(&mut pre, o, (cout * 64) as u32);
+        put_u32(&mut pre, o, out_sz as u32);
     }
 
     // ---- tail: signature, rt.version, LC_SYMTAB, strtab, reloc -----
@@ -1249,8 +1303,20 @@ pub fn emit_conv1x1_ns(
     for ty in TYPE_SYMS {
         entries.push(((*ty).into(), 0x80, 0, 0, 0));
     }
-    entries.push((layout_desc("x", 24, cin as u32), 0x20, 0, 0x18, 0));
-    entries.push((layout_desc("z", 29, cout as u32), 0x20, 0, 0x1d, 0));
+    entries.push((
+        layout_desc_w("x", 24, cin as u32, w as u32),
+        0x20,
+        0,
+        0x18,
+        0,
+    ));
+    entries.push((
+        layout_desc_w("z", 29, cout as u32, w as u32),
+        0x20,
+        0,
+        0x1d,
+        0,
+    ));
     // one __text relocation pointing at the kernel reference word —
     // 0x1a0 in the std template, 0x19c in the narrower one
     let reloc_addr: u32 = if narrow { 0x19c } else { 0x1a0 };
@@ -1296,18 +1362,40 @@ pub fn emit_conv1x1_ns(
     for i in 0..16 {
         put_u32(&mut text, 0xc0 + i * 4, lane_sz[i] as u32);
     }
+    // spatial W: position count at 0x104/0x114, DRAM stride at
+    // 0x138/0x17c (narrow: 0x134/0x178), SRAM stride at 0x154
+    // (narrow: 0x150)
+    put_u32(&mut text, 0x104, w as u32);
+    put_u32(&mut text, 0x114, w as u32);
     put_u32(&mut text, 0x10c, cin as u32);
     put_u32(&mut text, 0x11c, cout as u32);
+    let (s64a, s16, s64b) = if narrow {
+        (0x134usize, 0x150usize, 0x178usize)
+    } else {
+        (0x138, 0x154, 0x17c)
+    };
+    put_u32(&mut text, s64a, stride64 as u32);
+    put_u32(&mut text, s16, stride16 as u32);
+    put_u32(&mut text, s64b, stride64 as u32);
     if !narrow {
-        put_u32(&mut text, 0x124, if big { 0x244404 } else { 0x200004 });
+        // W > 64 drops the flag's low nibble (0x200004 -> 0x200000)
+        let flag = if w > 64 {
+            0x200000
+        } else if big {
+            0x244404
+        } else {
+            0x200004
+        };
+        put_u32(&mut text, 0x124, flag);
         put_u32(&mut text, 0x128, f128);
     }
     let cx: usize = if narrow { 0x154 } else { 0x158 };
     // first and last of the four copies carry the padded input dim
-    put_u32(&mut text, cx, ((cin + pad16) * 16) as u32);
-    put_u32(&mut text, cx + 4, (cin * 16) as u32);
-    put_u32(&mut text, cx + 8, (cin * 16) as u32);
-    put_u32(&mut text, cx + 0x10, ((cin + pad16) * 16) as u32);
+    // scaled by the SRAM row stride
+    put_u32(&mut text, cx, ((cin + pad16) * stride16) as u32);
+    put_u32(&mut text, cx + 4, (cin * stride16) as u32);
+    put_u32(&mut text, cx + 8, (cin * stride16) as u32);
+    put_u32(&mut text, cx + 0x10, ((cin + pad16) * stride16) as u32);
     debug_assert_eq!(text.len(), textlen);
 
     // ---- section contents ------------------------------------------
@@ -1656,7 +1744,6 @@ fn chain_narrow(cout: usize) -> bool {
     (65..=128).contains(&cout)
 }
 
-
 /// Emit a complete HWX image for a chain of `conv1x1` tasks where
 /// task `i` consumes task `i-1`'s output — the multi-task analogue of
 /// [`emit_conv1x1_ns`]. `shapes[i] = (cin, cout)`; `weights` holds
@@ -1806,11 +1893,19 @@ pub fn emit_conv_chain(
     let hdr10: u32 = {
         let y1 = shapes[0].1;
         if k == 2 {
-            if chain_narrow(y1) { 0x62 } else { 0x63 }
+            if chain_narrow(y1) {
+                0x62
+            } else {
+                0x63
+            }
         } else {
             let y2 = shapes[1].1;
             if chain_narrow(y1) {
-                if y2 <= y1 { 0x62 } else { 0x63 }
+                if y2 <= y1 {
+                    0x62
+                } else {
+                    0x63
+                }
             } else if y2 > y1 {
                 0x64
             } else {
@@ -1837,7 +1932,11 @@ pub fn emit_conv_chain(
 
         let mut rec = head.to_vec();
         put_u32(&mut rec, 0x00, if last { 0x0005_0009 } else { 0x0005_0001 });
-        put_u32(&mut rec, 0x08, 0x10240 + (i as u32) * 0x10000 + if last { 0x80 } else { 0 });
+        put_u32(
+            &mut rec,
+            0x08,
+            0x10240 + (i as u32) * 0x10000 + if last { 0x80 } else { 0 },
+        );
         for j in 0..16 {
             let o = 0x0c + j * 4 + if j >= 9 { 4 } else { 0 };
             put_u32(&mut rec, o, 0x21 + (i as u32) * 0x10000);
@@ -1876,7 +1975,11 @@ pub fn emit_conv_chain(
             }
             push(
                 &mut rec,
-                if out_off == 0 { 0xd007_9044 } else { 0xf007_9044 },
+                if out_off == 0 {
+                    0xd007_9044
+                } else {
+                    0xf007_9044
+                },
             );
             push(&mut rec, (out_off + co * 16) as u32);
             push(&mut rec, 0x10);
@@ -1983,8 +2086,8 @@ pub fn emit_conv_chain(
                 // buffer consumed by the last task: 0x63 when it grew
                 // past the previous intermediate or the output is
                 // narrow-class; 0x64 otherwise. k=2 runs one class lower.
-                let cond = chain_narrow(shapes[k - 1].1)
-                    || (k >= 3 && shapes[k - 2].1 > shapes[k - 3].1);
+                let cond =
+                    chain_narrow(shapes[k - 1].1) || (k >= 3 && shapes[k - 2].1 > shapes[k - 3].1);
                 (if k == 2 { 0x63u32 } else { 0x64u32 }) - cond as u32
             } else if i == 0 && k == 3 {
                 // single intermediate besides the feeder (k=3):
@@ -2058,14 +2161,27 @@ pub fn emit_conv_chain(
         entries.push(((*ty).into(), 0x80, 0, 0, 0));
     }
     entries.push((layout_desc("x", 24, shapes[0].0 as u32), 0x20, 0, 0x18, 0));
-    entries.push((layout_desc(out_name, 29, shapes[k - 1].1 as u32), 0x20, 0, 0x1d, 0));
+    entries.push((
+        layout_desc(out_name, 29, shapes[k - 1].1 as u32),
+        0x20,
+        0,
+        0x1d,
+        0,
+    ));
 
     // ---- envelope: prefix + generated tail ---------------------------
     let const2_span = textlen.div_ceil(0x40) * 0x40;
     let kern_vsz = kern_bytes.div_ceil(0x4000) * 0x4000;
     let pre = &SKELETON_CHAIN4[..CHAIN_PRE_OFF];
-    let (mut img, text_off) =
-        build_tail_at_reloc(pre, CHAIN_PRE_OFF, &entries, &relocs, mil_path, out_path, 0x218);
+    let (mut img, text_off) = build_tail_at_reloc(
+        pre,
+        CHAIN_PRE_OFF,
+        &entries,
+        &relocs,
+        mil_path,
+        out_path,
+        0x218,
+    );
     let const2_fo = text_off + const2_span;
     let kern_fo = text_off + 0x8000;
     let const2_va = text_va + const2_span as u64;
@@ -2093,8 +2209,8 @@ pub fn emit_conv_chain(
     put_u64(&mut img, 0x2e8, kern_va); // __kern_0 sect addr
     put_u64(&mut img, 0x2f0, kern_bytes as u64); // __kern_0 sect size
     put_u32(&mut img, 0x2f8, kern_fo as u32); // __kern_0 sect offset
-    // bind1 (network output) +0x18 carries a symbol-table reference:
-    // (0x30 + k) in the high byte — same `k + 0x30` as cmd 0x4 #3.
+                                              // bind1 (network output) +0x18 carries a symbol-table reference:
+                                              // (0x30 + k) in the high byte — same `k + 0x30` as cmd 0x4 #3.
     put_u32(&mut img, 0x348, out_va as u32); // cmd 0x4 #0: out VA
     put_u32(&mut img, 0x350, ((0x30 + k as u32) << 8) | 0x79);
     put_u32(&mut img, 0x368, text_va as u32); // cmd 0x4 #0: text VA
@@ -2106,7 +2222,7 @@ pub fn emit_conv_chain(
     put_u32(&mut img, 0xb7c, (textlen / 4) as u32); // cmd 0x4 #1: text words
     put_u32(&mut img, 0xb88, k as u32); // cmd 0x4 #1: task count
     put_u32(&mut img, 0xbb8, (14 * k + 3) as u32); // cmd 0x4 #1: sched count
-    // cmd 0x4 #1 input side: channel count + three buffer-size copies
+                                                   // cmd 0x4 #1 input side: channel count + three buffer-size copies
     put_u32(&mut img, 0xc24, c_in);
     for o in [0xc48usize, 0xc68, 0xc78] {
         put_u32(&mut img, o, c_in * 0x40);
@@ -2302,8 +2418,7 @@ fn patch_lane_idx(rec: &mut [u8], i: usize) {
 fn patch_record_act(rec: &mut [u8], act: FusedAct) {
     let stride = act.band_stride() as u32;
     for b in 0..15 {
-        rec[0x54 + 4 * b..0x58 + 4 * b]
-            .copy_from_slice(&(stride * (b as u32 + 1)).to_le_bytes());
+        rec[0x54 + 4 * b..0x58 + 4 * b].copy_from_slice(&(stride * (b as u32 + 1)).to_le_bytes());
     }
     for b in 0..16 {
         rec[0x90 + 4 * b..0x94 + 4 * b].copy_from_slice(&stride.to_le_bytes());
@@ -2596,7 +2711,10 @@ pub fn emit_conv_act_n_dw(
 ) -> Result<Vec<u8>, String> {
     const C: usize = 64;
     if layers == 0 || weights.len() != layers {
-        return Err(format!("expected {layers} weight blobs, got {}", weights.len()));
+        return Err(format!(
+            "expected {layers} weight blobs, got {}",
+            weights.len()
+        ));
     }
     let weights: Vec<&[u16]> = weights
         .iter()
@@ -2646,7 +2764,9 @@ pub fn emit_conv_act_n_dw(
         + REC_INT.1 * (layers - 2)
         + if layers == 2 { REC_LAST1.1 } else { REC_LAST.1 };
     if stream_len > 0x4000 {
-        return Err(format!("chain of {layers} layers overflows the record plane"));
+        return Err(format!(
+            "chain of {layers} layers overflows the record plane"
+        ));
     }
 
     let skel = SKELETON_CONV_SIG5;
@@ -2732,8 +2852,30 @@ pub fn emit_conv_act_n_dw(
             ]);
         } else {
             w.extend_from_slice(&[
-                0x41, 0x10, 0x06, 0x80, 0x04, 0x01, 0x00, 0x00, 0x00, 4 * (i as u8 - 1), 0x00,
-                0x00, 0x10, 0x00, 0x00, 0x00, 0x52, 0x10, 0x01, 0x00, 0x40, 0x01, 0x00, 0x00,
+                0x41,
+                0x10,
+                0x06,
+                0x80,
+                0x04,
+                0x01,
+                0x00,
+                0x00,
+                0x00,
+                4 * (i as u8 - 1),
+                0x00,
+                0x00,
+                0x10,
+                0x00,
+                0x00,
+                0x00,
+                0x52,
+                0x10,
+                0x01,
+                0x00,
+                0x40,
+                0x01,
+                0x00,
+                0x00,
             ]);
         }
         w.extend_from_slice(&[0x00, 4 * i as u8, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00]);
@@ -2816,8 +2958,7 @@ pub fn emit_conv_act_n_dw(
                 None => 0,
             };
             for (i, v) in stream[b * 256..b * 256 + 256].iter().enumerate() {
-                img[base + head + i * 2..base + head + i * 2 + 2]
-                    .copy_from_slice(&v.to_le_bytes());
+                img[base + head + i * 2..base + head + i * 2 + 2].copy_from_slice(&v.to_le_bytes());
             }
         }
     }
@@ -2932,8 +3073,8 @@ fn put_u16(b: &mut [u8], off: usize, v: u16) {
 /// softmax tasks carry a 17th slot at +0x52; in the conv task that
 /// slot is a different descriptor and stays zero.
 const TASK_COL: [usize; 17] = [
-    0x0a, 0x0e, 0x12, 0x16, 0x1a, 0x1e, 0x22, 0x26, 0x2a, 0x32, 0x36, 0x3a, 0x3e, 0x42, 0x46,
-    0x4a, 0x52,
+    0x0a, 0x0e, 0x12, 0x16, 0x1a, 0x1e, 0x22, 0x26, 0x2a, 0x32, 0x36, 0x3a, 0x3e, 0x42, 0x46, 0x4a,
+    0x52,
 ];
 
 /// Patch the producer-task-id slots of a task descriptor — the 16
@@ -2996,7 +3137,10 @@ pub fn emit_conv_sm_n_dw(
 ) -> Result<Vec<u8>, String> {
     const C: usize = 64;
     if layers == 0 || weights.len() != layers {
-        return Err(format!("expected {layers} weight blobs, got {}", weights.len()));
+        return Err(format!(
+            "expected {layers} weight blobs, got {}",
+            weights.len()
+        ));
     }
     let weights: Vec<&[u16]> = weights
         .iter()
@@ -3096,10 +3240,12 @@ pub fn emit_conv_sm_n_dw(
         // conv task — first-layer form carries the input-DMA prologue
         let co = stream.len() - SM_PROG.1 + 4;
         let (stream_u32_off, t) = if i == 0 {
-            (0x14c, skel3[SM_CONV_FIRST.0..SM_CONV_FIRST.0 + SM_CONV_FIRST.1].to_vec())
+            (
+                0x14c,
+                skel3[SM_CONV_FIRST.0..SM_CONV_FIRST.0 + SM_CONV_FIRST.1].to_vec(),
+            )
         } else {
-            let mut t =
-                skel3[SM_CONV_INT.0..SM_CONV_INT.0 + SM_CONV_INT.1].to_vec();
+            let mut t = skel3[SM_CONV_INT.0..SM_CONV_INT.0 + SM_CONV_INT.1].to_vec();
             patch_task_column(&mut t, (6 * i) as u16, 16);
             put_u16(&mut t, 0x13c, (6 * i + 1) as u16);
             put_u16(&mut t, 0x1bc, (6 * i + 2) as u16);
@@ -3158,14 +3304,8 @@ pub fn emit_conv_sm_n_dw(
         })
         .collect();
 
-    let (mut img, text_off) = build_tail_at(
-        skel3,
-        CONV_TAIL_OFF,
-        &entries,
-        &relocs,
-        mil_path,
-        out_path,
-    );
+    let (mut img, text_off) =
+        build_tail_at(skel3, CONV_TAIL_OFF, &entries, &relocs, mil_path, out_path);
 
     let section_size = stream.len();
     img.extend_from_slice(&stream);
@@ -3182,8 +3322,7 @@ pub fn emit_conv_sm_n_dw(
         for b in 0..16usize {
             let base = kern_off + stream_off(j) + b * 0x200;
             for (i, v) in inter[b * 256..b * 256 + 256].iter().enumerate() {
-                img[base + i * 2..base + i * 2 + 2]
-                    .copy_from_slice(&v.to_le_bytes());
+                img[base + i * 2..base + i * 2 + 2].copy_from_slice(&v.to_le_bytes());
             }
         }
     }
@@ -3206,11 +3345,9 @@ pub fn emit_conv_sm_n_dw(
     img[0x2f0..0x2f8].copy_from_slice(&(kern_payload as u64).to_le_bytes());
     put_u32(&mut img, 0x2f8, kern_off as u32);
     img[0x378..0x37a].copy_from_slice(&(0x8000u16 + aligned as u16).to_le_bytes());
-    img[0xb7c..0xb7e]
-        .copy_from_slice(&((0x151 + 0x134 * (layers - 1)) as u16).to_le_bytes());
+    img[0xb7c..0xb7e].copy_from_slice(&((0x151 + 0x134 * (layers - 1)) as u16).to_le_bytes());
     img[0xb88..0xb8c].copy_from_slice(&((6 * layers) as u32).to_le_bytes());
-    img[0xbb8..0xbba]
-        .copy_from_slice(&((0x57 + 0x54 * (layers - 1)) as u16).to_le_bytes());
+    img[0xbb8..0xbba].copy_from_slice(&((0x57 + 0x54 * (layers - 1)) as u16).to_le_bytes());
     Ok(img)
 }
 
@@ -3292,7 +3429,10 @@ pub fn emit_conv_ln_n_dw(
 ) -> Result<Vec<u8>, String> {
     const C: usize = 64;
     if layers == 0 || weights.len() != layers {
-        return Err(format!("expected {layers} weight blobs, got {}", weights.len()));
+        return Err(format!(
+            "expected {layers} weight blobs, got {}",
+            weights.len()
+        ));
     }
     let weights: Vec<&[u16]> = weights
         .iter()
@@ -3432,8 +3572,7 @@ pub fn emit_conv_ln_n_dw(
                 put_u16(&mut t, 0x30c, (5 * i + 5) as u16);
             }
         }
-        t[mark_u32_off..mark_u32_off + 4]
-            .copy_from_slice(&(0x2000 * ords[i] as u32).to_le_bytes());
+        t[mark_u32_off..mark_u32_off + 4].copy_from_slice(&(0x2000 * ords[i] as u32).to_le_bytes());
         stream.extend_from_slice(&t);
         reloc_offs.push(co + mark_u32_off);
     }
@@ -3448,14 +3587,8 @@ pub fn emit_conv_ln_n_dw(
         })
         .collect();
 
-    let (mut img, text_off) = build_tail_at(
-        skel,
-        CONV_TAIL_OFF,
-        &entries,
-        &relocs,
-        mil_path,
-        out_path,
-    );
+    let (mut img, text_off) =
+        build_tail_at(skel, CONV_TAIL_OFF, &entries, &relocs, mil_path, out_path);
 
     let section_size = stream.len();
     img.extend_from_slice(&stream);
@@ -3471,8 +3604,7 @@ pub fn emit_conv_ln_n_dw(
         for b in 0..16usize {
             let base = kern_off + 0x2000 * j + b * 0x200;
             for (i, v) in inter[b * 256..b * 256 + 256].iter().enumerate() {
-                img[base + i * 2..base + i * 2 + 2]
-                    .copy_from_slice(&v.to_le_bytes());
+                img[base + i * 2..base + i * 2 + 2].copy_from_slice(&v.to_le_bytes());
             }
         }
     }
@@ -3493,12 +3625,10 @@ pub fn emit_conv_ln_n_dw(
     put_u32(&mut img, 0x2f8, kern_off as u32);
     put_u32(&mut img, 0x378, 0x3000_8000 + aligned as u32);
     img[0xb7c..0xb7e].copy_from_slice(
-        &((0xec + 0xcc * (layers - 1) + if layers > 1 { 5 } else { 0 }) as u16)
-            .to_le_bytes(),
+        &((0xec + 0xcc * (layers - 1) + if layers > 1 { 5 } else { 0 }) as u16).to_le_bytes(),
     );
     img[0xb88..0xb8c].copy_from_slice(&((5 * layers) as u32).to_le_bytes());
-    img[0xbb8..0xbba]
-        .copy_from_slice(&((0x49 + 0x46 * (layers - 1)) as u16).to_le_bytes());
+    img[0xbb8..0xbba].copy_from_slice(&((0x49 + 0x46 * (layers - 1)) as u16).to_le_bytes());
     Ok(img)
 }
 
@@ -3597,7 +3727,10 @@ pub fn emit_conv_rms_n_dw(
 ) -> Result<Vec<u8>, String> {
     const C: usize = 64;
     if layers == 0 || weights.len() != layers {
-        return Err(format!("expected {layers} weight blobs, got {}", weights.len()));
+        return Err(format!(
+            "expected {layers} weight blobs, got {}",
+            weights.len()
+        ));
     }
     let weights: Vec<&[u16]> = weights
         .iter()
@@ -3838,8 +3971,20 @@ pub fn emit_conv_rms_n_dw(
                 kern_addr + stream_off(j) as u64,
             ));
             if j == 0 {
-                e.push((rms_entries[4].0.clone(), tpl0.1, tpl0.2, tpl0.3, kern_addr + 0x2000));
-                e.push((rms_entries[5].0.clone(), tpl0.1, tpl0.2, tpl0.3, kern_addr + 0x2080));
+                e.push((
+                    rms_entries[4].0.clone(),
+                    tpl0.1,
+                    tpl0.2,
+                    tpl0.3,
+                    kern_addr + 0x2000,
+                ));
+                e.push((
+                    rms_entries[5].0.clone(),
+                    tpl0.1,
+                    tpl0.2,
+                    tpl0.3,
+                    kern_addr + 0x2080,
+                ));
             }
         }
         for j in 0..n_streams {
@@ -3853,22 +3998,28 @@ pub fn emit_conv_rms_n_dw(
                 ));
             }
             if j == 0 {
-                e.push((rms_entries[21].0.clone(), tpln.1, tpln.2, tpln.3, kern_addr + 0x2080));
-                e.push((rms_entries[22].0.clone(), tpln.1, tpln.2, tpln.3, kern_addr + 0x2100));
+                e.push((
+                    rms_entries[21].0.clone(),
+                    tpln.1,
+                    tpln.2,
+                    tpln.3,
+                    kern_addr + 0x2080,
+                ));
+                e.push((
+                    rms_entries[22].0.clone(),
+                    tpln.1,
+                    tpln.2,
+                    tpln.3,
+                    kern_addr + 0x2100,
+                ));
             }
         }
         e.extend_from_slice(&rms_entries[23..]); // scalar descriptors
         e
     };
 
-    let (mut img, text_off) = build_tail_at(
-        skel,
-        CONV_TAIL_OFF,
-        &entries,
-        &relocs,
-        mil_path,
-        out_path,
-    );
+    let (mut img, text_off) =
+        build_tail_at(skel, CONV_TAIL_OFF, &entries, &relocs, mil_path, out_path);
 
     img.extend_from_slice(&stream);
 
@@ -3890,8 +4041,7 @@ pub fn emit_conv_rms_n_dw(
         for b in 0..16usize {
             let base = kern_off + stream_off(j) + b * 0x200;
             for (i, v) in inter[b * 256..b * 256 + 256].iter().enumerate() {
-                img[base + i * 2..base + i * 2 + 2]
-                    .copy_from_slice(&v.to_le_bytes());
+                img[base + i * 2..base + i * 2 + 2].copy_from_slice(&v.to_le_bytes());
             }
         }
     }
@@ -3900,8 +4050,7 @@ pub fn emit_conv_rms_n_dw(
         img[kern_off + 0x2000..kern_off + 0x2180]
             .copy_from_slice(&SKELETON_CONV_RMS1[0xe000..0xe180][..]);
     } else {
-        img[kern_off + 0x2000..kern_off + 0x2100]
-            .copy_from_slice(&skel[0xa000..0xa100][..]);
+        img[kern_off + 0x2000..kern_off + 0x2100].copy_from_slice(&skel[0xa000..0xa100][..]);
     }
 
     // scalars
@@ -3922,12 +4071,12 @@ pub fn emit_conv_rms_n_dw(
     put_u32(&mut img, 0x2f8, kern_off as u32);
     put_u32(&mut img, 0x378, sec2_addr as u32);
     put_u32(&mut img, 0x3d8, kern_addr as u32);
+    put_u32(&mut img, 0xb7c, 0x220 + (section_size as u32 - 0x880) / 4);
     put_u32(
         &mut img,
-        0xb7c,
-        0x220 + (section_size as u32 - 0x880) / 4,
+        0xb88,
+        if layers == 1 { 0xb } else { 12 * layers as u32 },
     );
-    put_u32(&mut img, 0xb88, if layers == 1 { 0xb } else { 12 * layers as u32 });
     put_u32(
         &mut img,
         0xbb8,
@@ -4008,7 +4157,11 @@ fn emit_conv_rms_xdw(
     // last task has no successor and emits body-only.
     let task = |text: &[u8], st: &[usize], t: usize| -> Vec<u8> {
         let s = st[t];
-        let e = if t + 1 < st.len() { st[t + 1] + 2 } else { text.len() };
+        let e = if t + 1 < st.len() {
+            st[t + 1] + 2
+        } else {
+            text.len()
+        };
         text[s + 2..e].to_vec()
     };
 
@@ -4176,8 +4329,20 @@ fn emit_conv_rms_xdw(
             kern_addr + stream_off(j) as u64,
         ));
         if j == 0 {
-            e.push((x_entries[4].0.clone(), tpl0.1, tpl0.2, tpl0.3, kern_addr + 0x2000));
-            e.push((x_entries[5].0.clone(), tpl0.1, tpl0.2, tpl0.3, kern_addr + 0x2080));
+            e.push((
+                x_entries[4].0.clone(),
+                tpl0.1,
+                tpl0.2,
+                tpl0.3,
+                kern_addr + 0x2000,
+            ));
+            e.push((
+                x_entries[5].0.clone(),
+                tpl0.1,
+                tpl0.2,
+                tpl0.3,
+                kern_addr + 0x2080,
+            ));
         }
     }
     // per-layer output names from the MIL: each following conv's `x`
@@ -4191,13 +4356,24 @@ fn emit_conv_rms_xdw(
                 .iter()
                 .filter(|o| o.op == "conv")
                 .skip(1)
-                .filter_map(|o| o.args.iter().find(|(k, _)| k == "x").map(|(_, v)| v.clone()))
+                .filter_map(|o| {
+                    o.args
+                        .iter()
+                        .find(|(k, _)| k == "x")
+                        .map(|(_, v)| v.clone())
+                })
                 .collect();
             (xs.len() + 1 == layers).then(|| xs.into_iter().chain([io.out]).collect())
         })
         .unwrap_or_else(|| {
             (0..layers)
-                .map(|j| if j + 1 == layers { "z".into() } else { format!("s{}", j + 2) })
+                .map(|j| {
+                    if j + 1 == layers {
+                        "z".into()
+                    } else {
+                        format!("s{}", j + 2)
+                    }
+                })
                 .collect()
         });
     for (j, nm) in layer_out.iter().enumerate() {
@@ -4220,20 +4396,25 @@ fn emit_conv_rms_xdw(
             ));
         }
         if j == 0 {
-            e.push((x_entries[36].0.clone(), tpln.1, tpln.2, tpln.3, kern_addr + 0x2080));
-            e.push((x_entries[37].0.clone(), tpln.1, tpln.2, tpln.3, kern_addr + 0x2100));
+            e.push((
+                x_entries[36].0.clone(),
+                tpln.1,
+                tpln.2,
+                tpln.3,
+                kern_addr + 0x2080,
+            ));
+            e.push((
+                x_entries[37].0.clone(),
+                tpln.1,
+                tpln.2,
+                tpln.3,
+                kern_addr + 0x2100,
+            ));
         }
     }
     e.extend_from_slice(&x_entries[x_entries.len() - 25..]);
 
-    let (mut img, text_off) = build_tail_at(
-        skel,
-        CONV_TAIL_OFF,
-        &e,
-        &relocs,
-        mil_path,
-        out_path,
-    );
+    let (mut img, text_off) = build_tail_at(skel, CONV_TAIL_OFF, &e, &relocs, mil_path, out_path);
     // `__KERN_0` file offset mirrors the vmaddr delta — the next
     // 0x4000 page past the end of the second `__TEXT` section.
     let kern_off = text_off + (kern_addr - 0x3000_8000) as usize;
@@ -4252,14 +4433,12 @@ fn emit_conv_rms_xdw(
         for b in 0..16usize {
             let base = kern_off + stream_off(j) + b * 0x200;
             for (i, v) in inter[b * 256..b * 256 + 256].iter().enumerate() {
-                img[base + i * 2..base + i * 2 + 2]
-                    .copy_from_slice(&v.to_le_bytes());
+                img[base + i * 2..base + i * 2 + 2].copy_from_slice(&v.to_le_bytes());
             }
         }
     }
     // div/recip LUT tail on lane 0
-    img[kern_off + 0x2000..kern_off + 0x2100]
-        .copy_from_slice(&skel[0x12000..0x12100]);
+    img[kern_off + 0x2000..kern_off + 0x2100].copy_from_slice(&skel[0x12000..0x12100]);
 
     // scalars — the `__text` segment spans through `__KERN_0`'s
     // page-aligned file offset
@@ -4282,11 +4461,7 @@ fn emit_conv_rms_xdw(
     put_u32(&mut img, 0x2f8, kern_off as u32);
     put_u32(&mut img, 0x378, sec2_addr as u32);
     put_u32(&mut img, 0x3d8, kern_addr as u32);
-    put_u32(
-        &mut img,
-        0xb7c,
-        0x220 + (section_size as u32 - 0x880) / 4,
-    );
+    put_u32(&mut img, 0xb7c, 0x220 + (section_size as u32 - 0x880) / 4);
     put_u32(&mut img, 0xb88, 13 * layers as u32);
     put_u32(&mut img, 0xbb8, 0x3 + 0xb6 * layers as u32);
     Ok(img)
@@ -4452,7 +4627,13 @@ pub fn emit_mm_part(part: MmPart, mil_path: &str, out_path: &str) -> Vec<u8> {
         Vec::new()
     };
     let (mut img, text_off) = build_tail_at_reloc(
-        skel, tail_off, &entries, &relocs, mil_path, out_path, reloff_field,
+        skel,
+        tail_off,
+        &entries,
+        &relocs,
+        mil_path,
+        out_path,
+        reloff_field,
     );
     debug_assert_eq!(text_off, 0x8000);
     img.extend_from_slice(&skel[0x8000..]);
@@ -4530,7 +4711,11 @@ fn mil_ops(text: &str) -> (Vec<MilOp>, Vec<(String, String)>) {
         let mut out = String::with_capacity(text.len());
         for raw in text.lines() {
             let line = raw.trim_end();
-            if out.ends_with(" =") && line.trim_start().starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+            if out.ends_with(" =")
+                && line
+                    .trim_start()
+                    .starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            {
                 out.push(' ');
                 out.push_str(line.trim_start());
             } else {
@@ -4755,26 +4940,25 @@ fn emit_from_mil_inner(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String
             .map(|(_, p)| p.clone())
     };
     let arg = |op: &MilOp, k: &str| -> Option<String> {
-        op.args
-            .iter()
-            .find(|(n, _)| n == k)
-            .map(|(_, v)| v.clone())
+        op.args.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
     };
     let weights_of = |op: &MilOp| -> Result<Vec<u16>, String> {
         let wname = arg(op, "weight").ok_or("conv without weight operand")?;
-        let path = blob_of(&wname).ok_or_else(|| format!("weight `{wname}` is not a blob const"))?;
+        let path =
+            blob_of(&wname).ok_or_else(|| format!("weight `{wname}` is not a blob const"))?;
         load_blob_u16(&resolve_blob(&mil_dir, &path))
     };
     let names: Vec<&str> = ops.iter().map(|o| o.op.as_str()).collect();
-    let elems = |o: &MilOp| -> u32 {
-        o.shape.iter().map(|d| (*d).max(1) as u32).product()
-    };
+    let elems = |o: &MilOp| -> u32 { o.shape.iter().map(|d| (*d).max(1) as u32).product() };
 
     // ---- single-op families ----
     match names.as_slice() {
         ["conv"] => {
             let o = &ops[0];
-            let (c, w) = (o.shape.get(1).copied().unwrap_or(0), o.shape.get(2).copied().unwrap_or(1));
+            let (c, w) = (
+                o.shape.get(1).copied().unwrap_or(0),
+                o.shape.get(2).copied().unwrap_or(1),
+            );
             // `[1,Cout,1,1]` conv1x1 with both dims >=32 goes through
             // the parametric emitter — byte-verified against ANEC for
             // every square `C` in 32..=4096 and a dense non-square
@@ -4801,18 +4985,63 @@ fn emit_from_mil_inner(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String
             };
             return emit_conv1x1(shape, &weights_of(o)?, mil_path, out_path);
         }
-        ["add"] => return Ok(emit_elementwise2(EwOp::Add, elems(&ops[0]), mil_path, out_path)),
-        ["mul"] => return Ok(emit_elementwise2(EwOp::Mul, elems(&ops[0]), mil_path, out_path)),
-        ["sub"] => return Ok(emit_elementwise2(EwOp::Sub, elems(&ops[0]), mil_path, out_path)),
+        ["add"] => {
+            return Ok(emit_elementwise2(
+                EwOp::Add,
+                elems(&ops[0]),
+                mil_path,
+                out_path,
+            ))
+        }
+        ["mul"] => {
+            return Ok(emit_elementwise2(
+                EwOp::Mul,
+                elems(&ops[0]),
+                mil_path,
+                out_path,
+            ))
+        }
+        ["sub"] => {
+            return Ok(emit_elementwise2(
+                EwOp::Sub,
+                elems(&ops[0]),
+                mil_path,
+                out_path,
+            ))
+        }
         ["minimum"] => {
-            return Ok(emit_elementwise2(EwOp::Min, elems(&ops[0]), mil_path, out_path))
+            return Ok(emit_elementwise2(
+                EwOp::Min,
+                elems(&ops[0]),
+                mil_path,
+                out_path,
+            ))
         }
         ["maximum"] => {
-            return Ok(emit_elementwise2(EwOp::Max, elems(&ops[0]), mil_path, out_path))
+            return Ok(emit_elementwise2(
+                EwOp::Max,
+                elems(&ops[0]),
+                mil_path,
+                out_path,
+            ))
         }
         ["relu"] => return Ok(emit_relu(mil_path, out_path)),
-        ["sigmoid"] => return Ok(emit_unary_lut(LutOp::Sigmoid, elems(&ops[0]), mil_path, out_path)),
-        ["tanh"] => return Ok(emit_unary_lut(LutOp::Tanh, elems(&ops[0]), mil_path, out_path)),
+        ["sigmoid"] => {
+            return Ok(emit_unary_lut(
+                LutOp::Sigmoid,
+                elems(&ops[0]),
+                mil_path,
+                out_path,
+            ))
+        }
+        ["tanh"] => {
+            return Ok(emit_unary_lut(
+                LutOp::Tanh,
+                elems(&ops[0]),
+                mil_path,
+                out_path,
+            ))
+        }
         [a, b] => {
             let ew = |s: &str| -> Option<EwOp> {
                 Some(match s {
@@ -4826,9 +5055,7 @@ fn emit_from_mil_inner(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String
             };
             if let (Some(op1), Some(op2)) = (ew(a), ew(b)) {
                 let (o1, o2) = (&ops[0], &ops[1]);
-                if arg(o1, "x").as_deref() != Some("x")
-                    || arg(o1, "y").as_deref() != Some("y")
-                {
+                if arg(o1, "x").as_deref() != Some("x") || arg(o1, "y").as_deref() != Some("y") {
                     return Err("elementwise chain op1 must bind (x = x, y = y)".into());
                 }
                 let (ox, oy) = (arg(o2, "x"), arg(o2, "y"));
@@ -4840,9 +5067,7 @@ fn emit_from_mil_inner(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String
                     return Err("elementwise chain op2 must consume op1's result".into());
                 };
                 if !matches!(free, Some("x") | Some("y")) {
-                    return Err(
-                        "elementwise chain op2's free operand must be x or y".into(),
-                    );
+                    return Err("elementwise chain op2's free operand must be x or y".into());
                 }
                 return emit_elementwise_chain(
                     op1,
@@ -4904,7 +5129,12 @@ fn emit_from_mil_inner(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String
                 64 => MmShape::N64,
                 128 => MmShape::N128,
                 256 => MmShape::N256,
-                _ => return Err(format!("matmul shape {:?} not on a skeleton family", ops[0].shape)),
+                _ => {
+                    return Err(format!(
+                        "matmul shape {:?} not on a skeleton family",
+                        ops[0].shape
+                    ))
+                }
             };
             return emit_matmul(shape, &w, mil_path, out_path);
         }
@@ -4928,26 +5158,28 @@ fn emit_from_mil_inner(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String
     }
 
     // ---- conv chains: group aux ops after each conv ----
-    if names.first() != Some(&"conv") || !names.iter().all(|n| {
-        matches!(
-            *n,
-            "conv"
-                | "sigmoid"
-                | "tanh"
-                | "relu"
-                | "gelu"
-                | "softmax"
-                | "layer_norm"
-                | "mul"
-                | "abs"
-                | "reduce_max"
-                | "maximum"
-                | "real_div"
-                | "reduce_mean"
-                | "add"
-                | "rsqrt"
-        )
-    }) {
+    if names.first() != Some(&"conv")
+        || !names.iter().all(|n| {
+            matches!(
+                *n,
+                "conv"
+                    | "sigmoid"
+                    | "tanh"
+                    | "relu"
+                    | "gelu"
+                    | "softmax"
+                    | "layer_norm"
+                    | "mul"
+                    | "abs"
+                    | "reduce_max"
+                    | "maximum"
+                    | "real_div"
+                    | "reduce_mean"
+                    | "add"
+                    | "rsqrt"
+            )
+        })
+    {
         return Err(format!(
             "op sequence {names:?} is not on a covered skeleton family"
         ));
@@ -5224,7 +5456,9 @@ fn apply_io_names(
         let kind = if first.is_empty() {
             Blk::Main
         } else if let Some(n) = first.strip_suffix("@output") {
-            Blk::Out { name: n.to_string() }
+            Blk::Out {
+                name: n.to_string(),
+            }
         } else {
             Blk::In { name: first }
         };
@@ -5237,9 +5471,8 @@ fn apply_io_names(
             _ => None,
         })
         .collect();
-    let Some((_, Blk::Out { name: skel_out })) = blocks
-        .iter()
-        .find(|(_, k)| matches!(k, Blk::Out { .. }))
+    let Some((_, Blk::Out { name: skel_out })) =
+        blocks.iter().find(|(_, k)| matches!(k, Blk::Out { .. }))
     else {
         return Ok(img.to_vec()); // no io blocks — nothing to substitute
     };
@@ -5257,7 +5490,9 @@ fn apply_io_names(
             }
         });
         let Some(n) = resolved else {
-            return Err(format!("apply_io_names: no MIL input for skeleton input `{s}`"));
+            return Err(format!(
+                "apply_io_names: no MIL input for skeleton input `{s}`"
+            ));
         };
         new_ins.push(n);
     }
@@ -5270,7 +5505,12 @@ fn apply_io_names(
     if new_all.iter().any(|n| n.len() > 15 || n.contains('\0')) {
         return Err("io name exceeds the 15-char type-0x40 name field".into());
     }
-    if new_all.iter().collect::<std::collections::HashSet<_>>().len() != new_all.len() {
+    if new_all
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        != new_all.len()
+    {
         return Err("io names must be distinct".into());
     }
 
@@ -5391,7 +5631,10 @@ fn apply_io_names(
     }
     // skeleton sec -> the io role's skeleton seg cmd index
     let seg_at_skel_sec = |s: u8| -> Option<usize> {
-        tensor_segs.iter().find(|(_, ss)| *ss == s).map(|(ci, _)| *ci)
+        tensor_segs
+            .iter()
+            .find(|(_, ss)| *ss == s)
+            .map(|(ci, _)| *ci)
     };
 
     // ---- rebuild cmd-0x4 blocks (ins alpha-sorted, output last) ---------
@@ -5406,10 +5649,7 @@ fn apply_io_names(
         b[4..8].copy_from_slice(&sz.to_le_bytes());
         // +0x7c interior field = block-relative offset of the second
         // name occurrence: tail_start + len("main\0") + len(first) + 1
-        let first_len = region[5..]
-            .iter()
-            .position(|&c| c == 0)
-            .unwrap_or(0);
+        let first_len = region[5..].iter().position(|&c| c == 0).unwrap_or(0);
         let ptr = (tail_start + 5 + first_len + 1) as u32;
         b[0x7c..0x80].copy_from_slice(&ptr.to_le_bytes());
         b
@@ -5476,9 +5716,10 @@ fn apply_io_names(
             entries.push((sx, *ty, sec, *desc, val));
         } else if *ty == 0x20 {
             if let Some((nm, rest)) = name.split_once(':') {
-                if let Some(tbase) = rest.strip_prefix('t').and_then(|r| {
-                    r.split('=').next().and_then(|d| d.parse::<u32>().ok())
-                }) {
+                if let Some(tbase) = rest
+                    .strip_prefix('t')
+                    .and_then(|r| r.split('=').next().and_then(|d| d.parse::<u32>().ok()))
+                {
                     descs.push(Desc {
                         skel_name: nm.to_string(),
                         body: rest[tbase.to_string().len() + 1 + 1..].to_string(),
@@ -5579,18 +5820,14 @@ fn apply_io_names(
                     _ => new_cmds.extend_from_slice(&img[coff..coff + csz]),
                 }
             }
-            4 => {
-                match &blocks.iter().find(|(bci, _)| *bci == ci).map(|(_, k)| k) {
-                    Some(Blk::In { .. }) => {
-                        new_cmds.extend_from_slice(&in_blks[inbi].1);
-                        inbi += 1;
-                    }
-                    Some(Blk::Out { .. }) => {
-                        new_cmds.extend_from_slice(out_blk.as_ref().unwrap())
-                    }
-                    _ => new_cmds.extend_from_slice(&img[coff..coff + csz]),
+            4 => match &blocks.iter().find(|(bci, _)| *bci == ci).map(|(_, k)| k) {
+                Some(Blk::In { .. }) => {
+                    new_cmds.extend_from_slice(&in_blks[inbi].1);
+                    inbi += 1;
                 }
-            }
+                Some(Blk::Out { .. }) => new_cmds.extend_from_slice(out_blk.as_ref().unwrap()),
+                _ => new_cmds.extend_from_slice(&img[coff..coff + csz]),
+            },
             2 => {
                 symtab_cmd_pos = new_cmds.len();
                 new_cmds.extend_from_slice(&[0u8; 0x18]); // patched below
@@ -5601,14 +5838,17 @@ fn apply_io_names(
     let cmds_end = 0x20 + new_cmds.len();
     let symoff_new = cmds_end;
     let stroff_new = symoff_new + entries.len() * 16;
-    new_cmds[symtab_cmd_pos..symtab_cmd_pos + 0x18].copy_from_slice(&[
-        2u32.to_le_bytes(),
-        0x18u32.to_le_bytes(),
-        (symoff_new as u32).to_le_bytes(),
-        (entries.len() as u32).to_le_bytes(),
-        (stroff_new as u32).to_le_bytes(),
-        (strtab_new.len() as u32).to_le_bytes(),
-    ].concat());
+    new_cmds[symtab_cmd_pos..symtab_cmd_pos + 0x18].copy_from_slice(
+        &[
+            2u32.to_le_bytes(),
+            0x18u32.to_le_bytes(),
+            (symoff_new as u32).to_le_bytes(),
+            (entries.len() as u32).to_le_bytes(),
+            (stroff_new as u32).to_le_bytes(),
+            (strtab_new.len() as u32).to_le_bytes(),
+        ]
+        .concat(),
+    );
 
     let mut out = img[..0x20].to_vec();
     put_u32(&mut out, 0x14, new_cmds.len() as u32);
@@ -5731,7 +5971,9 @@ mod tests {
         .unwrap();
         let vec: serde_json::Value = serde_json::from_str(&raw).unwrap();
         for c in [40usize, 80] {
-            let w: Vec<u16> = (0..c * c).map(|i| 0x3c00 + ((i * 7) % 0x3ff) as u16).collect();
+            let w: Vec<u16> = (0..c * c)
+                .map(|i| 0x3c00 + ((i * 7) % 0x3ff) as u16)
+                .collect();
             let expect: Vec<u16> = vec[c.to_string()]
                 .as_array()
                 .unwrap()
@@ -5798,7 +6040,9 @@ mod tests {
             (
                 ConvShape::C128W8,
                 "conv_perm128",
-                (0..16384u32).map(|i| (i as u16).saturating_sub(4)).collect(),
+                (0..16384u32)
+                    .map(|i| (i as u16).saturating_sub(4))
+                    .collect(),
                 true,
             ),
         ] {
@@ -5809,10 +6053,7 @@ mod tests {
                 weights
             };
             let (mil, out) = if rel {
-                (
-                    format!("{case}/net.mil"),
-                    format!("{case}/out/net.macho"),
-                )
+                (format!("{case}/net.mil"), format!("{case}/out/net.macho"))
             } else {
                 (
                     format!("/tmp/ane_corpus/{case}/net.mil"),
@@ -5986,15 +6227,11 @@ mod tests {
                 relaid: vec![i_name.to_string()],
             };
             let (inn, outn) = (i_name.to_string(), o_name.to_string());
-            let img = apply_io_names(
-                &img,
-                &io,
-                &move |s| match s {
-                    "x" => Some(inn.clone()),
-                    "z" => Some(outn.clone()),
-                    _ => None,
-                },
-            )
+            let img = apply_io_names(&img, &io, &move |s| match s {
+                "x" => Some(inn.clone()),
+                "z" => Some(outn.clone()),
+                _ => None,
+            })
             .unwrap();
             let expect = std::fs::read(format!(
                 "{}/assets/ioname_{probe}_reference.hwx",
@@ -6058,11 +6295,8 @@ mod tests {
             (4, "conv_sig4_reference.hwx", "chain4"),
             (5, "conv_sig5_skeleton.hwx", "chain5"),
         ] {
-            let expect = std::fs::read(format!(
-                "{}/assets/{asset}",
-                env!("CARGO_MANIFEST_DIR")
-            ))
-            .unwrap();
+            let expect =
+                std::fs::read(format!("{}/assets/{asset}", env!("CARGO_MANIFEST_DIR"))).unwrap();
             // invert dst[g*C*B + ic*B + m] = src[(g*B+m)*C + ic];
             // band b holds group g=b, so j = ic*B + m
             const C: usize = 64;
@@ -6111,17 +6345,12 @@ mod tests {
             (3, 2, "conv_sig3_pdw_reference.hwx", "chain3_pdw"),
             (8, 8, "conv_sig8_dw_reference.hwx", "chain8_dw"),
         ] {
-            let expect = std::fs::read(format!(
-                "{}/assets/{asset}",
-                env!("CARGO_MANIFEST_DIR")
-            ))
-            .unwrap();
+            let expect =
+                std::fs::read(format!("{}/assets/{asset}", env!("CARGO_MANIFEST_DIR"))).unwrap();
             let weights: Vec<Vec<u16>> = (0..layers)
                 .map(|i| {
                     let j = (i % n_blobs) as u32;
-                    (0..64u32 * 64)
-                        .map(|e| (e + j * 0x5555) as u16)
-                        .collect()
+                    (0..64u32 * 64).map(|e| (e + j * 0x5555) as u16).collect()
                 })
                 .collect();
             let wrefs: Vec<&[u16]> = weights.iter().map(|w| w.as_slice()).collect();
@@ -6156,29 +6385,122 @@ mod tests {
     fn conv_act_chain_byte_identical() {
         let _g = SIG_LOCK.lock().unwrap();
         for (act, layers, n_blobs, asset, case) in [
-            (FusedAct::Relu, 1usize, 1usize, "conv64_relu_skeleton.hwx", "chain_conv_relu"),
-            (FusedAct::Relu, 2, 1, "conv_act2_relu_reference.hwx", "chain_conv2_relu2"),
-            (FusedAct::Relu, 5, 1, "conv_sig5_relu_reference.hwx", "chain5_relu"),
-            (FusedAct::Relu, 8, 8, "conv_act8_relu_dw_reference.hwx", "chain8_relu_dw"),
-            (FusedAct::Tanh, 1, 1, "conv64_tanh_skeleton.hwx", "chain_conv_tanh"),
-            (FusedAct::Tanh, 2, 1, "conv_act2_tanh_reference.hwx", "chain_conv2_tanh2"),
-            (FusedAct::Tanh, 5, 1, "conv_sig5_tanh_reference.hwx", "chain5_tanh"),
-            (FusedAct::Tanh, 8, 8, "conv_act8_tanh_dw_reference.hwx", "chain8_tanh_dw"),
-            (FusedAct::Gelu, 1, 1, "conv64_gelu_skeleton.hwx", "chain_conv_gelu"),
-            (FusedAct::Gelu, 2, 1, "conv_act2_gelu_reference.hwx", "chain_conv2_gelu2"),
-            (FusedAct::Gelu, 5, 1, "conv_sig5_gelu_reference.hwx", "chain5_gelu"),
-            (FusedAct::Gelu, 8, 8, "conv_act8_gelu_dw_reference.hwx", "chain8_gelu_dw"),
-            (FusedAct::Silu, 1, 1, "conv64_silu_skeleton.hwx", "chain_conv_silu"),
-            (FusedAct::Silu, 2, 1, "conv_act2_silu_reference.hwx", "chain_conv2_silu2"),
-            (FusedAct::Silu, 5, 1, "conv_sig5_silu_reference.hwx", "chain5_silu"),
-            (FusedAct::Silu, 8, 8, "conv_act8_silu_dw_reference.hwx", "chain8_silu_dw"),
+            (
+                FusedAct::Relu,
+                1usize,
+                1usize,
+                "conv64_relu_skeleton.hwx",
+                "chain_conv_relu",
+            ),
+            (
+                FusedAct::Relu,
+                2,
+                1,
+                "conv_act2_relu_reference.hwx",
+                "chain_conv2_relu2",
+            ),
+            (
+                FusedAct::Relu,
+                5,
+                1,
+                "conv_sig5_relu_reference.hwx",
+                "chain5_relu",
+            ),
+            (
+                FusedAct::Relu,
+                8,
+                8,
+                "conv_act8_relu_dw_reference.hwx",
+                "chain8_relu_dw",
+            ),
+            (
+                FusedAct::Tanh,
+                1,
+                1,
+                "conv64_tanh_skeleton.hwx",
+                "chain_conv_tanh",
+            ),
+            (
+                FusedAct::Tanh,
+                2,
+                1,
+                "conv_act2_tanh_reference.hwx",
+                "chain_conv2_tanh2",
+            ),
+            (
+                FusedAct::Tanh,
+                5,
+                1,
+                "conv_sig5_tanh_reference.hwx",
+                "chain5_tanh",
+            ),
+            (
+                FusedAct::Tanh,
+                8,
+                8,
+                "conv_act8_tanh_dw_reference.hwx",
+                "chain8_tanh_dw",
+            ),
+            (
+                FusedAct::Gelu,
+                1,
+                1,
+                "conv64_gelu_skeleton.hwx",
+                "chain_conv_gelu",
+            ),
+            (
+                FusedAct::Gelu,
+                2,
+                1,
+                "conv_act2_gelu_reference.hwx",
+                "chain_conv2_gelu2",
+            ),
+            (
+                FusedAct::Gelu,
+                5,
+                1,
+                "conv_sig5_gelu_reference.hwx",
+                "chain5_gelu",
+            ),
+            (
+                FusedAct::Gelu,
+                8,
+                8,
+                "conv_act8_gelu_dw_reference.hwx",
+                "chain8_gelu_dw",
+            ),
+            (
+                FusedAct::Silu,
+                1,
+                1,
+                "conv64_silu_skeleton.hwx",
+                "chain_conv_silu",
+            ),
+            (
+                FusedAct::Silu,
+                2,
+                1,
+                "conv_act2_silu_reference.hwx",
+                "chain_conv2_silu2",
+            ),
+            (
+                FusedAct::Silu,
+                5,
+                1,
+                "conv_sig5_silu_reference.hwx",
+                "chain5_silu",
+            ),
+            (
+                FusedAct::Silu,
+                8,
+                8,
+                "conv_act8_silu_dw_reference.hwx",
+                "chain8_silu_dw",
+            ),
             (FusedAct::Softmax, 1, 1, "conv_sm_perm_reference.hwx", "smp"),
         ] {
-            let expect = std::fs::read(format!(
-                "{}/assets/{asset}",
-                env!("CARGO_MANIFEST_DIR")
-            ))
-            .unwrap();
+            let expect =
+                std::fs::read(format!("{}/assets/{asset}", env!("CARGO_MANIFEST_DIR"))).unwrap();
             let weights: Vec<Vec<u16>> = (0..layers)
                 .map(|i| {
                     let j = (i % n_blobs) as u32;
@@ -6235,11 +6557,8 @@ mod tests {
             (6, 6, "conv_smdw6_reference.hwx", "smdw6", true),
             (3, 2, "conv_smpdw_reference.hwx", "smpdw", false),
         ] {
-            let expect = std::fs::read(format!(
-                "{}/assets/{asset}",
-                env!("CARGO_MANIFEST_DIR")
-            ))
-            .unwrap();
+            let expect =
+                std::fs::read(format!("{}/assets/{asset}", env!("CARGO_MANIFEST_DIR"))).unwrap();
             let weights: Vec<Vec<u16>> = (0..layers)
                 .map(|i| {
                     let j = (i % n_blobs) as u32;
@@ -6298,11 +6617,8 @@ mod tests {
             (5, 5, "conv_lndw5_reference.hwx", "lndw5", true),
             (6, 6, "conv_lndw6_reference.hwx", "lndw6", true),
         ] {
-            let expect = std::fs::read(format!(
-                "{}/assets/{asset}",
-                env!("CARGO_MANIFEST_DIR")
-            ))
-            .unwrap();
+            let expect =
+                std::fs::read(format!("{}/assets/{asset}", env!("CARGO_MANIFEST_DIR"))).unwrap();
             let weights: Vec<Vec<u16>> = (0..layers)
                 .map(|i| {
                     let j = i % n_blobs;
@@ -6310,7 +6626,9 @@ mod tests {
                         vec![0x3c00u16; 64 * 64]
                     } else if ramp {
                         // the lndw5/6 probes use the `j*0x5555` ramp
-                        (0..64u32 * 64).map(|e| (e + j as u32 * 0x5555) as u16).collect()
+                        (0..64u32 * 64)
+                            .map(|e| (e + j as u32 * 0x5555) as u16)
+                            .collect()
                     } else {
                         (0..64u32 * 64).map(|e| (e + SEEDS[j]) as u16).collect()
                     }
@@ -6363,19 +6681,14 @@ mod tests {
             (4, 4, "conv_rmsdw4_reference.hwx", "rmsdw4", true),
             (3, 2, "conv_rmspdw3_reference.hwx", "rmspdw3", true),
         ] {
-            let expect = std::fs::read(format!(
-                "{}/assets/{asset}",
-                env!("CARGO_MANIFEST_DIR")
-            ))
-            .unwrap();
+            let expect =
+                std::fs::read(format!("{}/assets/{asset}", env!("CARGO_MANIFEST_DIR"))).unwrap();
             const SEEDS: [u32; 4] = [0, 0x5555, 0xaaaa, 0x3333];
             let weights: Vec<Vec<u16>> = (0..layers)
                 .map(|i| {
                     let j = i % n_blobs;
                     if n_blobs != 1 {
-                        (0..64u32 * 64)
-                            .map(|e| (e + SEEDS[j]) as u16)
-                            .collect()
+                        (0..64u32 * 64).map(|e| (e + SEEDS[j]) as u16).collect()
                     } else if case == "rms6" {
                         // the rms6 probe's weight.bin is the `w[i]=i`
                         // ramp, not ones
@@ -6475,17 +6788,44 @@ mod tests {
             ("conv_rmsdw7_skeleton.hwx", "rmsdw7", b'B', seq(7), false),
             ("conv_rmsdw8_skeleton.hwx", "rmsdw8", b'B', seq(8), false),
             ("conv_rmsdw9_reference.hwx", "rmsdw9", b'D', seq(9), false),
-            ("conv_rmsdw10_reference.hwx", "rmsdw10", b'D', seq(10), false),
-            ("conv_rmsdw11_reference.hwx", "rmsdw11", b'C', seq(11), false),
-            ("conv_rmsdw12_reference.hwx", "rmsdw12", b'C', seq(12), false),
-            ("conv_rmspdw5_2_reference.hwx", "rmspdw5_2", b'C', vec![0, 1, 0, 1, 0], false),
-            ("conv_rmspdw6_4_reference.hwx", "rmspdw6_4", b'C', vec![0, 1, 2, 3, 0, 1], false),
+            (
+                "conv_rmsdw10_reference.hwx",
+                "rmsdw10",
+                b'D',
+                seq(10),
+                false,
+            ),
+            (
+                "conv_rmsdw11_reference.hwx",
+                "rmsdw11",
+                b'C',
+                seq(11),
+                false,
+            ),
+            (
+                "conv_rmsdw12_reference.hwx",
+                "rmsdw12",
+                b'C',
+                seq(12),
+                false,
+            ),
+            (
+                "conv_rmspdw5_2_reference.hwx",
+                "rmspdw5_2",
+                b'C',
+                vec![0, 1, 0, 1, 0],
+                false,
+            ),
+            (
+                "conv_rmspdw6_4_reference.hwx",
+                "rmspdw6_4",
+                b'C',
+                vec![0, 1, 2, 3, 0, 1],
+                false,
+            ),
         ] {
-            let expect = std::fs::read(format!(
-                "{}/assets/{asset}",
-                env!("CARGO_MANIFEST_DIR")
-            ))
-            .unwrap();
+            let expect =
+                std::fs::read(format!("{}/assets/{asset}", env!("CARGO_MANIFEST_DIR"))).unwrap();
             let weights: Vec<Vec<u16>> = blobs
                 .iter()
                 .map(|&j| (0..64u32 * 64).map(|e| pat(p, j as u32, e)).collect())
@@ -6518,7 +6858,13 @@ mod tests {
         // beyond the mined ordinal table: clear error, no bad bytes
         let (w0, w1) = (vec![0u16; 64 * 64], vec![1u16; 64 * 64]);
         let many: Vec<&[u16]> = (0..13)
-            .map(|i| if i % 2 == 0 { w0.as_slice() } else { w1.as_slice() })
+            .map(|i| {
+                if i % 2 == 0 {
+                    w0.as_slice()
+                } else {
+                    w1.as_slice()
+                }
+            })
             .collect();
         assert!(emit_conv_rms_n_dw(13, &many, "/tmp/x.mil", "/tmp/x.out").is_err());
     }
@@ -6575,7 +6921,8 @@ mod tests {
             std::env::set_var("HWX_SIG_ANEC", "1");
             let img = emit_elementwise_chain(op1, op2, t_first, free_y, n, mil, out).unwrap();
             std::env::remove_var("HWX_SIG_ANEC");
-            let expect = std::fs::read(format!("{}/assets/{asset}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+            let expect =
+                std::fs::read(format!("{}/assets/{asset}", env!("CARGO_MANIFEST_DIR"))).unwrap();
             let diffs: Vec<usize> = (0..expect.len().min(img.len()))
                 .filter(|&i| img[i] != expect[i])
                 .collect();

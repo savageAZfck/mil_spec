@@ -58,8 +58,8 @@ fn main() {
     let outs: Vec<(&str, u64)> = vec![(out_name.as_str(), out_k)];
     let inouts: Vec<(&str, u64)> = vec![];
 
-    let prog = Program::compile_cfg(&mil, DeviceMask::Ane, &live, &outs, &inouts, &cc)
-        .expect("compile");
+    let prog =
+        Program::compile_cfg(&mil, DeviceMask::Ane, &live, &outs, &inouts, &cc).expect("compile");
     let inp: Vec<u16> = (0..in_k)
         .map(|i| half::f16::from_f32(((i % 16) + 1) as f32).to_bits())
         .collect();
@@ -75,7 +75,11 @@ fn main() {
     walk(&cache, &mut files);
     let mut bundle_dir: Option<PathBuf> = None;
     for f in &files {
-        println!("  cache file: {} ({} B)", f.display(), f.metadata().unwrap().len());
+        println!(
+            "  cache file: {} ({} B)",
+            f.display(),
+            f.metadata().unwrap().len()
+        );
         if f.extension().map(|e| e == "bundle").unwrap_or(false) {
             bundle_dir = Some(f.clone());
         }

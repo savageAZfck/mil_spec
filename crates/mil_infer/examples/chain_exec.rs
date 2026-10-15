@@ -56,7 +56,8 @@ fn main() {
             let w = u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
             let id = (w >> 16) & 0xff;
             let idx = w & 0xffff;
-            if w >> 24 == 0 && ((w >> 8) & 0xff) == 0 && (0x54..=0x64).contains(&id) && idx <= 0x20 {
+            if w >> 24 == 0 && ((w >> 8) & 0xff) == 0 && (0x54..=0x64).contains(&id) && idx <= 0x20
+            {
                 let nid = if mutate == 1 { 0x60 } else { id + 1 };
                 let nw = (nid << 16) | (w & 0xffff);
                 bytes[i..i + 4].copy_from_slice(&nw.to_le_bytes());

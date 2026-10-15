@@ -490,10 +490,8 @@ impl EspressoProgram {
                     // only when a non-zero perf-stats mask is present.
                     objc.ns_string("kANEFPerformanceStatsMask"),
                 ];
-                let mut vals: Vec<Id> = vec![
-                    objc.ns_string("kANEFModelPreCompiled"),
-                    objc.ns_int(0x7f),
-                ];
+                let mut vals: Vec<Id> =
+                    vec![objc.ns_string("kANEFModelPreCompiled"), objc.ns_int(0x7f)];
                 for (k, v) in extra {
                     keys.push(objc.ns_string(k));
                     vals.push(objc.ns_int(*v));

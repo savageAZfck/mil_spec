@@ -46,12 +46,19 @@ fn main() {
     let mutate: u32 = a.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
     let extra: Vec<(String, u64)> = a[3..]
         .iter()
-        .filter_map(|s| s.split_once('=').map(|(k, v)| (k.to_string(), v.parse().unwrap_or(1))))
+        .filter_map(|s| {
+            s.split_once('=')
+                .map(|(k, v)| (k.to_string(), v.parse().unwrap_or(1)))
+        })
         .collect();
     let extra_ref: Vec<(&str, u64)> = extra.iter().map(|(k, v)| (k.as_str(), *v)).collect();
 
     let is_dir = Path::new(&macho).is_dir();
-    let mut bytes = if is_dir { Vec::new() } else { std::fs::read(&macho).unwrap() };
+    let mut bytes = if is_dir {
+        Vec::new()
+    } else {
+        std::fs::read(&macho).unwrap()
+    };
     if mutate > 0 && !is_dir {
         let tmp = Path::new("/tmp/hwx_exec_mut.macho");
         let mut n = 0;
@@ -74,7 +81,8 @@ fn main() {
     }
     let path = std::env::var("HWX").unwrap_or(macho.clone());
 
-    let mut m = EspressoProgram::load_precompiled(Path::new(&path), &extra_ref).expect("load_precompiled");
+    let mut m =
+        EspressoProgram::load_precompiled(Path::new(&path), &extra_ref).expect("load_precompiled");
     println!(
         "loaded: ph={} inputs={:?} outputs={:?} procs={:?}",
         m.program_handle,
@@ -88,7 +96,10 @@ fn main() {
     }
     let d = m.input_descs[0].clone();
     let b = m.input_mut(0);
-    let fill_mode: u32 = std::env::var("FILL").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let fill_mode: u32 = std::env::var("FILL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     for k in 0..d.k {
         let off = d.offset(0, 0, k, 0, 0);
         let v = match fill_mode {
@@ -103,7 +114,12 @@ fn main() {
     let d = m.output_descs[0].clone();
     let out = m.output(0);
     let vals: Vec<f32> = (0..d.k.min(8))
-        .map(|k| f32_of(u16::from_le_bytes([out[d.offset(0, 0, k, 0, 0)], out[d.offset(0, 0, k, 0, 0) + 1]])))
+        .map(|k| {
+            f32_of(u16::from_le_bytes([
+                out[d.offset(0, 0, k, 0, 0)],
+                out[d.offset(0, 0, k, 0, 0) + 1],
+            ]))
+        })
         .collect();
     println!("out[0..8] = {vals:?}");
 }
