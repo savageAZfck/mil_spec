@@ -273,6 +273,7 @@ fn release(o: Id) {
 struct IoApi {
     get_base: unsafe extern "C" fn(Id) -> *mut c_void,
     alloc_size: unsafe extern "C" fn(Id) -> usize,
+    cf_retain: unsafe extern "C" fn(Id) -> Id,
     cf_release: unsafe extern "C" fn(Id),
 }
 
@@ -294,6 +295,7 @@ impl IoApi {
         Ok(IoApi {
             get_base: unsafe { std::mem::transmute(sym(hi, "IOSurfaceGetBaseAddress")?) },
             alloc_size: unsafe { std::mem::transmute(sym(hi, "IOSurfaceGetAllocSize")?) },
+            cf_retain: unsafe { std::mem::transmute(sym(hc, "CFRetain")?) },
             cf_release: unsafe { std::mem::transmute(sym(hc, "CFRelease")?) },
         })
     }
@@ -636,6 +638,53 @@ impl EspressoProgram {
             len: s.len,
             owned: false,
         };
+    }
+
+    /// Raw `IOSurfaceRef` of input `i` — opaque handle for
+    /// cross-program sharing via [`EspressoProgram::adopt_input`]
+    /// / [`EspressoProgram::adopt_output`].
+    pub fn input_surf(&self, i: usize) -> *mut c_void {
+        self.inputs[i].surf
+    }
+
+    /// Raw `IOSurfaceRef` of output `o`.
+    pub fn output_surf(&self, o: usize) -> *mut c_void {
+        self.outputs[o].surf
+    }
+
+    /// Bind input `i` onto a foreign `IOSurfaceRef` (e.g. another
+    /// program's output surface, obtained via `output_surf`). The
+    /// surface is retained, so either program may drop first.
+    pub fn adopt_input(&mut self, i: usize, foreign: *mut c_void) -> Result<(), EspError> {
+        Self::adopt(&self.objc, &self.io, &mut self.inputs[i], foreign)
+    }
+
+    /// Bind output `o` onto a foreign `IOSurfaceRef`. Same
+    /// retain/ownership rules as [`EspressoProgram::adopt_input`].
+    pub fn adopt_output(&mut self, o: usize, foreign: *mut c_void) -> Result<(), EspError> {
+        Self::adopt(&self.objc, &self.io, &mut self.outputs[o], foreign)
+    }
+
+    fn adopt(objc: &Objc, io: &IoApi, slot: &mut Surface, foreign: Id) -> Result<(), EspError> {
+        unsafe { (io.cf_retain)(foreign) };
+        let wrap =
+            unsafe { msg!((Id) -> Id)(objc.ane_surf, selp("objectWithIOSurface:"), foreign) };
+        if wrap.is_null() {
+            unsafe { (io.cf_release)(foreign) };
+            return Err(EspError::Msg("objectWithIOSurface nil".into()));
+        }
+        retain(wrap);
+        if slot.owned {
+            release(slot.wrap);
+            unsafe { (io.cf_release)(slot.surf) };
+        }
+        *slot = Surface {
+            surf: foreign,
+            wrap,
+            len: slot.len,
+            owned: true,
+        };
+        Ok(())
     }
 
     /// Raw bytes of output surface `i` after `eval`.
