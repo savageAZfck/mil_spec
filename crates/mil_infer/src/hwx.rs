@@ -5153,18 +5153,18 @@ pub fn emit_matmul(
 
 /// A compute op extracted from MIL text: op type, result shape, and
 /// the operand names we inspect (`x`/`y`/`weight`).
-struct MilOp {
-    op: String,
+pub(crate) struct MilOp {
+    pub(crate) op: String,
     /// Result tensor name (the lhs identifier).
-    result: String,
-    shape: Vec<i64>,
-    args: Vec<(String, String)>,
+    pub(crate) result: String,
+    pub(crate) shape: Vec<i64>,
+    pub(crate) args: Vec<(String, String)>,
 }
 
 /// Scan MIL text for compute ops (non-`const` declarations of the
 /// form `tensor<dtype, [shape]> name = op(arg = operand, ...)`) and
 /// blob-const bindings (`name = const()[..BLOBFILE(path = string("P"))]`).
-fn mil_ops(text: &str) -> (Vec<MilOp>, Vec<(String, String)>) {
+pub(crate) fn mil_ops(text: &str) -> (Vec<MilOp>, Vec<(String, String)>) {
     let mut ops = Vec::new();
     let mut blobs = Vec::new();
     // Op declarations may wrap after `=` — join continuation lines so
@@ -5253,14 +5253,23 @@ fn mil_ops(text: &str) -> (Vec<MilOp>, Vec<(String, String)>) {
 /// Parse the `func main<...>(tensor<fp16, [dims]> name, ...)` signature
 /// into `(name, shape)` pairs — operand shapes for ops whose inputs are
 /// function parameters (matmul's M lives on `x`, not the result).
-fn func_input_shapes(text: &str) -> Vec<(String, Vec<i64>)> {
+pub(crate) fn func_input_shapes(text: &str) -> Vec<(String, Vec<i64>)> {
     let mut out = Vec::new();
+    // the func signature may wrap across lines — accumulate until `{`
+    let mut in_sig = false;
     for raw in text.lines() {
         let line = raw.trim();
-        if !line.contains("func ") {
-            continue;
+        if !in_sig {
+            if !line.contains("func ") {
+                continue;
+            }
+            in_sig = true;
         }
-        let mut rest = line;
+        let (pre, done) = match line.find('{') {
+            Some(p) => (&line[..p], true),
+            None => (line, false),
+        };
+        let mut rest = pre;
         while let Some(t) = rest.find("tensor<") {
             let after = &rest[t + 7..];
             let Some(l) = after.find('[') else { break };
@@ -5278,14 +5287,16 @@ fn func_input_shapes(text: &str) -> Vec<(String, Vec<i64>)> {
             out.push((name, shape));
             rest = &after[l + r + 1..];
         }
-        break;
+        if done {
+            break;
+        }
     }
     out
 }
 
 /// Load the `u16` payload of a weight blob — deadbeef-headered blobs
 /// carry data at byte 128; bare files are read from offset 0.
-fn load_blob_u16(path: &std::path::Path) -> Result<Vec<u16>, String> {
+pub(crate) fn load_blob_u16(path: &std::path::Path) -> Result<Vec<u16>, String> {
     let b = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let off = if b.len() > 132 && &b[64..68] == b"\xef\xbe\xad\xde" {
         128
@@ -5300,7 +5311,7 @@ fn load_blob_u16(path: &std::path::Path) -> Result<Vec<u16>, String> {
 
 /// Resolve a `BLOBFILE` path — `@model_path/` prefixes and relative
 /// paths resolve against the MIL's directory.
-fn resolve_blob<'a>(mil_dir: &'a std::path::Path, p: &'a str) -> std::path::PathBuf {
+pub(crate) fn resolve_blob<'a>(mil_dir: &'a std::path::Path, p: &'a str) -> std::path::PathBuf {
     let p = p.strip_prefix("@model_path/").unwrap_or(p);
     let pb = std::path::PathBuf::from(p);
     if pb.is_absolute() {
@@ -5313,7 +5324,7 @@ fn resolve_blob<'a>(mil_dir: &'a std::path::Path, p: &'a str) -> std::path::Path
 /// Extract a scalar `fp16` const's bit pattern: `<ty> <name> =
 /// const()[val = fp16(V)]`. Returns `None` if `name` isn't declared
 /// as a scalar fp16 const (e.g. a blob tensor).
-fn mil_scalar_f16(text: &str, name: &str) -> Option<u16> {
+pub(crate) fn mil_scalar_f16(text: &str, name: &str) -> Option<u16> {
     for raw in text.lines() {
         let line = raw.trim();
         let Some(eq) = line.find(" = ") else { continue };
@@ -5331,7 +5342,7 @@ fn mil_scalar_f16(text: &str, name: &str) -> Option<u16> {
 
 /// Resolve a scalar `bool` const's value: `bool <name> =
 /// const()[val = bool(true|false)]`. `None` when not a bool const.
-fn mil_scalar_bool(text: &str, name: &str) -> Option<bool> {
+pub(crate) fn mil_scalar_bool(text: &str, name: &str) -> Option<bool> {
     for raw in text.lines() {
         let line = raw.trim();
         let Some(eq) = line.find(" = ") else { continue };

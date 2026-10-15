@@ -62,6 +62,9 @@ mod conv_ns_table;
 pub mod hwx;
 mod mm_ns_table;
 pub use hwx::{EwOp, FusedAct};
+/// Multi-op graph scheduler: MIL DAG -> per-op HWX programs wired by
+/// IOSurface adoption (`compile_graph` + `GraphRuntime`).
+pub mod graph;
 
 /// Which hardware units the model is allowed to use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
