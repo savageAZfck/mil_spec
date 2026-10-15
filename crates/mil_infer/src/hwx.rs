@@ -1619,8 +1619,264 @@ pub fn emit_matmul_ns(
     Ok(img)
 }
 
-/// Emit a complete HWX image for the fused chain
-/// `z = sigmoid(conv1x1(x, w))` — the real-model pattern — for `C=64`.
+// ------------------------------------------------------------------
+// Multi-task composition: conv1x1 chains
+// ------------------------------------------------------------------
+//
+// ANEC compiles a chain of K independent conv1x1 ops into ONE Mach-O:
+// a single `__KERN_0` holding the concatenated per-task weight streams
+// and a `__TEXT.__text` task table of per-task records (0x30-byte
+// header, then first 0x190 / middle 0x160 / last 0x170-byte records —
+// the i=1 record forms are one u32 shorter). The intermediate buffers
+// use a small fixed set of descriptor ids: `0x55` for the first
+// intermediate, `0x56` for middle ones, and `0x64` (`0x63` when it is
+// the only intermediate) for the buffer feeding the last task, with
+// `0xfff820`/`0xfff860`+`0x04000000` tail variants for the same split.
+// Everything else is the single-op machinery: same 13-command
+// envelope, `x`/output binds, per-task kernel families in the symtab
+// (each task's name = [`conv_kernel_name_ns`] over its own blob data
+// offset), `nreloc = K` pointing at each record's kernel-offset word.
+//
+// Templates are sliced from the captured `c64k4`/`c64k2` corpus; the
+// emitter patches every task-index/chain-length-dependent field.
+
+/// `c64k4` reference: `__text` at file offset `0x8000`, size `0x5f0`.
+const SKELETON_CHAIN4: &[u8] = include_bytes!("../assets/chain/c64k4.hwx");
+/// `c64k2` reference: `__text` at file offset `0x4000`, size `0x32c`;
+/// supplies the short i=1 last-task record variant (0x16c).
+const SKELETON_CHAIN2: &[u8] = include_bytes!("../assets/chain/c64k2.hwx");
+
+/// `__text` task-table header (`+0x2c` carries the multi-task flag).
+const CHAIN4_TEXT: usize = 0x8000;
+const CHAIN2_TEXT: usize = 0x4000;
+/// The signature/argv load command begins at `0x2690`; everything
+/// before it is the command prefix (`pre`) reused verbatim.
+const CHAIN_PRE_OFF: usize = 0x2690;
+
+/// Intermediate-buffer descriptor tail for a non-last record.
+/// `feeder` selects the variant used by the buffer consumed by the
+/// last task (`0x64` id + `0xfff860`/`0x04000000`); `sole` is the
+/// k==2 first-record special case (`0x63` id).
+fn chain_out_desc(rec: &mut [u8], i: usize, k: usize) {
+    let sole = k == 2;
+    let feeder = i == k - 2;
+    let id: u32 = if feeder && sole {
+        0x63
+    } else if feeder {
+        0x64
+    } else if i == 0 {
+        0x55
+    } else {
+        0x56
+    };
+    // desc offsets differ between the first record (0x190) and the
+    // middle records (0x160)
+    let base = rec.len() - 0x30;
+    put_u32(rec, base + 0x10, (id << 16) | (i as u32 + 1));
+    put_u32(rec, base + 0x18, if feeder { 0x0400_0000 } else { 0 });
+    put_u32(rec, base + 0x20, if feeder { 0xfff860 } else { 0xfff820 });
+    put_u32(rec, base + 0x2c, if feeder { 0 } else { 1 });
+}
+
+/// Emit a complete HWX image for a chain of `k` identical `conv1x1`
+/// ops (`Cin == Cout == 64`), where task `i` consumes task `i-1`'s
+/// output — the multi-task analogue of [`emit_conv1x1_ns`]. `weights`
+/// is `k` consecutive `[64,64]` fp16 matrices; each task's stream is
+/// [`weight_layout_ns`] at `__KERN_0` offset `i * 0x2000`, and its
+/// kernel family name hashes the blob data offset `0x80 + i * 0x2040`.
+/// `out_name` is the network output symbol (`y{k}` in the corpus).
+pub fn emit_conv_chain64(
+    k: usize,
+    weights: &[u16],
+    out_name: &str,
+    mil_path: &str,
+    out_path: &str,
+) -> Result<Vec<u8>, String> {
+    if k < 2 {
+        return Err("chain emitter needs >=2 tasks".into());
+    }
+    if weights.len() < k * 4096 {
+        return Err(format!("expected {} weights, got {}", k * 4096, weights.len()));
+    }
+
+    let kern_va: u64 = 0x3001_0000;
+    let rec_lens = |i: usize| -> usize {
+        match (i, k) {
+            (0, _) => 0x190,
+            (i, k) if i == k - 1 => {
+                if i == 1 {
+                    0x16c
+                } else {
+                    0x170
+                }
+            }
+            _ => 0x160,
+        }
+    };
+
+    // ---- __text: header + task records ------------------------------
+    let mut text = SKELETON_CHAIN4[CHAIN4_TEXT..CHAIN4_TEXT + 0x30].to_vec();
+    put_u32(&mut text, 0x2c, 1); // multi-task flag
+    let mut relocs: Vec<[u8; 8]> = Vec::with_capacity(k);
+    let mut rec_base = 0x30usize;
+    for i in 0..k {
+        let last = i == k - 1;
+        let (mut rec, reloc_off) = if i == 0 {
+            (
+                SKELETON_CHAIN4[CHAIN4_TEXT + 0x30..CHAIN4_TEXT + 0x1c0].to_vec(),
+                0x150usize,
+            )
+        } else if last && i == 1 {
+            (
+                SKELETON_CHAIN2[CHAIN2_TEXT + 0x1c0..CHAIN2_TEXT + 0x32c].to_vec(),
+                0x150usize,
+            )
+        } else if last {
+            (
+                SKELETON_CHAIN4[CHAIN4_TEXT + 0x480..CHAIN4_TEXT + 0x5f0].to_vec(),
+                0x154usize,
+            )
+        } else if i == 1 {
+            (
+                SKELETON_CHAIN4[CHAIN4_TEXT + 0x1c0..CHAIN4_TEXT + 0x320].to_vec(),
+                0x12cusize,
+            )
+        } else {
+            (
+                SKELETON_CHAIN4[CHAIN4_TEXT + 0x320..CHAIN4_TEXT + 0x480].to_vec(),
+                0x130usize,
+            )
+        };
+        // shared head fields
+        put_u32(&mut rec, 0x00, if last { 0x0005_0009 } else { 0x0005_0001 });
+        put_u32(&mut rec, 0x08, 0x10240 + (i as u32) * 0x10000 + if last { 0x80 } else { 0 });
+        for j in 0..16 {
+            let o = 0x0c + j * 4 + if j >= 9 { 4 } else { 0 };
+            put_u32(&mut rec, o, 0x21 + (i as u32) * 0x10000);
+        }
+        // input-side descriptor: mid/last records for i>=2 carry the
+        // `0x104, 0x400*(i-1)` word pair; the i=1 forms collapse them
+        // into the single `0x120` word (template already carries it).
+        if i >= 2 {
+            put_u32(&mut rec, 0x108, 0x400 * (i as u32 - 1));
+            put_u32(&mut rec, 0x118, 0x400 * i as u32);
+        }
+        if last {
+            // network-output tail: task marker + kern stream offset
+            let e0 = if i == 1 { 0x13c } else { 0x140 };
+            put_u32(&mut rec, e0, ((i as u32) << 16) | 0xe0);
+            let kf = if i == 1 { 0x150 } else { 0x154 };
+            put_u32(&mut rec, kf, 0x2000 * i as u32);
+            let lastw = rec.len() - 4;
+            put_u32(&mut rec, lastw, 0x0100_0031 + (i as u32) * 0x10000);
+        } else {
+            if i == 1 {
+                put_u32(&mut rec, 0x12c, 0x2000 * i as u32);
+            } else if i > 1 {
+                put_u32(&mut rec, 0x130, 0x2000 * i as u32);
+            }
+            chain_out_desc(&mut rec, i, k);
+        }
+        relocs.push([
+            (rec_base + reloc_off) as u8,
+            ((rec_base + reloc_off) >> 8) as u8,
+            ((rec_base + reloc_off) >> 16) as u8,
+            ((rec_base + reloc_off) >> 24) as u8,
+            0x05,
+            0,
+            0,
+            0x07,
+        ]);
+        rec_base += rec_lens(i);
+        text.extend_from_slice(&rec);
+    }
+    let textlen = text.len();
+
+    // ---- symtab entries ---------------------------------------------
+    let (stream0, lane_off, _) = weight_layout_ns(&weights[..4096], 64, 64);
+    let _ = stream0;
+    let mut entries: Vec<(String, u8, u8, u16, u64)> =
+        Vec::with_capacity(27 + 16 * k);
+    entries.push(("x".into(), 0x0f, 1, 0, 0x3000_0000));
+    entries.push((out_name.into(), 0x0f, 2, 0, 0x3000_4000));
+    // ANEC orders the table x, out, then every family's primary `ne_0`
+    // (desc=2), then each family's remaining `ne_1..15` lanes.
+    let knames: Vec<String> = (0..k)
+        .map(|i| conv_kernel_name_ns(64, 64, 0x80 + i as u64 * 0x2040))
+        .collect();
+    for (i, kn) in knames.iter().enumerate() {
+        entries.push((
+            format!("{kn}_ne_0"),
+            0x0f,
+            5,
+            2,
+            kern_va + (i * 0x2000 + lane_off[0]) as u64,
+        ));
+    }
+    for (i, kn) in knames.iter().enumerate() {
+        for j in 1..16 {
+            entries.push((
+                format!("{kn}_ne_{j}"),
+                0x0f,
+                5,
+                0,
+                kern_va + (i * 0x2000 + lane_off[j]) as u64,
+            ));
+        }
+    }
+    for ty in TYPE_SYMS {
+        entries.push(((*ty).into(), 0x80, 0, 0, 0));
+    }
+    entries.push((layout_desc("x", 24, 64), 0x20, 0, 0x18, 0));
+    entries.push((layout_desc(out_name, 29, 64), 0x20, 0, 0x1d, 0));
+
+    // ---- envelope: prefix + generated tail ---------------------------
+    let const2_span = textlen.div_ceil(0x40) * 0x40;
+    let kern_bytes = k * 0x2000;
+    let kern_vsz = kern_bytes.div_ceil(0x4000) * 0x4000;
+    let pre = &SKELETON_CHAIN4[..CHAIN_PRE_OFF];
+    let (mut img, text_off) =
+        build_tail_at_reloc(pre, CHAIN_PRE_OFF, &entries, &relocs, mil_path, out_path, 0x218);
+    let const2_fo = text_off + const2_span;
+    let kern_fo = text_off + 0x8000;
+    let const2_va = 0x3000_8000u64 + const2_span as u64;
+
+    put_u64(&mut img, 0x1c0, text_off as u64); // __TEXT seg fileoff
+    put_u64(&mut img, 0x208, textlen as u64); // __text sect size
+    put_u32(&mut img, 0x210, text_off as u32); // __text sect offset
+    put_u32(&mut img, 0x21c, k as u32); // __text nreloc
+    put_u64(&mut img, 0x250, const2_va); // __const sect addr
+    put_u32(&mut img, 0x260, const2_fo as u32); // __const sect offset
+    put_u64(&mut img, 0x2a0, kern_vsz as u64); // __KERN_0 vmsize
+    put_u64(&mut img, 0x2a8, kern_fo as u64); // __KERN_0 fileoff
+    put_u64(&mut img, 0x2b0, kern_vsz as u64); // __KERN_0 filesize
+    put_u64(&mut img, 0x2f0, kern_bytes as u64); // __kern_0 sect size
+    put_u32(&mut img, 0x2f8, kern_fo as u32); // __kern_0 sect offset
+    // bind1 (network output) +0x18 carries a symbol-table reference:
+    // (0x30 + k) in the high byte — same `k + 0x30` as cmd 0x4 #3.
+    put_u32(&mut img, 0x350, ((0x30 + k as u32) << 8) | 0x79);
+    put_u32(&mut img, 0x378, const2_va as u32); // cmd 0x4 #1: const VA
+    put_u32(&mut img, 0xb7c, (textlen / 4) as u32); // cmd 0x4 #1: text words
+    put_u32(&mut img, 0xb88, k as u32); // cmd 0x4 #1: task count
+    put_u32(&mut img, 0xbb8, (14 * k + 3) as u32); // cmd 0x4 #1: sched count
+    put_u32(&mut img, 0x267c, 0x4030_7900 + (k as u32) * 0x10000);
+    put_u32(&mut img, 0x2688, (0x30 + k) as u32);
+
+    // ---- section contents --------------------------------------------
+    img.resize(text_off, 0);
+    img.extend_from_slice(&text);
+    img.resize(kern_fo, 0);
+    for i in 0..k {
+        let (stream, _, _) =
+            weight_layout_ns(&weights[i * 4096..(i + 1) * 4096], 64, 64);
+        for v in &stream {
+            img.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    img.resize(kern_fo + kern_vsz, 0);
+    Ok(img)
+}
+
 ///
 /// `__KERN_0` layout differs from bare conv: sixteen bands of
 /// `0x280` bytes each, `[0x80 sigmoid LUT][0x200 band weights]`
@@ -5375,6 +5631,56 @@ mod tests {
                 .map(|i| i as i64)
                 .unwrap_or(-1)
         );
+    }
+
+    /// Multi-task program emission: `k` chained conv1x1(64→64) ops
+    /// in one Mach-O — task-table records, per-task kernel families,
+    /// `nreloc = k`, intermediate-buffer descriptor classes. Verified
+    /// byte-for-byte against the ANEC chain corpus (weights are the
+    /// probe ramp `w[j] = (j + i*7919) % 65536` per task `i`).
+    #[test]
+    fn conv_chain64_byte_identical() {
+        let _g = SIG_LOCK.lock().unwrap();
+        std::env::set_var("HWX_SIG_ANEC", "1");
+        for k in [2usize, 3, 4] {
+            let mut weights = Vec::with_capacity(k * 4096);
+            for i in 0..k {
+                for j in 0..4096u32 {
+                    weights.push(((j + i as u32 * 7919) % 65536) as u16);
+                }
+            }
+            let img = emit_conv_chain64(
+                k,
+                &weights,
+                &format!("y{k}"),
+                &format!("/tmp/chain/c64k{k}/net.mil"),
+                &format!("/tmp/chain/c64k{k}/out/net.macho"),
+            )
+            .unwrap();
+            let expect = std::fs::read(format!(
+                "{}/assets/chain/c64k{k}.hwx",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap();
+            assert_eq!(
+                img.len(),
+                expect.len(),
+                "c64k{k}: len {} vs {}",
+                img.len(),
+                expect.len()
+            );
+            assert_eq!(
+                img,
+                expect,
+                "c64k{k}: first diff at {:#x}",
+                img.iter()
+                    .zip(&expect)
+                    .position(|(a, b)| a != b)
+                    .map(|i| i as i64)
+                    .unwrap_or(-1)
+            );
+        }
+        std::env::remove_var("HWX_SIG_ANEC");
     }
 
     /// Arbitrary io names on the conv family: same-sort, reordered,
