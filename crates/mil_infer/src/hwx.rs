@@ -5035,6 +5035,57 @@ pub fn emit_repack64(mil_path: &str, out_path: &str) -> Vec<u8> {
     )
 }
 
+/// 128-wide repack `transpose(x=[1,128,1,1], perm=[0,2,3,1])` →
+/// `z[1,1,1,128]` — FFN intermediate width counterpart of
+/// [`emit_repack64`].
+const SKELETON_RPK128: &[u8] = include_bytes!("../assets/rpk128_skeleton.hwx");
+
+pub fn emit_repack128(mil_path: &str, out_path: &str) -> Vec<u8> {
+    let (entries, relocs) = tail_meta(SKELETON_RPK128);
+    rebuild_tail_at(
+        SKELETON_RPK128,
+        0x25f0,
+        &entries,
+        &relocs,
+        mil_path,
+        out_path,
+    )
+}
+
+/// Strided `sigmoid(x=[1,128,1,1])` — elementwise on the channel axis,
+/// same plane layout as the strided vectors; fits `gate·σ(gate)` SiLU
+/// without leaving the strided currency.
+const SKELETON_SIG128: &[u8] = include_bytes!("../assets/sig128_skeleton.hwx");
+
+pub fn emit_sigmoid128(mil_path: &str, out_path: &str) -> Vec<u8> {
+    let (entries, relocs) = tail_meta(SKELETON_SIG128);
+    rebuild_tail_at(
+        SKELETON_SIG128,
+        0x2688,
+        &entries,
+        &relocs,
+        mil_path,
+        out_path,
+    )
+}
+
+/// Strided `mul(x=[1,128,1,1], y=[1,128,1,1])` — SiLU's multiply.
+const SKELETON_MUL128: &[u8] = include_bytes!("../assets/mul128_skeleton.hwx");
+
+pub fn emit_mul128(mil_path: &str, out_path: &str) -> Vec<u8> {
+    let (entries, relocs) = tail_meta(SKELETON_MUL128);
+    rebuild_tail_at_text(
+        SKELETON_MUL128,
+        0x33f0,
+        0x8000,
+        &entries,
+        &relocs,
+        mil_path,
+        out_path,
+    )
+    .expect("mul128 tail fits under __text")
+}
+
 /// Emit the attn·V matvec for `(t, d)` pairs on the skeleton table.
 pub fn emit_attn_v(t: u32, d: u32, mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> {
     let skel = match (t, d) {
