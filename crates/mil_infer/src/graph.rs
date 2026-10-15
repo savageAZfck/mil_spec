@@ -355,7 +355,7 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
             "sigmoid" | "tanh" | "relu" => {
                 let x = arg_of(o, "x").unwrap_or("x").to_string();
                 let img = match o.op.as_str() {
-                    "sigmoid" if elems == 128 || elems == 256 => emit_sigmoid_strided(
+                    "sigmoid" if matches!(elems, 128 | 256 | 512 | 1024) => emit_sigmoid_strided(
                         elems,
                         mil_path,
                         &format!("{out_dir}/.tmps_{}", o.result),
@@ -490,17 +490,17 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
                 // y a vector) vs attn·V (x strided scores, y packed
                 // cache rows). Distinguish by y's shape: a lone trailing
                 // dim means the vector form.
-                let y_spatial: Vec<i64> = ys.iter().skip(1).copied().collect();
-                let y_widem = y_spatial.iter().filter(|d| **d > 1).count();
+                let y_widem = ys.iter().skip(1).filter(|d| **d > 1).count();
                 let xt = xs
                     .get(1)
                     .copied()
                     .unwrap_or(1)
                     .max(1)
                     .max(xs.get(2).copied().unwrap_or(1).max(1));
-                if tx && xs.len() == 4 && ys.len() == 4 && y_widem == 1 && ys[3] > 1 {
-                    // outer: x=[1,T,1,1] strided one-hot, y=[1,1,1,D]
-                    let (t, d) = (xt as u32, ys[3] as u32);
+                if tx && xs.len() == 4 && ys.len() == 4 && y_widem == 1 {
+                    // outer: x=[1,T,1,1] strided one-hot, y a D-vector
+                    // (declared `[1,1,1,D]` or strided `[1,D,1,1]`)
+                    let (t, d) = (xt as u32, ys[1].max(ys[3]).max(1) as u32);
                     let img =
                         emit_outer_t(t, d, mil_path, &format!("{out_dir}/.tmpo_{}", o.result))?;
                     let idx = push_prog(&mut nodes, &mut created, o.result.clone(), img, out_dir)?;
@@ -518,12 +518,16 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
                 } else if ty
                     && xs.len() == 4
                     && ys.len() == 4
-                    && xs[..3] == [1, 1, 1]
                     && ys[0] == 1
+                    && ys[1] > 1
                     && ys[2] == 1
-                    && xs[3] == ys[3]
+                    && ys[3] > 1
+                    && xs.iter().skip(1).filter(|d| **d > 1).count() == 1
+                    && xs[1].max(xs[3]) == ys[3]
                 {
-                    let (r, k) = (ys[1].max(1) as u32, xs[3].max(1) as u32);
+                    // broadcast matvec: a vector (contig `[1,1,1,K]` or
+                    // strided `[1,K,1,1]`) x matrix rows `[1,R,1,K]`
+                    let (r, k) = (ys[1].max(1) as u32, ys[3].max(1) as u32);
                     let img = emit_avw(r, k, mil_path, &format!("{out_dir}/.tmpa_{}", o.result));
                     let idx = push_prog(&mut nodes, &mut created, o.result.clone(), img, out_dir)?;
                     prod.insert(o.result.clone(), (idx, Cur::Strided(r)));
@@ -714,6 +718,14 @@ impl GraphRuntime {
     pub fn out_desc(&self, i: usize) -> crate::espresso::TensorDesc {
         self.progs[i].as_ref().unwrap().output_descs[0].clone()
     }
+    /// Node index by node/result name (internal intermediates too).
+    pub fn node_named(&self, name: &str) -> Option<usize> {
+        self.plan.nodes.iter().position(|n| match n {
+            Node::Prog { name: n2, .. } => n2 == name,
+            Node::Host(_) => false,
+        })
+    }
+
     pub fn out_node(&self, name: &str) -> Option<usize> {
         self.plan
             .outputs

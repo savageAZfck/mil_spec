@@ -77,6 +77,13 @@ fn main() {
         &format!("{dir}/gam.bin"),
         &vec![f16::from_f32(1.0).to_bits(); D],
     );
+    // half-rotation permutation matrix: Perm[j][k] = delta(j, k ^ 32)
+    blob(
+        &format!("{dir}/perm.bin"),
+        &(0..D * D)
+            .map(|i| f16::from_f32(if (i / D) == ((i % D) ^ 32) { 1.0 } else { 0.0 }).to_bits())
+            .collect::<Vec<_>>(),
+    );
 
     let mil = format!(
         r#"program(1.3)
@@ -85,7 +92,9 @@ fn main() {
                      tensor<fp16, [1, 256, 1, 1]> e_t,
                      tensor<fp16, [1, 256, 1, 1]> msk,
                      tensor<fp16, [1, 256, 1, 64]> kcache,
-                     tensor<fp16, [1, 256, 1, 64]> vcache) {{
+                     tensor<fp16, [1, 256, 1, 64]> vcache,
+                     tensor<fp16, [1, 64, 1, 1]> cos_t,
+                     tensor<fp16, [1, 64, 1, 1]> sin_t) {{
         tensor<fp16, [64, 64]> Wq = const()[val = tensor<fp16, [64, 64]>(BLOBFILE(path = string("{dir}/wq.bin"), offset = uint64(0)))];
         tensor<fp16, [64, 64]> Wk = const()[val = tensor<fp16, [64, 64]>(BLOBFILE(path = string("{dir}/wk.bin"), offset = uint64(0)))];
         tensor<fp16, [64, 64]> Wv = const()[val = tensor<fp16, [64, 64]>(BLOBFILE(path = string("{dir}/wv.bin"), offset = uint64(0)))];
@@ -98,15 +107,25 @@ fn main() {
         tensor<int32, []> ax1 = const()[val = int32(1)];
         tensor<bool, []> bt = const()[val = bool(true)];
 
+        tensor<fp16, [64, 64]> Perm = const()[val = tensor<fp16, [64, 64]>(BLOBFILE(path = string("{dir}/perm.bin"), offset = uint64(0)))];
         tensor<fp16, [1, 64, 1, 1]> xn1 = rms_norm(x = x, w = gam1, eps = fp16(0.00001))[name = string("xn1")];
         tensor<fp16, [1, 1, 1, 64]> q = matmul(x = xn1, y = Wq, transpose_y = bt)[name = string("q")];
         tensor<fp16, [1, 1, 1, 64]> kk = matmul(x = xn1, y = Wk, transpose_y = bt)[name = string("kk")];
         tensor<fp16, [1, 1, 1, 64]> vv = matmul(x = xn1, y = Wv, transpose_y = bt)[name = string("vv")];
-        tensor<fp16, [1, 256, 1, 64]> ek = matmul(x = e_t, y = kk, transpose_x = bt)[name = string("ek")];
+        // RoPE: v_r = v*cos_t + perm(v)*sin_t   (sign folded into sin_t)
+        tensor<fp16, [1, 1, 1, 64]> qp = matmul(x = q, y = Perm, transpose_y = bt)[name = string("qp")];
+        tensor<fp16, [1, 64, 1, 1]> qc = mul(x = q, y = cos_t)[name = string("qc")];
+        tensor<fp16, [1, 64, 1, 1]> qps = mul(x = qp, y = sin_t)[name = string("qps")];
+        tensor<fp16, [1, 64, 1, 1]> qr = add(x = qc, y = qps)[name = string("qr")];
+        tensor<fp16, [1, 1, 1, 64]> kp = matmul(x = kk, y = Perm, transpose_y = bt)[name = string("kp")];
+        tensor<fp16, [1, 64, 1, 1]> kc = mul(x = kk, y = cos_t)[name = string("kc")];
+        tensor<fp16, [1, 64, 1, 1]> kps = mul(x = kp, y = sin_t)[name = string("kps")];
+        tensor<fp16, [1, 64, 1, 1]> kr = add(x = kc, y = kps)[name = string("kr")];
+        tensor<fp16, [1, 256, 1, 64]> ek = matmul(x = e_t, y = kr, transpose_x = bt)[name = string("ek")];
         tensor<fp16, [1, 256, 1, 64]> ev = matmul(x = e_t, y = vv, transpose_x = bt)[name = string("ev")];
         tensor<fp16, [1, 256, 1, 64]> knew = add(x = kcache, y = ek)[name = string("knew")];
         tensor<fp16, [1, 256, 1, 64]> vnew = add(x = vcache, y = ev)[name = string("vnew")];
-        tensor<fp16, [1, 256, 1, 1]> s = matmul(x = q, y = knew, transpose_y = bt)[name = string("s")];
+        tensor<fp16, [1, 256, 1, 1]> s = matmul(x = qr, y = knew, transpose_y = bt)[name = string("s")];
         tensor<fp16, [1, 256, 1, 1]> sm2 = add(x = s, y = msk)[name = string("sm2")];
         tensor<fp16, [1, 256, 1, 1]> p = softmax(x = sm2, axis = ax1)[name = string("p")];
         tensor<fp16, [1, 1, 1, 64]> aout = matmul(x = p, y = vnew, transpose_x = bt)[name = string("aout")];
@@ -172,6 +191,31 @@ fn main() {
                 }
             }
         });
+        // RoPE tables for this position: theta_i = base^{-2i/d}
+        let (half, base) = (D / 2, 10000f32);
+        let ang = |i: usize| (step as f32) * base.powf(-2.0 * (i % half) as f32 / D as f32);
+        let cosv: Vec<f32> = (0..D).map(|i| ang(i).cos()).collect();
+        let sinv: Vec<f32> = (0..D)
+            .map(|i| if i < half { -1.0 } else { 1.0 } * ang(i).sin())
+            .collect();
+        let cv = cosv.clone();
+        rt.write_ext("cos_t", move |b, d| {
+            for i in 0..D {
+                let o = d.offset(0, 0, i as u64, 0, 0);
+                if o + 2 <= b.len() {
+                    b[o..o + 2].copy_from_slice(&f16::from_f32(cv[i]).to_le_bytes());
+                }
+            }
+        });
+        let sv = sinv.clone();
+        rt.write_ext("sin_t", move |b, d| {
+            for i in 0..D {
+                let o = d.offset(0, 0, i as u64, 0, 0);
+                if o + 2 <= b.len() {
+                    b[o..o + 2].copy_from_slice(&f16::from_f32(sv[i]).to_le_bytes());
+                }
+            }
+        });
         rt.write_ext("msk", move |b, d| {
             for i in 0..T_MAX {
                 let o = d.offset(0, 0, i as u64, 0, 0);
@@ -182,7 +226,31 @@ fn main() {
                 }
             }
         });
+        let t0 = std::time::Instant::now();
         rt.run().expect("run");
+        if std::env::var("GP_DIAG").is_ok() {
+            for nm in ["q", "qp", "qr", "kk", "kp", "kr", "s", "p"] {
+                if let Some(ni) = rt.node_named(nm) {
+                    let d = rt.out_desc(ni);
+                    let b = rt.output(ni);
+                    let mut v = Vec::new();
+                    for c in 0..6u64 {
+                        let o = if d.k > 1 {
+                            d.offset(0, 0, c, 0, 0)
+                        } else {
+                            d.offset(0, 0, 0, 0, c)
+                        };
+                        if o + 2 <= b.len() {
+                            v.push(f32_of(u16::from_le_bytes([b[o], b[o + 1]])));
+                        }
+                    }
+                    println!("  {nm}: {:?} (desc k{}h{}w{})", v, d.k, d.h, d.w);
+                }
+            }
+        }
+        if step == 2 {
+            println!("run() took {:?}", t0.elapsed());
+        }
 
         // ---- CPU reference ----
         let mm = |wtag: u8, v: &[f32], n: usize, k: usize| -> Vec<f32> {
@@ -196,9 +264,18 @@ fn main() {
                 .recip()
         };
         let xnr: Vec<f32> = x.iter().map(|a| a * rms(&x)).collect();
-        let qr = mm(b'q', &xnr, D, D);
-        let kr = mm(b'k', &xnr, D, D);
+        let mut qr = mm(b'q', &xnr, D, D);
+        let mut kr = mm(b'k', &xnr, D, D);
         let vr = mm(b'v', &xnr, D, D);
+        // rope: r[i] = v[i]*cos + v[i^half]*sin_signed
+        let rope = |v: &mut Vec<f32>| {
+            let orig = v.clone();
+            for i in 0..D {
+                v[i] = orig[i] * cosv[i] + orig[i ^ half] * sinv[i];
+            }
+        };
+        rope(&mut qr);
+        rope(&mut kr);
         kref[step] = kr;
         vref[step] = vr;
         let sc_r: Vec<f32> = (0..T_MAX)

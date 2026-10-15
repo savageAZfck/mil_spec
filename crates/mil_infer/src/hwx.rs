@@ -4961,6 +4961,8 @@ const SKELETON_AV1024X128: &[u8] = include_bytes!("../assets/attnv_1024x128_skel
 /// append (`cache += outer(e_t, kv_t)` via a flat ew add).
 const SKELETON_OUTER64: &[u8] = include_bytes!("../assets/outer64_skeleton.hwx");
 const SKELETON_OUTER256: &[u8] = include_bytes!("../assets/outer256_skeleton.hwx");
+const SKELETON_OUTER512: &[u8] = include_bytes!("../assets/outer512_skeleton.hwx");
+const SKELETON_OUTER1024: &[u8] = include_bytes!("../assets/outer1024_skeleton.hwx");
 
 /// Emit the outer-product row scatter for `(t, d)` on the skeleton
 /// table — `t` is the cache/frame length, `d` the channel width.
@@ -4968,6 +4970,8 @@ pub fn emit_outer_t(t: u32, d: u32, mil_path: &str, out_path: &str) -> Result<Ve
     let skel = match (t, d) {
         (64, 64) => SKELETON_OUTER64,
         (256, 64) => SKELETON_OUTER256,
+        (512, 64) => SKELETON_OUTER512,
+        (1024, 64) => SKELETON_OUTER1024,
         _ => return Err(format!("outer ({t},{d}) off skeleton table")),
     };
     let (entries, relocs) = tail_meta(skel);
@@ -4987,12 +4991,16 @@ pub fn emit_outer(mil_path: &str, out_path: &str) -> Vec<u8> {
 /// KV-append slot (`cache += outer(e_t, kv_t)` in place via aliasing).
 const SKELETON_ADD4D64: &[u8] = include_bytes!("../assets/add4d64_skeleton.hwx");
 const SKELETON_ADD4D256: &[u8] = include_bytes!("../assets/add4d256_skeleton.hwx");
+const SKELETON_ADD4D512: &[u8] = include_bytes!("../assets/add4d512_skeleton.hwx");
+const SKELETON_ADD4D1024: &[u8] = include_bytes!("../assets/add4d1024_skeleton.hwx");
 
 /// Packed 4-D add on `[1,T,1,D]` for `(t,d)` on the skeleton table.
 pub fn emit_add4d(t: u32, d: u32, mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> {
     let skel = match (t, d) {
         (64, 64) => SKELETON_ADD4D64,
         (256, 64) => SKELETON_ADD4D256,
+        (512, 64) => SKELETON_ADD4D512,
+        (1024, 64) => SKELETON_ADD4D1024,
         _ => return Err(format!("add4d ({t},{d}) off skeleton table")),
     };
     let (entries, relocs) = tail_meta(skel);
@@ -5055,6 +5063,8 @@ pub fn emit_repack128(mil_path: &str, out_path: &str) -> Vec<u8> {
 
 /// 256-wide repack — same transpose task at FFN width 256.
 const SKELETON_RPK256: &[u8] = include_bytes!("../assets/rpk256_skeleton.hwx");
+const SKELETON_RPK512: &[u8] = include_bytes!("../assets/rpk512_skeleton.hwx");
+const SKELETON_RPK1024: &[u8] = include_bytes!("../assets/rpk1024_skeleton.hwx");
 
 /// Strided `[1,N,1,1]` -> contiguous `[1,1,1,N]` repack for `n` on the
 /// skeleton table `{64,128,256}`.
@@ -5063,6 +5073,8 @@ pub fn emit_repack(n: u32, mil_path: &str, out_path: &str) -> Result<Vec<u8>, St
         64 => SKELETON_REPACK64,
         128 => SKELETON_RPK128,
         256 => SKELETON_RPK256,
+        512 => SKELETON_RPK512,
+        1024 => SKELETON_RPK1024,
         _ => return Err(format!("repack n={n} off skeleton table")),
     };
     let (entries, relocs) = tail_meta(skel);
@@ -5076,6 +5088,8 @@ pub fn emit_repack(n: u32, mil_path: &str, out_path: &str) -> Result<Vec<u8>, St
 /// without leaving the strided currency.
 const SKELETON_SIG128: &[u8] = include_bytes!("../assets/sig128_skeleton.hwx");
 const SKELETON_SIG256: &[u8] = include_bytes!("../assets/sig256_skeleton.hwx");
+const SKELETON_SIG512: &[u8] = include_bytes!("../assets/sig512_skeleton.hwx");
+const SKELETON_SIG1024: &[u8] = include_bytes!("../assets/sig1024_skeleton.hwx");
 
 /// Strided sigmoid `[1,N,1,1]` for `n` on the skeleton table
 /// `{128,256}`.
@@ -5083,6 +5097,8 @@ pub fn emit_sigmoid_strided(n: u32, mil_path: &str, out_path: &str) -> Result<Ve
     let skel = match n {
         128 => SKELETON_SIG128,
         256 => SKELETON_SIG256,
+        512 => SKELETON_SIG512,
+        1024 => SKELETON_SIG1024,
         _ => return Err(format!("sigmoid strided n={n} off skeleton table")),
     };
     let (entries, relocs) = tail_meta(skel);
