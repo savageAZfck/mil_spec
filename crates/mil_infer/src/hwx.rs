@@ -1321,6 +1321,304 @@ pub fn emit_conv1x1_ns(
     Ok(img)
 }
 
+/// Non-square const-weight matmul skeleton: `matmul(x, w, transpose_y)`
+/// with x `[1,1,1,K]`, w `[1,N,1,K]` → z `[1,1,1,N]` (the M=1
+/// vector-matrix form transformer projections lower to). Same
+/// 43-symbol program envelope as the conv family — the `__KERN_0`
+/// stream is [`weight_layout_ns`]`(w, K, N)` byte-for-byte — but a
+/// distinct `__text` record (0x24c) and kernel-name record (383 B).
+const SKELETON_MM_NS: &[u8] = include_bytes!("../assets/mmns64x32_reference.hwx");
+
+/// Narrow-output `__text` template (`ceil(N/16) in 5..=8`): the std
+/// record minus the `0x1d8` f128 word (0x248 bytes), with the regime
+/// marker `0x91418005` at `0x1c0`.
+const MM_NS_TEXT_NARROW: &[u8] = include_bytes!("../assets/mm_ns_text_narrow.bin");
+
+/// `(f14, pad, big)` scheduler scalars for the matmul plan: tabled
+/// over the swept multiples-of-32 grid in
+/// [`crate::mm_ns_table::MM_NS_TABLE`], structural fallback off-grid.
+/// No `*16` input pad has been observed for this family (the text
+/// `0x88` group is always `K*16`), so the table stores `f14` and the
+/// big-kernel flag only.
+fn mm_ns_params(k: usize, n: usize, kern_sz: usize) -> (u32, bool) {
+    if k % 32 == 0 && n % 32 == 0 && k <= 2048 && n <= 2048 {
+        let v = crate::mm_ns_table::MM_NS_TABLE[(k / 32 - 1) * 64 + (n / 32 - 1)];
+        if v != u32::MAX {
+            return (v & 0xfff, v & 0x10000 != 0);
+        }
+    }
+    // fallback: f14 counts the kernel's full 0xC000 chunks (ANEC's
+    // exact rounding is irregular — same heuristic class as conv).
+    (
+        kern_sz.saturating_sub(1) as u32 / 0xc000,
+        kern_sz > 0x100000,
+    )
+}
+
+/// ANEC's matmul kernel symbol name for a const weight `[1,N,1,K]`
+/// at `@model_path/weights/weight.bin`: SHA-256 over a 383-byte record
+/// — blob stem/file name/offset/size, a `desc` block carrying the
+/// weight's `[N,K]` dims in the conv `[cout,cin,1,1]` arrangement,
+/// then a second blob descriptor and a metadata block whose strides
+/// scale with `K`,`N` (`N*256`,`K*256`,`K*N*256`), ending with the
+/// per-lane row count `min(ceil(N/16),32)` packed `<<40`.
+/// Verified against ANEC symbols at (64,32),(128,64),(256,64),
+/// (64,256),(64,65),(64,513),(64,1024).
+pub fn mm_kernel_name_ns(k: u64, n: u64, data_offset: u64) -> String {
+    let mut s: Vec<u8> = Vec::with_capacity(383);
+    s.extend_from_slice(b"weight");
+    s.extend_from_slice(b"weight.bin0");
+    s.extend_from_slice(&data_offset.to_le_bytes());
+    s.extend_from_slice(&(n * k * 2).to_le_bytes());
+    s.extend_from_slice(&[0; 5]);
+    s.extend_from_slice(b"desc");
+    s.extend_from_slice(&[0; 40]);
+    for v in [n, k, 1, 1, 1, k, 1, 1, 1, 1, 0, 0] {
+        s.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in [1u32, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0] {
+        s.extend_from_slice(&v.to_le_bytes());
+    }
+    s.extend_from_slice(b"weight.bin0");
+    s.extend_from_slice(&data_offset.to_le_bytes());
+    s.extend_from_slice(&(n * k * 2).to_le_bytes());
+    for v in [
+        0x10fu64,
+        0x100,
+        0x100,
+        n * 256,
+        k * 256,
+        n * 256,
+        k * 256,
+        0x100,
+        0x100,
+        0x100,
+        n * k * 256,
+        n * k * 256,
+        k * 256,
+        k * 256,
+        0x100,
+        n.div_ceil(16).min(32) << 40,
+    ] {
+        s.extend_from_slice(&v.to_le_bytes());
+    }
+    s.extend_from_slice(&[0; 6]);
+    debug_assert_eq!(s.len(), 383);
+    format!("K{}", mil_spec::sha256::sha256_hex(&s).to_uppercase())
+}
+
+/// Emit `z = matmul(x, w, transpose_y)` for x `[1,1,1,K]`, const
+/// weight `[1,N,1,K]` → z `[1,1,1,N]` — the M=1 non-square form every
+/// transformer FFN/attention projection needs. `weights` is the raw
+/// row-major `[N,K]` blob payload.
+///
+/// Field model (dense ANEC sweep over the `(K,N)` grid,
+/// `/tmp/mmgrid`, plus per-shape probes):
+/// - `__const` slot is `align(K*2, 0x4000)`, `__data` `align(N*64)`;
+///   `__KERN_0` payload = [`weight_layout_ns`]`(w, K, N)` verbatim.
+/// - `__text` is a fixed 0x24c record (0x248 in the narrow regime
+///   `ceil(N/16) in 5..=8`, which drops the `0x1d8` f128 word and
+///   shifts the tail down one u32): `K` at `0x40`/`0x50`/`0x1bc`,
+///   `K*16` at `0x88`, `K*2` at `0x8c..0x98`, `N` at `0x1cc`, the
+///   15 lane offsets at `0x134`, 16 lane sizes at `0x170`, the big
+///   flag at `0x1d4`, `K*18` at `0x1f4` (`0x1f0` narrow).
+/// - Blobs: `1` (M) at `0xc24`, `K` at `0xc2c`, `K*2` at the `0xc48`
+///   group; `N` at `0x196c`, `N*64` at the `0x1990` group; regime
+///   marker `0x93`/`0x92` at `0xb7c`; `f14` at `0xbe8`.
+/// - Only the M=1 form is emitted — ANEC rejects `M>1` non-square
+///   matmuls (status 1), and M=N squares go through [`emit_matmul`].
+pub fn emit_matmul_ns(
+    k: usize,
+    n: usize,
+    weights: &[u16],
+    mil_path: &str,
+    out_path: &str,
+) -> Result<Vec<u8>, String> {
+    if k < 32 || n < 32 {
+        return Err(format!(
+            "matmul ns: (K={k},N={n}) below the probed template floor"
+        ));
+    }
+    if weights.len() < k * n {
+        return Err(format!("expected {} weights, got {}", k * n, weights.len()));
+    }
+    let (stream, lane_off, lane_sz) = weight_layout_ns(&weights[..k * n], k, n);
+    let kern_sz = stream.len() * 2;
+    let narrow = (5..=8).contains(&n.div_ceil(16));
+    let textlen: usize = if narrow { 0x248 } else { 0x24c };
+    let (f14, big) = mm_ns_params(k, n, kern_sz);
+    if f14 == u32::MAX {
+        return Err(format!("matmul ns: (K={k},N={n}) hit a variant window"));
+    }
+    let f128 = match n.div_ceil(16) {
+        ..=2 => 1u32,
+        3 | 4 => 2,
+        9..=16 => 4,
+        _ => 5,
+    };
+    // __const payload is the K-element input padded to 0x40; the text
+    // stride group uses align(K*2, 0x10), and 0x90 additionally adds a
+    // DMA guard when K*2 lands on a 0x200 boundary (0x10, or 0x20 at
+    // 0x400 boundaries — ANEC cache-set spacing).
+    let const_sz = (k * 2 + 0x3f) & !0x3f;
+    let stride16 = (k * 2 + 0xf) & !0xf;
+    let stride_g = if (k * 2) % 0x200 == 0 {
+        stride16 + 0x10 + usize::from((k * 2) % 0x400 == 0) * 0x10
+    } else {
+        stride16
+    };
+    let slot_in = (const_sz + 0x3fff) & !0x3fff;
+    let slot_out = (n * 64 + 0x3fff) & !0x3fff;
+    let const_va = 0x3000_0000u64;
+    let data_va = const_va + slot_in as u64;
+    let text_va = data_va + slot_out as u64;
+    let const2_va = text_va + textlen.div_ceil(0x40) as u64 * 0x40;
+    let kern_va = text_va + 0x8000;
+    let kern_vsz = (kern_sz + 0x3fff) & !0x3fff;
+
+    // ---- header + segments + command blobs -------------------------
+    let mut pre = SKELETON_MM_NS[..CONV_TAIL_OFF].to_vec();
+    put_u64(&mut pre, 0x88, slot_in as u64); // __const seg vmsize
+    put_u64(&mut pre, 0xd0, const_va); // __const sect addr
+    put_u64(&mut pre, 0xd8, const_sz as u64); // __const sect size
+    put_u64(&mut pre, 0x118, data_va); // __data seg vmaddr
+    put_u64(&mut pre, 0x120, slot_out as u64); // __data seg vmsize
+    put_u64(&mut pre, 0x168, data_va); // __data sect addr
+    put_u64(&mut pre, 0x170, (n * 64) as u64); // __data sect size
+    put_u64(&mut pre, 0x1b0, text_va); // __TEXT seg vmaddr
+    put_u64(&mut pre, 0x200, text_va); // __text sect addr
+    put_u64(&mut pre, 0x208, textlen as u64); // __text sect size
+    put_u64(&mut pre, 0x250, const2_va); // __TEXT __const sect addr
+    put_u64(&mut pre, 0x298, kern_va); // __KERN_0 seg vmaddr
+    put_u64(&mut pre, 0x2a0, kern_vsz as u64); // __KERN_0 seg vmsize
+    put_u64(&mut pre, 0x2b0, kern_vsz as u64); // __KERN_0 seg filesize
+    put_u64(&mut pre, 0x2e8, kern_va); // __kern_0 sect addr
+    put_u64(&mut pre, 0x2f0, kern_sz as u64); // __kern_0 sect size
+
+    put_u64(&mut pre, 0x348, data_va);
+    put_u64(&mut pre, 0x3c8, data_va);
+    put_u64(&mut pre, 0x3d8, kern_va);
+    put_u32(&mut pre, 0x368, text_va as u32);
+    put_u32(&mut pre, 0xb68, text_va as u32);
+    put_u32(&mut pre, 0x378, const2_va as u32);
+    put_u32(&mut pre, 0xb7c, if narrow { 0x92 } else { 0x93 });
+    put_u32(&mut pre, 0xbe8, f14);
+    // x-side descriptors: M at 0xc24, K at 0xc2c, padded input byte
+    // size (align(K*2, 0x40)) at the 0xc48 group
+    put_u32(&mut pre, 0xc24, 1);
+    put_u32(&mut pre, 0xc2c, k as u32);
+    for &o in &[0xc48usize, 0xc50, 0xc58, 0xc68, 0xc78] {
+        put_u32(&mut pre, o, const_sz as u32);
+    }
+    // z-side: N and N*64 (same layout as conv's Cout group)
+    put_u32(&mut pre, 0x196c, n as u32);
+    for &o in &[0x1990usize, 0x19b0, 0x19c0] {
+        put_u32(&mut pre, o, (n * 64) as u32);
+    }
+
+    // ---- tail: signature, rt.version, LC_SYMTAB, strtab, reloc -----
+    let kname = mm_kernel_name_ns(k as u64, n as u64, 0x80);
+    let mut entries: Vec<(String, u8, u8, u16, u64)> = Vec::with_capacity(43);
+    entries.push(("x".into(), 0x0f, 1, 0, const_va));
+    entries.push(("z".into(), 0x0f, 2, 0, data_va));
+    for i in 0..16 {
+        entries.push((
+            format!("{kname}_ne_{i}"),
+            0x0f,
+            5,
+            if i == 0 { 2 } else { 0 },
+            kern_va + lane_off[i] as u64,
+        ));
+    }
+    for ty in TYPE_SYMS {
+        entries.push(((*ty).into(), 0x80, 0, 0, 0));
+    }
+    // x layout: the three s-fields carry the padded input byte size
+    // (align(K*2, 0x40)); the raw element count lands on `h` only.
+    let xdesc = format!(
+        "x:t24=ar1;0;1;25=s{}n:ar1;0;1;26=s{}c:ar1;0;1;27=s{}h:ar1;0;{};28=s2w:5",
+        const_sz, const_sz, const_sz, k
+    );
+    entries.push((xdesc, 0x20, 0, 0x18, 0));
+    entries.push((layout_desc("z", 29, n as u32), 0x20, 0, 0x1d, 0));
+    let reloc_addr: u32 = if narrow { 0x22c } else { 0x230 };
+    let relocs: Vec<[u8; 8]> = vec![[
+        reloc_addr.to_le_bytes()[0],
+        reloc_addr.to_le_bytes()[1],
+        reloc_addr.to_le_bytes()[2],
+        reloc_addr.to_le_bytes()[3],
+        0x05,
+        0,
+        0,
+        0x07,
+    ]];
+
+    let (mut img, text_off) = build_tail_at_reloc(
+        &pre,
+        CONV_TAIL_OFF,
+        &entries,
+        &relocs,
+        mil_path,
+        out_path,
+        0x218,
+    );
+    put_u32(&mut img, 0x1c0, text_off as u32); // __TEXT seg fileoff
+    put_u32(&mut img, 0x210, text_off as u32); // __text sect offset
+    let const2_fo = text_off + textlen.div_ceil(0x40) * 0x40;
+    put_u32(&mut img, 0x260, const2_fo as u32); // __TEXT __const offset
+    let kern_fo = text_off + 0x8000;
+    put_u64(&mut img, 0x2a8, kern_fo as u64); // __KERN_0 seg fileoff
+    put_u32(&mut img, 0x2f8, kern_fo as u32); // __kern_0 sect offset
+
+    // ---- __text ----------------------------------------------------
+    // the narrow template is the std record minus the f128 word at
+    // 0x1d8 — all tail fields sit one u32 lower.
+    let shift = |o: usize| if narrow && o >= 0x1dc { o - 4 } else { o };
+    let mut text = if narrow {
+        MM_NS_TEXT_NARROW.to_vec()
+    } else {
+        SKELETON_MM_NS[0x4000..0x4000 + 0x24c].to_vec()
+    };
+    // f14 lands at text 0xc4 (and blob 0xbe8) — text 0x14 stays 0 for
+    // this family.
+    put_u32(&mut text, 0xc4, f14);
+    put_u32(&mut text, 0x40, k as u32);
+    put_u32(&mut text, 0x50, k as u32);
+    put_u32(&mut text, 0x88, (k * 16) as u32);
+    for &o in &[0x8cusize, 0x94, 0x98] {
+        put_u32(&mut text, o, stride16 as u32);
+    }
+    put_u32(&mut text, 0x90, stride_g as u32);
+    for i in 0..15 {
+        put_u32(&mut text, 0x134 + i * 4, lane_off[i + 1] as u32);
+    }
+    for i in 0..16 {
+        put_u32(&mut text, 0x170 + i * 4, lane_sz[i] as u32);
+    }
+    put_u32(&mut text, 0x1bc, k as u32);
+    put_u32(&mut text, 0x1cc, n as u32);
+    put_u32(&mut text, 0x1d4, if big { 0x244404 } else { 0x200004 });
+    if !narrow {
+        put_u32(&mut text, 0x1d8, f128);
+    }
+    put_u32(
+        &mut text,
+        shift(0x1f4),
+        ((k * 18 + 0xf) & !0xf) as u32 + (stride_g - stride16) as u32,
+    );
+    debug_assert_eq!(text.len(), textlen);
+
+    // ---- section contents ------------------------------------------
+    img.resize(text_off, 0);
+    img.extend_from_slice(&text);
+    img.resize(kern_fo, 0);
+    for v in &stream {
+        img.extend_from_slice(&v.to_le_bytes());
+    }
+    img.resize(kern_fo + kern_vsz, 0);
+    Ok(img)
+}
+
 /// Emit a complete HWX image for the fused chain
 /// `z = sigmoid(conv1x1(x, w))` — the real-model pattern — for `C=64`.
 ///
@@ -3820,6 +4118,23 @@ fn mil_scalar_f16(text: &str, name: &str) -> Option<u16> {
     None
 }
 
+/// Resolve a scalar `bool` const's value: `bool <name> =
+/// const()[val = bool(true|false)]`. `None` when not a bool const.
+fn mil_scalar_bool(text: &str, name: &str) -> Option<bool> {
+    for raw in text.lines() {
+        let line = raw.trim();
+        let Some(eq) = line.find(" = ") else { continue };
+        if line[..eq].rsplit(|c: char| c == ' ' || c == '>').next() != Some(name) {
+            continue;
+        }
+        let rhs = &line[eq + 3..];
+        let v = rhs.find("bool(")?;
+        let end = rhs[v..].find(')')? + v;
+        return Some(&rhs[v + 5..end] == "true");
+    }
+    None
+}
+
 /// Emit a complete HWX image for a MIL program on a covered skeleton
 /// family — the dispatch behind `milc compile --target ane --emit-hwx`.
 /// Matches the op sequence against every verified family and loads
@@ -4033,11 +4348,26 @@ fn emit_from_mil_inner(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String
         }
     };
     if let ["matmul"] = names.as_slice() {
-        // const-weight matmul → the MmShape families.
+        // const-weight matmul → the MmShape families (square `[1,N,1,N]`
+        // activation) or the parametric M=1 non-square emitter
+        // (`[1,1,1,K] x [1,N,1,K]`, transpose_y).
         let y = arg(&ops[0], "y").unwrap_or_default();
         if let Some(path) = blob_of(&y) {
-            let n = ops[0].shape.get(1).copied().unwrap_or(0) as usize;
-            let shape = match n {
+            let o = &ops[0].shape;
+            let m = o.get(1).copied().unwrap_or(0) as usize;
+            let n = o.get(3).copied().unwrap_or(0) as usize;
+            let w = load_blob_u16(&resolve_blob(&mil_dir, &path))?;
+            let ty = match arg(&ops[0], "transpose_y").as_deref() {
+                Some(v) => mil_scalar_bool(&text, v).unwrap_or(v == "true"),
+                None => false,
+            };
+            if m == 1 && ty && n >= 32 && w.len() % n == 0 {
+                let k = w.len() / n;
+                if k >= 32 {
+                    return emit_matmul_ns(k, n, &w, mil_path, out_path);
+                }
+            }
+            let shape = match m {
                 16 => MmShape::N16,
                 32 => MmShape::N32,
                 64 => MmShape::N64,
@@ -4045,7 +4375,7 @@ fn emit_from_mil_inner(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String
                 256 => MmShape::N256,
                 _ => return Err(format!("matmul shape {:?} not on a skeleton family", ops[0].shape)),
             };
-            return emit_matmul(shape, &load_blob_u16(&resolve_blob(&mil_dir, &path))?, mil_path, out_path);
+            return emit_matmul(shape, &w, mil_path, out_path);
         }
     }
     if let Some(part) = mm_part(&names) {
@@ -5004,6 +5334,41 @@ mod tests {
             img,
             expect,
             "convns64x32: first diff at {:#x}",
+            img.iter()
+                .zip(&expect)
+                .position(|(a, b)| a != b)
+                .map(|i| i as i64)
+                .unwrap_or(-1)
+        );
+    }
+
+    /// Non-square const-weight matmul: `emit_matmul_ns(64, 32)`
+    /// reproduces the captured ANEC artifact byte-for-byte — the
+    /// M=1 program plan, lane stream, 383-byte kernel-name hash and
+    /// all metadata.
+    #[test]
+    fn matmul_ns_byte_identical() {
+        let _g = SIG_LOCK.lock().unwrap();
+        let weights: Vec<u16> = (0..64 * 32).map(|i| i as u16).collect();
+        std::env::set_var("HWX_SIG_ANEC", "1");
+        let img = emit_matmul_ns(
+            64,
+            32,
+            &weights,
+            "/tmp/ane_corpus/mmns64x32/net.mil",
+            "/tmp/ane_corpus/mmns64x32/out/net.macho",
+        )
+        .unwrap();
+        std::env::remove_var("HWX_SIG_ANEC");
+        let expect = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/mmns64x32_reference.hwx"
+        ))
+        .unwrap();
+        assert_eq!(
+            img,
+            expect,
+            "mmns64x32: first diff at {:#x}",
             img.iter()
                 .zip(&expect)
                 .position(|(a, b)| a != b)
