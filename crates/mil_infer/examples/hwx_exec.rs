@@ -88,9 +88,16 @@ fn main() {
     }
     let d = m.input_descs[0].clone();
     let b = m.input_mut(0);
+    let fill_mode: u32 = std::env::var("FILL").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     for k in 0..d.k {
         let off = d.offset(0, 0, k, 0, 0);
-        b[off..off + 2].copy_from_slice(&f16(((k % 16) + 1) as f32).to_le_bytes());
+        let v = match fill_mode {
+            1 => 0.0f32,
+            2 => 1.0,
+            3 => (k as f32) * 0.25,
+            _ => ((k % 16) + 1) as f32,
+        };
+        b[off..off + 2].copy_from_slice(&f16(v).to_le_bytes());
     }
     m.eval().expect("eval");
     let d = m.output_descs[0].clone();

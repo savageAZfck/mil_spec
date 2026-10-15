@@ -483,8 +483,17 @@ impl EspressoProgram {
             }
             retain(client);
             let opts = if precompiled {
-                let mut keys: Vec<Id> = vec![objc.ns_string("kANEFModelType")];
-                let mut vals: Vec<Id> = vec![objc.ns_string("kANEFModelPreCompiled")];
+                let mut keys: Vec<Id> = vec![
+                    objc.ns_string("kANEFModelType"),
+                    // aned's _ANEMachoPatcher transforms the relocatable
+                    // Mach-O into the driver-loadable deployed program
+                    // only when a non-zero perf-stats mask is present.
+                    objc.ns_string("kANEFPerformanceStatsMask"),
+                ];
+                let mut vals: Vec<Id> = vec![
+                    objc.ns_string("kANEFModelPreCompiled"),
+                    objc.ns_int(0x7f),
+                ];
                 for (k, v) in extra {
                     keys.push(objc.ns_string(k));
                     vals.push(objc.ns_int(*v));
