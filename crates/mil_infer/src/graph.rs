@@ -863,6 +863,27 @@ impl GraphRuntime {
             .map(|(_, i)| *i)
     }
 
+    /// Zero all persistent state surfaces (KV-cache accumulators marked
+    /// with `zero` ports) for a fresh decode horizon without unloading
+    /// resident ANE programs.
+    pub fn reset_state(&mut self) {
+        let mut ports = Vec::new();
+        for (i, n) in self.plan.nodes.iter().enumerate() {
+            if let Node::Prog { zero, .. } = n {
+                for &port in zero {
+                    ports.push((i, port));
+                }
+            }
+        }
+        for (i, port) in ports {
+            if let Some(s) = self.port_surf(i, port) {
+                for b in s.bytes_mut().iter_mut() {
+                    *b = 0;
+                }
+            }
+        }
+    }
+
     /// Execute the whole graph once in scheduled order; programs load
     /// lazily and are evicted LRU-first under ANE residency pressure.
     pub fn run(&mut self) -> Result<(), String> {
@@ -940,5 +961,156 @@ impl GraphRuntime {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use half::f16;
+
+    #[test]
+    fn graph_scheduler_rms_q8_swiglu_exec() {
+        let dir = std::env::temp_dir().join(format!("graph_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (d, ff) = (64usize, 128usize);
+        let gam: Vec<u8> = (0..d)
+            .flat_map(|i| f16::from_f32(0.8 + (i % 7) as f32 * 0.05).to_le_bytes())
+            .collect();
+        std::fs::write(dir.join("gam.bin"), &gam).unwrap();
+
+        let wu_q8: Vec<i8> = (0..ff * d)
+            .map(|i| (((i * 23 + 7) % 199) as i32 - 99) as i8)
+            .collect();
+        let wu_sc: Vec<f32> = (0..ff * 2)
+            .map(|i| f16::from_f32(0.002 * ((i * 11 % 31) as f32 + 1.0)).to_f32())
+            .collect();
+        std::fs::write(
+            dir.join("wu_q8.bin"),
+            wu_q8.iter().map(|&c| c as u8).collect::<Vec<u8>>(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("wu_sc.bin"),
+            wu_sc
+                .iter()
+                .flat_map(|&s| f16::from_f32(s).to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )
+        .unwrap();
+
+        let wg: Vec<f32> = (0..ff * d)
+            .map(|i| f16::from_f32(((i * 17 + 3) % 29) as f32 / 64.0 - 0.22).to_f32())
+            .collect();
+        let wd: Vec<f32> = (0..d * ff)
+            .map(|i| f16::from_f32(((i * 13 + 5) % 23) as f32 / 64.0 - 0.17).to_f32())
+            .collect();
+        std::fs::write(
+            dir.join("wg.bin"),
+            wg.iter()
+                .flat_map(|&v| f16::from_f32(v).to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("wd.bin"),
+            wd.iter()
+                .flat_map(|&v| f16::from_f32(v).to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )
+        .unwrap();
+
+        let mil = format!(
+            r#"program(1.3)
+{{
+    func main<ios18>(tensor<fp16, [1, 64, 1, 1]> x) {{
+        tensor<fp16, [64]> gam = const()[val = tensor<fp16, [64]>(BLOBFILE(path = string("{d}/gam.bin"), offset = uint64(0)))];
+        tensor<int8, [128, 64]> Wu_q = const()[val = tensor<int8, [128, 64]>(BLOBFILE(path = string("{d}/wu_q8.bin"), offset = uint64(0)))];
+        tensor<fp16, [128, 2]> Wu_s = const()[val = tensor<fp16, [128, 2]>(BLOBFILE(path = string("{d}/wu_sc.bin"), offset = uint64(0)))];
+        tensor<fp16, [128, 64]> Wu = constexpr_blockwise_shift_scale(data = Wu_q, scale = Wu_s)[name = string("Wu")];
+        tensor<fp16, [128, 64]> Wg = const()[val = tensor<fp16, [128, 64]>(BLOBFILE(path = string("{d}/wg.bin"), offset = uint64(0)))];
+        tensor<fp16, [64, 128]> Wd = const()[val = tensor<fp16, [64, 128]>(BLOBFILE(path = string("{d}/wd.bin"), offset = uint64(0)))];
+        tensor<bool, []> bt = const()[val = bool(true)];
+        tensor<fp16, [1, 64, 1, 1]> xn = rms_norm(x = x, w = gam, eps = fp16(0.00001))[name = string("xn")];
+        tensor<fp16, [1, 1, 1, 128]> u = matmul(x = xn, y = Wu, transpose_y = bt)[name = string("u")];
+        tensor<fp16, [1, 1, 1, 128]> g = matmul(x = xn, y = Wg, transpose_y = bt)[name = string("g")];
+        tensor<fp16, [1, 128, 1, 1]> gs = sigmoid(x = g)[name = string("gs")];
+        tensor<fp16, [1, 128, 1, 1]> gsl = mul(x = g, y = gs)[name = string("gsl")];
+        tensor<fp16, [1, 128, 1, 1]> fu = mul(x = u, y = gsl)[name = string("fu")];
+        tensor<fp16, [1, 1, 1, 64]> dn = matmul(x = fu, y = Wd, transpose_y = bt)[name = string("dn")];
+        tensor<fp16, [1, 64, 1, 1]> y = add(x = x, y = dn)[name = string("y")];
+    }} -> (y);
+}}"#,
+            d = dir.display()
+        );
+        let mil_path = dir.join("m.mil");
+        std::fs::write(&mil_path, &mil).unwrap();
+        let plan = compile_graph(
+            mil_path.to_str().unwrap(),
+            dir.join("out").to_str().unwrap(),
+        )
+        .unwrap();
+        let mut rt = GraphRuntime::load(plan).unwrap();
+
+        let xv: Vec<f32> = (0..d)
+            .map(|i| f16::from_f32(((i * 9 + 4) % 17) as f32 / 16.0 - 0.5).to_f32())
+            .collect();
+        let xc = xv.clone();
+        rt.write_ext("x", move |b, desc| {
+            for i in 0..d {
+                let o = desc.offset(0, 0, i as u64, 0, 0);
+                b[o..o + 2].copy_from_slice(&f16::from_f32(xc[i]).to_le_bytes());
+            }
+        });
+        rt.run().unwrap();
+
+        let r = (xv.iter().map(|a| a * a).sum::<f32>() / d as f32 + 1e-5)
+            .sqrt()
+            .recip();
+        let xnr: Vec<f32> = (0..d)
+            .map(|i| {
+                let g = f16::from_f32(0.8 + (i % 7) as f32 * 0.05).to_f32();
+                xv[i] * f16::from_f32(r * g).to_f32()
+            })
+            .collect();
+        let ur: Vec<f32> = (0..ff)
+            .map(|j| {
+                (0..d)
+                    .map(|i| {
+                        let w =
+                            f16::from_f32(wu_q8[j * d + i] as f32 * wu_sc[j * 2 + i / 32]).to_f32();
+                        xnr[i] * w
+                    })
+                    .sum()
+            })
+            .collect();
+        let gr: Vec<f32> = (0..ff)
+            .map(|j| (0..d).map(|i| xnr[i] * wg[j * d + i]).sum())
+            .collect();
+        let fur: Vec<f32> = ur
+            .iter()
+            .zip(&gr)
+            .map(|(u, g)| u * g / (1.0 + (-g).exp()))
+            .collect();
+        let dnr: Vec<f32> = (0..d)
+            .map(|j| (0..ff).map(|i| fur[i] * wd[j * ff + i]).sum())
+            .collect();
+        let yr: Vec<f32> = xv.iter().zip(&dnr).map(|(a, b)| a + b).collect();
+
+        let yn = rt.out_node("y").unwrap();
+        let dy = rt.out_desc(yn);
+        let zb = rt.output(yn);
+        for j in 0..d {
+            let o = dy.offset(0, 0, j as u64, 0, 0);
+            let hw = f16::from_bits(u16::from_le_bytes([zb[o], zb[o + 1]])).to_f32();
+            assert!(
+                (hw - yr[j]).abs() < 0.03 + yr[j].abs() * 0.05,
+                "y[{j}]: hw={hw} ref={}",
+                yr[j]
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

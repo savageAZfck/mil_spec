@@ -81,7 +81,10 @@ fn split_top(s: &str, sep: char) -> Vec<String> {
 fn kv_list(s: &str) -> Vec<(String, String)> {
     split_top(s, ',')
         .into_iter()
-        .filter_map(|p| p.split_once('=').map(|(k, v)| (k.trim().into(), v.trim().into())))
+        .filter_map(|p| {
+            p.split_once('=')
+                .map(|(k, v)| (k.trim().into(), v.trim().into()))
+        })
         .collect()
 }
 
@@ -165,7 +168,7 @@ fn parse_bare(t: &str) -> Option<Stmt> {
         args: kv_list(argstr),
         attrs,
         line: String::new(), // filled by caller
-        line_idx: 0,       // filled by caller
+        line_idx: 0,         // filled by caller
     })
 }
 
@@ -213,7 +216,10 @@ fn parse_const_vec(s: &str) -> Option<Vec<i64>> {
     let s = s.trim();
     let start = s.rfind('(')?;
     let end = s.rfind(')')?;
-    let body = s[start + 1..end].trim().trim_start_matches('[').trim_end_matches(']');
+    let body = s[start + 1..end]
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
     body.split(',')
         .map(|p| p.trim().parse::<i64>().ok())
         .collect()
@@ -308,7 +314,9 @@ pub fn lower_for_ane(text: &str, pos: i64) -> Result<(String, LowerReport), Stri
         .iter()
         .position(|l| l.contains("func main<"))
         .ok_or("no func main<...> signature")?;
-    let (sig_head, sig_rest) = lines[sig_idx].split_once('(').ok_or("malformed signature")?;
+    let (sig_head, sig_rest) = lines[sig_idx]
+        .split_once('(')
+        .ok_or("malformed signature")?;
     let (params_s, sig_close) = sig_rest.split_once(')').ok_or("malformed signature")?;
     let params = split_top(params_s, ',');
 
@@ -406,12 +414,17 @@ pub fn lower_for_ane(text: &str, pos: i64) -> Result<(String, LowerReport), Stri
         let mut covered = 0i64;
         for b in &bases {
             if *b != covered {
-                return Err(format!("state {name}: stripes don't tile dim0 (gap at {b})"));
+                return Err(format!(
+                    "state {name}: stripes don't tile dim0 (gap at {b})"
+                ));
             }
             covered += stripes.iter().find(|s| s.base == *b).unwrap().width;
         }
         if covered != st.dims[0] {
-            return Err(format!("state {name}: stripes cover {covered} of {}", st.dims[0]));
+            return Err(format!(
+                "state {name}: stripes cover {covered} of {}",
+                st.dims[0]
+            ));
         }
     }
 
@@ -492,8 +505,8 @@ pub fn lower_for_ane(text: &str, pos: i64) -> Result<(String, LowerReport), Stri
                 rep.writes_emitted += 1;
             }
             "slice_by_index" => {
-                let Some((state, stripe_i, base)) = arg(&s.args, "x")
-                    .and_then(|x| su_home.get(x).cloned())
+                let Some((state, stripe_i, base)) =
+                    arg(&s.args, "x").and_then(|x| su_home.get(x).cloned())
                 else {
                     continue;
                 };
@@ -564,7 +577,10 @@ pub fn lower_for_ane(text: &str, pos: i64) -> Result<(String, LowerReport), Stri
     }
 
     // Assemble: header lines (incl. new signature), rewritten body, tail.
-    let first_stmt = stmt_of_line.iter().position(|s| s.is_some()).unwrap_or(lines.len());
+    let first_stmt = stmt_of_line
+        .iter()
+        .position(|s| s.is_some())
+        .unwrap_or(lines.len());
     let last_stmt = stmt_of_line.iter().rposition(|s| s.is_some()).unwrap_or(0);
     let mut new_params: Vec<String> = Vec::new();
     for p in &params {
@@ -591,7 +607,12 @@ pub fn lower_for_ane(text: &str, pos: i64) -> Result<(String, LowerReport), Stri
             *l = format!("{sig_head}({}){}", new_params.join(", "), sig_close);
         }
     }
-    for (i, l) in lines.iter().enumerate().take(last_stmt + 1).skip(first_stmt) {
+    for (i, l) in lines
+        .iter()
+        .enumerate()
+        .take(last_stmt + 1)
+        .skip(first_stmt)
+    {
         if stmt_of_line[i].is_none() {
             result.push(l.clone());
         } else if drops.contains(&i) {
@@ -692,8 +713,12 @@ fn collect_used_vars(text: &str) -> BTreeSet<String> {
             for tok in split_top(v, ',') {
                 let t = tok.trim();
                 if !t.is_empty()
-                    && t.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false)
-                    && t.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                    && t.chars()
+                        .next()
+                        .map(|c| c.is_alphabetic() || c == '_')
+                        .unwrap_or(false)
+                    && t.chars()
+                        .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
                 {
                     used.insert(t.to_string());
                 }

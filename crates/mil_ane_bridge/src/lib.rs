@@ -84,11 +84,7 @@ pub extern "C" fn bad_apple_ane_predict_next(
 }
 
 #[no_mangle]
-pub extern "C" fn bad_apple_ane_prefill(
-    h: *mut c_void,
-    tokens: *const i32,
-    count: i32,
-) -> bool {
+pub extern "C" fn bad_apple_ane_prefill(h: *mut c_void, tokens: *const i32, count: i32) -> bool {
     let Some(h) = mut_handle(h) else { return false };
     if tokens.is_null() || count <= 0 {
         return false;
@@ -138,7 +134,9 @@ pub extern "C" fn bad_apple_ane_reset(h: *mut c_void) -> bool {
 /// One throwaway decode step — warms the stream, states reset after.
 #[no_mangle]
 pub extern "C" fn bad_apple_ane_prewarm(h: *mut c_void) -> bool {
-    let Some(this) = mut_handle(h) else { return false };
+    let Some(this) = mut_handle(h) else {
+        return false;
+    };
     let t = Instant::now();
     let ok = this.decoder.push(0, false).is_ok() && this.decoder.reset().is_ok();
     if let Ok(mut u) = this.prewarm_us.lock() {

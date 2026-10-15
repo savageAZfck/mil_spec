@@ -105,6 +105,7 @@ fn cmd_ane(args: &[String]) -> ExitCode {
     let mut arch = "h16g".to_string();
     let mut pos = 0i64;
     let mut detail = false;
+    let mut emit_hwx = false;
     let mut tokens: Vec<u32> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -126,10 +127,7 @@ fn cmd_ane(args: &[String]) -> ExitCode {
             }
             "--pos" | "--steps" | "--max-new" => {
                 i += 1;
-                pos = args
-                    .get(i)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
+                pos = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
             }
             "--tokens" => {
                 i += 1;
@@ -141,6 +139,7 @@ fn cmd_ane(args: &[String]) -> ExitCode {
                 }
             }
             "--detail" => detail = true,
+            "--emit-hwx" => emit_hwx = true,
             s if !s.starts_with('-') => {
                 if mil.is_none() {
                     mil = Some(PathBuf::from(s));
@@ -173,7 +172,13 @@ fn cmd_ane(args: &[String]) -> ExitCode {
         match dec.generate(&tokens, max_new) {
             Ok(ids) => {
                 let el = t.elapsed().as_secs_f64();
-                println!("{}", ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(","));
+                println!(
+                    "{}",
+                    ids.iter()
+                        .map(|i| i.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
                 eprintln!(
                     "[decode] {} prompt + {} new in {:.2}s ({:.1} tok/s)",
                     tokens.len(),
@@ -195,16 +200,90 @@ fn cmd_ane(args: &[String]) -> ExitCode {
     }
     if mode == "run" {
         let steps = if pos > 0 { pos as u32 } else { 1 };
-        let (prog, map) = match mil_infer::e5rt::Program::compile_auto(
-            &mil,
-            mil_infer::e5rt::DeviceMask::Ane,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("milc ane run: {e}");
-                return ExitCode::FAILURE;
+        if emit_hwx {
+            let dir = out.unwrap_or_else(|| std::env::temp_dir().join("milc_hwx_run"));
+            let _ = std::fs::create_dir_all(&dir);
+            let plan = match mil_infer::graph::compile_graph(
+                &mil.display().to_string(),
+                &dir.display().to_string(),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("milc ane run --emit-hwx: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            println!(
+                "graph: {} nodes, {} externals, {} outputs",
+                plan.nodes.len(),
+                plan.externals.len(),
+                plan.outputs.len()
+            );
+            let ext_names: Vec<String> = plan
+                .externals
+                .iter()
+                .filter(|(n, _)| !plan.const_fills.iter().any(|(c, _)| c == n))
+                .map(|(n, _)| n.clone())
+                .collect();
+            let outs = plan.outputs.clone();
+            let mut rt = match mil_infer::graph::GraphRuntime::load(plan) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("milc ane run --emit-hwx: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            for n in &ext_names {
+                rt.write_ext(n, |b, d| {
+                    for c in 0..d.k.max(1) {
+                        for h in 0..d.h.max(1) {
+                            for w in 0..d.w.max(1) {
+                                let o = d.offset(0, 0, c, h, w);
+                                if o + 2 <= b.len() {
+                                    b[o..o + 2].copy_from_slice(&0x3c00u16.to_le_bytes());
+                                }
+                            }
+                        }
+                    }
+                });
+                println!("  input  {n}");
             }
-        };
+            for i in 0..steps {
+                let t = std::time::Instant::now();
+                if let Err(e) = rt.run() {
+                    eprintln!("milc ane run --emit-hwx: step {i}: {e}");
+                    return ExitCode::FAILURE;
+                }
+                println!("step {i}: {:?}", t.elapsed());
+            }
+            for (n, idx) in &outs {
+                let d = rt.out_desc(*idx);
+                let b = rt.output(*idx);
+                let mut head = Vec::new();
+                for k in 0..6u64.min(d.k.max(d.w).max(1)) {
+                    let o = if d.k > 1 {
+                        d.offset(0, 0, k, 0, 0)
+                    } else {
+                        d.offset(0, 0, 0, 0, k)
+                    };
+                    if o + 2 <= b.len() {
+                        head.push(
+                            half::f16::from_bits(u16::from_le_bytes([b[o], b[o + 1]])).to_f32(),
+                        );
+                    }
+                }
+                println!("{n}: head {head:?}");
+            }
+            return ExitCode::SUCCESS;
+        }
+        let (prog, map) =
+            match mil_infer::e5rt::Program::compile_auto(&mil, mil_infer::e5rt::DeviceMask::Ane) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("milc ane run: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
         println!("functions: {:?}", prog.functions);
         for (n, e) in &map.inputs {
             let v = vec![0x3c00u16; *e as usize]; // fp16 1.0 seed
@@ -274,7 +353,10 @@ fn cmd_ane(args: &[String]) -> ExitCode {
         };
     }
     if !mil_infer::anec::ARCHES.contains(&arch.as_str()) {
-        eprintln!("milc ane: arch {arch} not in target table {:?}", mil_infer::anec::ARCHES);
+        eprintln!(
+            "milc ane: arch {arch} not in target table {:?}",
+            mil_infer::anec::ARCHES
+        );
         return ExitCode::from(2);
     }
     let ane = match mil_infer::Anec::open() {
@@ -299,7 +381,11 @@ fn cmd_ane(args: &[String]) -> ExitCode {
                 println!("error: {e}");
             }
             if let Some(a) = &v.artifact {
-                println!("artifact: {} ({} bytes)", a.display(), a.metadata().map(|m| m.len()).unwrap_or(0));
+                println!(
+                    "artifact: {} ({} bytes)",
+                    a.display(),
+                    a.metadata().map(|m| m.len()).unwrap_or(0)
+                );
             }
             if detail {
                 println!("{}", v.detail);
@@ -964,8 +1050,7 @@ fn cmd_compile(args: &[String]) -> ExitCode {
             Ok((l, rep)) => {
                 eprintln!(
                     "ane_lower: states={} updates={} reads={} dropped={}",
-                    rep.states_split, rep.updates_localized, rep.reads_localized,
-                    rep.ops_dropped
+                    rep.states_split, rep.updates_localized, rep.reads_localized, rep.ops_dropped
                 );
                 l
             }
@@ -976,38 +1061,72 @@ fn cmd_compile(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        if emit_hwx {
-            // Native emission — no ANECompiler.framework at all. The
-            // dispatcher matches the lowered program against every
-            // verified skeleton family.
-            let work = out.join("mil");
-            let _ = std::fs::create_dir_all(&work);
-            let lmil = work.join("model.mil");
-            if let Err(e) = std::fs::write(&lmil, &lowered) {
-                eprintln!("milc compile --emit-hwx: {}: {e}", lmil.display());
-                return ExitCode::FAILURE;
+        let work = out.join("mil");
+        let _ = std::fs::create_dir_all(&work);
+        let lmil = work.join("model.mil");
+        if let Err(e) = std::fs::write(&lmil, &lowered) {
+            eprintln!("milc compile --target ane: {}: {e}", lmil.display());
+            return ExitCode::FAILURE;
+        }
+        if let Some(parent) = pkg.parent() {
+            let w = parent.join("weights");
+            if w.is_dir() && !work.join("weights").exists() {
+                let _ = std::fs::create_dir_all(work.join("weights"));
+                if let Ok(rd) = std::fs::read_dir(&w) {
+                    for f in rd.flatten() {
+                        let _ = std::fs::copy(f.path(), work.join("weights").join(f.file_name()));
+                    }
+                }
             }
+            if let Ok(rd) = std::fs::read_dir(parent) {
+                for f in rd.flatten() {
+                    if f.path().extension().and_then(|s| s.to_str()) == Some("bin") {
+                        let _ = std::fs::copy(f.path(), work.join(f.file_name()));
+                    }
+                }
+            }
+        }
+        if emit_hwx {
+            // Native emission — no ANECompiler.framework at all. Try the
+            // single-program fused dispatcher first; if the MIL is a
+            // general multi-op DAG, fall back to the graph scheduler.
             let dst = out.join("model.macho");
             let _ = std::fs::create_dir_all(&out);
-            return match mil_infer::hwx::emit_from_mil(
+            match mil_infer::hwx::emit_from_mil(
                 &lmil.display().to_string(),
                 &dst.display().to_string(),
             ) {
                 Ok(img) => match std::fs::write(&dst, &img) {
                     Ok(()) => {
                         println!("{} via hwx ({} bytes)", dst.display(), img.len());
-                        ExitCode::SUCCESS
+                        return ExitCode::SUCCESS;
                     }
                     Err(e) => {
                         eprintln!("milc compile --emit-hwx: {}: {e}", dst.display());
-                        ExitCode::FAILURE
+                        return ExitCode::FAILURE;
                     }
                 },
-                Err(e) => {
-                    eprintln!("milc compile --emit-hwx: {e}");
-                    ExitCode::FAILURE
-                }
-            };
+                Err(single_err) => match mil_infer::graph::compile_graph(
+                    &lmil.display().to_string(),
+                    &out.display().to_string(),
+                ) {
+                    Ok(plan) => {
+                        println!(
+                            "{} via hwx-graph ({} nodes, {} externals)",
+                            out.display(),
+                            plan.nodes.len(),
+                            plan.externals.len()
+                        );
+                        return ExitCode::SUCCESS;
+                    }
+                    Err(graph_err) => {
+                        eprintln!(
+                            "milc compile --emit-hwx: single ({single_err}); graph ({graph_err})"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                },
+            }
         }
         let ane = match mil_infer::Anec::open() {
             Ok(a) => a,
@@ -1016,28 +1135,6 @@ fn cmd_compile(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        // The compiler resolves @model_path against the mil's dir —
-        // write the lowered text beside a copy of any weights/ dir.
-        let work = out.join("mil");
-        let _ = std::fs::create_dir_all(&work);
-        let lmil = work.join("model.mil");
-        if let Err(e) = std::fs::write(&lmil, &lowered) {
-            eprintln!("milc compile --target ane: {}: {e}", lmil.display());
-            return ExitCode::FAILURE;
-        }
-        if let Some(w) = pkg.parent().map(|p| p.join("weights")) {
-            if w.is_dir() && !work.join("weights").exists() {
-                let _ = std::fs::create_dir_all(work.join("weights"));
-                if let Ok(rd) = std::fs::read_dir(&w) {
-                    for f in rd.flatten() {
-                        let _ = std::fs::copy(
-                            f.path(),
-                            work.join("weights").join(f.file_name()),
-                        );
-                    }
-                }
-            }
-        }
         return match ane.compile(&lmil, &out, &arch) {
             Ok(v) if v.rc == 0 => {
                 if let Some(a) = &v.artifact {

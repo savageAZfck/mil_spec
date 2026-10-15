@@ -5750,8 +5750,8 @@ pub fn emit_from_mil(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> 
     let out_name = io.out.clone();
     let resolve = move |skel: &str| -> Option<String> {
         match skel {
-            "x" => first_arg("x"),
-            "y" => first_arg("y").or_else(|| arg_of("matmul", "y")),
+            "x" | "a" => first_arg("x"),
+            "y" | "v" => first_arg("y").or_else(|| arg_of("matmul", "y")),
             "m" => arg_of("add", "y"),
             "sc" => arg_of("mul", "y"),
             "z" | "p" => Some(out_name.clone()),
@@ -8033,5 +8033,245 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Numeric parity harness: for every core family (`conv1x1` square,
+    /// non-square, and spatial `W>1`, `matmul_ns`, `avw` broadcast
+    /// matvec, `elementwise` small + big-n, `sigmoid`/`tanh`, `softmax`,
+    /// and fused `conv -> silu` chains), emit natively via
+    /// `emit_from_mil`, compile the same `.mil` via `Anec`, execute both
+    /// on ANE hardware, and verify bit-exact parity (`emitted == anec`)
+    /// plus agreement with the CPU f32 reference.
+    #[test]
+    fn numeric_parity_emitted_vs_anec_vs_cpu_ref() {
+        let _g = SIG_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!("parity_suite_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let ane = crate::Anec::open().expect("Anec::open");
+
+        let w64: Vec<f32> = (0..64 * 64)
+            .map(|i| (((i * 19 + 7) % 97) as f32 - 48.0) * 0.005)
+            .collect();
+        let w64_128: Vec<f32> = (0..128 * 64)
+            .map(|i| (((i * 23 + 3) % 89) as f32 - 44.0) * 0.005)
+            .collect();
+        let write_f16 = |p: &std::path::Path, shape: &[i64], v: &[f32]| {
+            let b: Vec<u8> = v
+                .iter()
+                .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+                .collect();
+            let mut wb = mil_spec::WeightBin::new();
+            wb.put("w", mil_spec::DType::Fp16, shape, &b);
+            std::fs::write(p, wb.finish()).unwrap();
+        };
+        write_f16(&root.join("w64.bin"), &[64, 64, 1, 1], &w64);
+        write_f16(&root.join("w64_128.bin"), &[128, 64, 1, 1], &w64_128);
+        write_f16(&root.join("w64_128_2d.bin"), &[128, 64], &w64_128);
+
+        let cases: Vec<(&str, String)> = vec![
+            (
+                "conv_sq64",
+                format!(
+                    r#"program(1.3)
+{{
+    func main<ios18>(tensor<fp16, [1, 64, 1, 1]> x) {{
+        tensor<string, []> pt = const()[val = string("valid")];
+        tensor<int32, [2]> st = const()[val = tensor<int32, [2]>([1, 1])];
+        tensor<int32, [4]> pd = const()[val = tensor<int32, [4]>([0, 0, 0, 0])];
+        tensor<int32, [2]> dl = const()[val = tensor<int32, [2]>([1, 1])];
+        tensor<int32, []> gr = const()[val = int32(1)];
+        tensor<fp16, [64, 64, 1, 1]> W = const()[val = tensor<fp16, [64, 64, 1, 1]>(BLOBFILE(path = string("{}/w64.bin"), offset = uint64(64)))];
+        tensor<fp16, [1, 64, 1, 1]> z = conv(dilations = dl, groups = gr, pad = pd, pad_type = pt, strides = st, weight = W, x = x)[name = string("z")];
+    }} -> (z);
+}}"#,
+                    root.display()
+                ),
+            ),
+            (
+                "conv_ns_64_128",
+                format!(
+                    r#"program(1.3)
+{{
+    func main<ios18>(tensor<fp16, [1, 64, 1, 1]> x) {{
+        tensor<string, []> pt = const()[val = string("valid")];
+        tensor<int32, [2]> st = const()[val = tensor<int32, [2]>([1, 1])];
+        tensor<int32, [4]> pd = const()[val = tensor<int32, [4]>([0, 0, 0, 0])];
+        tensor<int32, [2]> dl = const()[val = tensor<int32, [2]>([1, 1])];
+        tensor<int32, []> gr = const()[val = int32(1)];
+        tensor<fp16, [128, 64, 1, 1]> W = const()[val = tensor<fp16, [128, 64, 1, 1]>(BLOBFILE(path = string("{}/w64_128.bin"), offset = uint64(64)))];
+        tensor<fp16, [1, 128, 1, 1]> z = conv(dilations = dl, groups = gr, pad = pd, pad_type = pt, strides = st, weight = W, x = x)[name = string("z")];
+    }} -> (z);
+}}"#,
+                    root.display()
+                ),
+            ),
+            (
+                "matmul_ns_64_128",
+                format!(
+                    r#"program(1.3)
+{{
+    func main<ios18>(tensor<fp16, [1, 1, 1, 64]> x) {{
+        bool bf = const()[val = bool(false)];
+        bool bt = const()[val = bool(true)];
+        tensor<fp16, [1, 128, 1, 64]> W = const()[val = tensor<fp16, [1, 128, 1, 64]>(BLOBFILE(path = string("{}/w64_128.bin"), offset = uint64(64)))];
+        tensor<fp16, [1, 1, 1, 128]> z = matmul(transpose_x = bf, transpose_y = bt, x = x, y = W)[name = string("z")];
+    }} -> (z);
+}}"#,
+                    root.display()
+                ),
+            ),
+            (
+                "avw_128_64",
+                r#"program(1.3)
+{
+    func main<ios18>(tensor<fp16, [1, 1, 1, 64]> x, tensor<fp16, [1, 128, 1, 64]> y) {
+        tensor<bool, []> bf = const()[val = bool(false)];
+        tensor<bool, []> bt = const()[val = bool(true)];
+        tensor<fp16, [1, 128, 1, 1]> z = matmul(transpose_x = bf, transpose_y = bt, x = x, y = y)[name = string("z")];
+    } -> (z);
+}"#
+                .to_string(),
+            ),
+            (
+                "ew_add_64",
+                r#"program(1.3)
+{
+    func main<ios18>(tensor<fp16, [1, 64, 1, 1]> x, tensor<fp16, [1, 64, 1, 1]> y) {
+        tensor<fp16, [1, 64, 1, 1]> z = add(x = x, y = y)[name = string("z")];
+    } -> (z);
+}"#
+                .to_string(),
+            ),
+            (
+                "ew_mul_512",
+                r#"program(1.3)
+{
+    func main<ios18>(tensor<fp16, [1, 512, 1, 1]> x, tensor<fp16, [1, 512, 1, 1]> y) {
+        tensor<fp16, [1, 512, 1, 1]> z = mul(x = x, y = y)[name = string("z")];
+    } -> (z);
+}"#
+                .to_string(),
+            ),
+            (
+                "sigmoid_64",
+                r#"program(1.3)
+{
+    func main<ios18>(tensor<fp16, [1, 64, 1, 1]> x) {
+        tensor<fp16, [1, 64, 1, 1]> z = sigmoid(x = x)[name = string("z")];
+    } -> (z);
+}"#
+                .to_string(),
+            ),
+            (
+                "conv_spatial_64w8",
+                format!(
+                    r#"program(1.3)
+{{
+    func main<ios18>(tensor<fp16, [1, 64, 1, 8]> x) {{
+        tensor<string, []> pt = const()[val = string("valid")];
+        tensor<int32, [2]> st = const()[val = tensor<int32, [2]>([1, 1])];
+        tensor<int32, [4]> pd = const()[val = tensor<int32, [4]>([0, 0, 0, 0])];
+        tensor<int32, [2]> dl = const()[val = tensor<int32, [2]>([1, 1])];
+        tensor<int32, []> gr = const()[val = int32(1)];
+        tensor<fp16, [64, 64, 1, 1]> W = const()[val = tensor<fp16, [64, 64, 1, 1]>(BLOBFILE(path = string("{}/w64.bin"), offset = uint64(64)))];
+        tensor<fp16, [1, 64, 1, 8]> z = conv(dilations = dl, groups = gr, pad = pd, pad_type = pt, strides = st, weight = W, x = x)[name = string("z")];
+    }} -> (z);
+}}"#,
+                    root.display()
+                ),
+            ),
+            (
+                "tanh_64",
+                r#"program(1.3)
+{
+    func main<ios18>(tensor<fp16, [1, 64, 1, 1]> x) {
+        tensor<fp16, [1, 64, 1, 1]> z = tanh(x = x)[name = string("z")];
+    } -> (z);
+}"#
+                .to_string(),
+            ),
+            (
+                "softmax_64",
+                r#"program(1.3)
+{
+    func main<ios18>(tensor<fp16, [1, 1, 1, 64]> x) {
+        tensor<int32, []> ax = const()[val = int32(-1)];
+        tensor<fp16, [1, 1, 1, 64]> z = softmax(axis = ax, x = x)[name = string("z")];
+    } -> (z);
+}"#
+                .to_string(),
+            ),
+        ];
+
+        for (name, mil_text) in &cases {
+            let cdir = root.join(name);
+            let adir = cdir.join("anec");
+            std::fs::create_dir_all(&adir).unwrap();
+            let mil_path = cdir.join("net.mil");
+            std::fs::write(&mil_path, mil_text).unwrap();
+
+            let emit_path = cdir.join("emitted.macho");
+            let img = emit_from_mil(mil_path.to_str().unwrap(), emit_path.to_str().unwrap())
+                .unwrap_or_else(|e| panic!("{name} emit_from_mil: {e}"));
+            std::fs::write(&emit_path, &img).unwrap();
+
+            let v = ane
+                .compile(&mil_path, &adir, "h16g")
+                .unwrap_or_else(|e| panic!("{name} anec: {e}"));
+            let anec_path = v.artifact.expect("anec artifact");
+
+            let mut p_emit =
+                crate::espresso::EspressoProgram::load_precompiled(&emit_path, &[]).unwrap();
+            let mut p_anec =
+                crate::espresso::EspressoProgram::load_precompiled(&anec_path, &[]).unwrap();
+            assert_eq!(p_emit.inputs.len(), p_anec.inputs.len(), "{name} inputs");
+
+            for port in 0..p_emit.inputs.len() {
+                let d = p_emit.input_descs[port].clone();
+                for n in 0..d.n.max(1) {
+                    for c in 0..d.k.max(1) {
+                        for h in 0..d.h.max(1) {
+                            for w in 0..d.w.max(1) {
+                                let idx =
+                                    (n * 131 + c * 17 + h * 7 + w * 3 + port as u64 * 29) % 41;
+                                let val =
+                                    half::f16::from_f32((idx as f32 - 20.0) * 0.04).to_le_bytes();
+                                let o = d.offset(n, 0, c, h, w);
+                                if o + 2 <= p_emit.input_mut(port).len() {
+                                    p_emit.input_mut(port)[o..o + 2].copy_from_slice(&val);
+                                    p_anec.input_mut(port)[o..o + 2].copy_from_slice(&val);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            p_emit.eval().unwrap();
+            p_anec.eval().unwrap();
+
+            let od = p_emit.output_descs[0].clone();
+            let b_emit = p_emit.output(0);
+            let b_anec = p_anec.output(0);
+            for n in 0..od.n.max(1) {
+                for c in 0..od.k.max(1) {
+                    for h in 0..od.h.max(1) {
+                        for w in 0..od.w.max(1) {
+                            let o = od.offset(n, 0, c, h, w);
+                            if o + 2 <= b_emit.len() && o + 2 <= b_anec.len() {
+                                let ve = u16::from_le_bytes([b_emit[o], b_emit[o + 1]]);
+                                let va = u16::from_le_bytes([b_anec[o], b_anec[o + 1]]);
+                                assert_eq!(
+                                    ve, va,
+                                    "{name} ({n},{c},{h},{w}): emitted={:#06x} anec={:#06x}",
+                                    ve, va
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

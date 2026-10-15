@@ -47,10 +47,21 @@ fn stripes_split_and_indices_bake() {
     // Each su has its own read → update → write triple.
     assert_eq!(out.matches("read_state(input = kv_0)").count(), 1);
     assert_eq!(out.matches("read_state(input = kv_1)").count(), 1);
-    assert_eq!(out.matches("write_state(data = l0_su, input = kv_0)").count(), 1);
-    assert_eq!(out.matches("write_state(data = l1_su, input = kv_1)").count(), 1);
+    assert_eq!(
+        out.matches("write_state(data = l0_su, input = kv_0)")
+            .count(),
+        1
+    );
+    assert_eq!(
+        out.matches("write_state(data = l1_su, input = kv_1)")
+            .count(),
+        1
+    );
     // Index math gone; begin/end baked to local consts.
-    assert!(!out.contains(" l0_beg = concat"), "concat index math dropped");
+    assert!(
+        !out.contains(" l0_beg = concat"),
+        "concat index math dropped"
+    );
     assert!(!out.contains(" l0_p2 = add"), "pos add dropped");
     assert!(out.contains("> l0_su_lb = const()[val = tensor<int32, [4]>([0, 0, 0, 0])]"));
     assert!(out.contains("> l1_su_lb = const()[val = tensor<int32, [4]>([0, 0, 0, 0])]"));
