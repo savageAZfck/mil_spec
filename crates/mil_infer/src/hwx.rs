@@ -4744,6 +4744,135 @@ pub fn emit_mm_part(part: MmPart, mil_path: &str, out_path: &str) -> Vec<u8> {
     img
 }
 
+/// Broadcast-vector×matrix activation matmul (`matmul(x=[1,1,1,K],
+/// y=[1,R,1,K], transpose_y=true)`): ANEC lowers it to a sliding
+/// row-dot engine whose channel-plane output satisfies
+/// `z[c][h] = a·V[c+h]` — the `c=0` row is the full matvec
+/// `z[j] = Σ_w a[w]·V[j][w]`. This is both decode-time attention
+/// contractions: `a=q` against `V=K[t][d]` produces all scores in one
+/// program, and `a=scores` against `V=Vᵀ[j][t]` produces `attn·V`
+/// (the value cache is stored transposed — a column-append).
+/// Exec-verified at (R,K) ∈ {(64,64),(64,256),(512,64)} with 0
+/// mismatches.
+const SKELETON_AVW: &[u8] = include_bytes!("../assets/avw_ft64_skeleton.hwx");
+
+/// Emit the broadcast matvec `z[j] = Σ_w a[w]·v[j][w]` for
+/// `a=[1,1,1,k]`, `v=[1,r,1,k]` (ANEC `matmul(transpose_y)` form).
+/// Every shape-dependent word was recovered by field-diffing ANEC
+/// artifacts across 13 `(r,k)` grid points; see the field map below.
+/// `k`/`r` are padded to 64 by the caller — zero lanes contribute
+/// nothing to the contraction.
+pub fn emit_avw(r: u32, k: u32, mil_path: &str, out_path: &str) -> Vec<u8> {
+    assert!(r >= 1 && k >= 1);
+    let k2 = k * 2; // a bytes / v row stride
+    let vbytes = r * k * 2;
+    let v_vm = (vbytes + 0x3fff) & !0x3fff;
+    let zbytes = r * 64;
+    let z_vm = (zbytes + 0x3fff) & !0x3fff;
+    let z_va = 0x3000_8000 + (v_vm - 0x4000) as u64; // z seg after v
+    let tiles = r * k / 2048 + r / 128 + k / 128;
+    let f8014 = r / 256 + r / 512 + k / 256 + k / 1024 + r.min(k) / 128;
+    // 0x802c is a low-B-bits lane mask over the c+h sliding window.
+    let b = (r / 64 + k / 64 + r.min(k) / 128).max(1);
+    assert!(b < 32, "avw lane mask overflows at r={r} k={k}");
+    let mask = (1u32 << b) - 1;
+    let small = k < 64;
+
+    let mut img = SKELETON_AVW.to_vec();
+    let put = |img: &mut Vec<u8>, off: usize, v: u32| {
+        img[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    };
+    // a surface = K*2, v = R*K*2 (+0x4000-aligned vmsize), z = R*64.
+    put(&mut img, 0xd8, k2);
+    put(&mut img, 0x120, v_vm);
+    put(&mut img, 0x170, vbytes);
+    // z segment at 0x4000+v_vm; the __text/weights segment follows it
+    // (+0x200 lands on its entry header).
+    put(&mut img, 0x1b8, z_vm);
+    for off in [0x1b0usize, 0x200, 0x368, 0x3f8] {
+        put(&mut img, off, 0x3000_0000u32.wrapping_add(0x4000 + v_vm));
+    }
+    for off in [0x248usize, 0x298, 0x388, 0xb88] {
+        put(
+            &mut img,
+            off,
+            0x3000_0000u32.wrapping_add(0x4000 + v_vm + z_vm),
+        );
+    }
+    for off in [0x2e8usize, 0x398] {
+        put(
+            &mut img,
+            off,
+            0x3000_0000u32.wrapping_add(0x4200 + v_vm + z_vm),
+        );
+    }
+    put(&mut img, 0x208, zbytes);
+    put(&mut img, 0x2a0, if small { 0x1f0 } else { 0x1f8 });
+    put(&mut img, 0xb9c, if small { 0x7c } else { 0x7e });
+    put(&mut img, 0xc08, tiles);
+    put(&mut img, 0xc4c, k);
+    for off in [0xc68usize, 0xc70, 0xc78, 0xc88, 0xc98] {
+        put(&mut img, off, k2);
+    }
+    put(&mut img, 0x198c, r);
+    put(&mut img, 0x1994, k);
+    for off in [0x19b0usize, 0x19d0, 0x19e0] {
+        put(&mut img, off, vbytes);
+    }
+    put(&mut img, 0x19b8, k2);
+    put(&mut img, 0x19c0, k2);
+    put(&mut img, 0x26d4, r);
+    for off in [0x26f8usize, 0x2718, 0x2728] {
+        put(&mut img, off, zbytes);
+    }
+    // Tail: entries carry the three layout-desc strings and z's VA.
+    let (mut entries, relocs) = tail_meta(SKELETON_AVW);
+    let a_desc =
+        format!("a:t24=ar1;0;1;25=s{k2}n:ar1;0;1;26=s{k2}c:ar1;0;1;27=s{k2}h:ar1;0;{k};28=s2w:5");
+    let v_desc = format!(
+        "v:t29=ar1;0;1;30=s{vbytes}n:ar1;0;{r};31=s{k2}c:ar1;0;1;32=s{k2}h:ar1;0;{k};33=s2w:5"
+    );
+    let z_desc =
+        format!("z:t34=ar1;0;1;35=s{zbytes}n:ar1;0;{r};36=s64c:ar1;0;1;37=s64h:ar1;0;1;38=s2w:5");
+    for e in entries.iter_mut() {
+        if e.0 == "z" {
+            e.4 = z_va;
+        } else if e.0.starts_with("a:t24") {
+            e.0 = a_desc.clone();
+        } else if e.0.starts_with("v:t29") {
+            e.0 = v_desc.clone();
+        } else if e.0.starts_with("z:t34") {
+            e.0 = z_desc.clone();
+        }
+    }
+    let (mut img, text_off) =
+        build_tail_at_reloc(&img, 0x33f0, &entries, &relocs, mil_path, out_path, 0x218);
+    debug_assert_eq!(text_off, 0x8000);
+    img.extend_from_slice(&SKELETON_AVW[0x8000..]);
+    // __text task record fields ride at file offset 0x8000.
+    put(&mut img, 0x8014, f8014);
+    put(&mut img, 0x802c, mask);
+    put(&mut img, 0x8038, k);
+    put(&mut img, 0x8048, k);
+    put(&mut img, 0x8054, r);
+    for off in [0x8074usize, 0x80fc, 0x8144] {
+        put(&mut img, off, k2);
+    }
+    // lane-stride fields saturate at 128 elements (0x100 bytes).
+    let k2_sat = k.min(128) * 2;
+    for off in [0x8090usize, 0x8094, 0x8098, 0x809c] {
+        put(&mut img, off, k2_sat);
+    }
+    put(&mut img, 0x808c, r * k * 16);
+    put(&mut img, 0x8194, r * k * 16);
+    put(&mut img, 0x80ac, k * 16);
+    put(&mut img, 0x8188, k * 16);
+    put(&mut img, 0x80d4, tiles);
+    put(&mut img, 0x8154, k);
+    put(&mut img, 0x8168, r);
+    img
+}
+
 /// Emit `p = softmax(matmul(x, y^T))` — both operands activations —
 /// byte-identically for the `[1,64,1,64]` skeleton family.
 pub fn emit_mm_sm(mil_path: &str, out_path: &str) -> Vec<u8> {
@@ -5298,6 +5427,39 @@ fn emit_from_mil_inner(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String
                 }
             };
             return emit_matmul(shape, &w, mil_path, out_path);
+        }
+        // Broadcast-vector×matrix (`avw`): `matmul(x=[1,1,1,K],
+        // y=[1,R,1,K], transpose_y)` — both operands runtime. The
+        // engine computes `z[c][h]=a·V[c+h]`; z row 0 is the matvec.
+        // Covers decode-time QKᵀ scores (`a=q`, `V=K[t][d]`) and
+        // `attn·V` (`a=scores`, `V=Vᵀ[j][t]` — transposed cache).
+        let (xname, yname) = (arg(&ops[0], "x"), arg(&ops[0], "y"));
+        let sigs = func_input_shapes(&text);
+        let shape_of = |n: &Option<String>| -> Vec<i64> {
+            sigs.iter()
+                .find(|(nm, _)| Some(nm) == n.as_ref().map(|s| s))
+                .map(|(_, s)| s.clone())
+                .unwrap_or_default()
+        };
+        let (xs, ys) = (shape_of(&xname), shape_of(&yname));
+        let ty = match arg(&ops[0], "transpose_y").as_deref() {
+            Some(v) => mil_scalar_bool(&text, v).unwrap_or(v == "true"),
+            None => false,
+        };
+        if ty
+            && xs.len() == 4
+            && ys.len() == 4
+            && xs[..3] == [1, 1, 1]
+            && ys[0] == 1
+            && ys[2] == 1
+            && xs[3] == ys[3]
+        {
+            return Ok(emit_avw(
+                ys[1].max(1) as u32,
+                xs[3].max(1) as u32,
+                mil_path,
+                out_path,
+            ));
         }
     }
     if let Some(part) = mm_part(&names) {
