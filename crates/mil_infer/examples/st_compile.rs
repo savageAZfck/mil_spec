@@ -26,8 +26,10 @@ fn main() {
     // stateful: use compile_auto which discovers inout ports itself
     match Program::compile_auto_cfg(&mil, DeviceMask::Ane, &cc) {
         Ok((prog, map)) => {
-            println!("compiled. inputs={:?} outputs={:?} inouts={:?}",
-                map.inputs, map.outputs, map.inouts);
+            println!(
+                "compiled. inputs={:?} outputs={:?} inouts={:?}",
+                map.inputs, map.outputs, map.inouts
+            );
             prog.execute().expect("exec");
             println!("exec ok");
         }

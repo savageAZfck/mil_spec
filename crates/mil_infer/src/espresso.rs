@@ -355,11 +355,14 @@ impl TensorDesc {
 /// One program IO buffer: an IOSurface plus its `_ANEIOSurfaceObject`
 /// wrapper (what `_ANERequest` wants in its arrays).
 pub struct Surface {
-    /// Raw `IOSurfaceRef` (+1, released on drop).
+    /// Raw `IOSurfaceRef` (+1, released on drop when `owned`).
     surf: Id,
     /// Retained `_ANEIOSurfaceObject`.
     wrap: Id,
     len: usize,
+    /// `false` for surfaces created by `alias_*` — they borrow another
+    /// port's handle and must not be released on drop.
+    owned: bool,
 }
 
 /// A precompiled Espresso package loaded into `aned`, buffers bound.
@@ -548,6 +551,7 @@ impl EspressoProgram {
                     surf,
                     wrap,
                     len: bytes,
+                    owned: true,
                 })
             };
             let mut inputs = Vec::new();
@@ -590,6 +594,48 @@ impl EspressoProgram {
     pub fn input_mut(&mut self, i: usize) -> &mut [u8] {
         let (p, n) = self.surf_bytes(&self.inputs[i]);
         unsafe { std::slice::from_raw_parts_mut(p, n) }
+    }
+
+    /// Read-only bytes of input surface `i` — after `eval`, meaningful
+    /// for aliased in-place ports.
+    pub fn input_bytes(&self, i: usize) -> &[u8] {
+        let (p, n) = self.surf_bytes(&self.inputs[i]);
+        unsafe { std::slice::from_raw_parts(p, n) }
+    }
+
+    /// Alias output `o` onto input `i`'s IOSurface — the program then
+    /// reads and writes the same physical pages, giving in-place
+    /// persistent state (KV-cache-style) without `state<>` ops.
+    /// `Surface` is a pair of retained refs with no `Drop`, so
+    /// duplicating the handle is safe.
+    pub fn alias_out_to_in(&mut self, o: usize, i: usize) {
+        release(self.outputs[o].wrap);
+        unsafe { (self.io.cf_release)(self.outputs[o].surf) };
+        let s = &self.inputs[i];
+        self.outputs[o] = Surface {
+            surf: s.surf,
+            wrap: s.wrap,
+            len: s.len,
+            owned: false,
+        };
+    }
+
+    /// Alias output `o` onto output `i`'s IOSurface — two output descs
+    /// write disjoint regions of one shared buffer (e.g. kv_out back
+    /// into the cache surface).
+    pub fn alias_out_to_out(&mut self, o: usize, i: usize) {
+        if o == i {
+            return;
+        }
+        release(self.outputs[o].wrap);
+        unsafe { (self.io.cf_release)(self.outputs[o].surf) };
+        let s = &self.outputs[i];
+        self.outputs[o] = Surface {
+            surf: s.surf,
+            wrap: s.wrap,
+            len: s.len,
+            owned: false,
+        };
     }
 
     /// Raw bytes of output surface `i` after `eval`.
@@ -721,8 +767,10 @@ fn err_desc(err: Id) -> String {
 impl Drop for EspressoProgram {
     fn drop(&mut self) {
         for s in self.inputs.iter().chain(self.outputs.iter()) {
-            release(s.wrap);
-            unsafe { (self.io.cf_release)(s.surf) };
+            if s.owned {
+                release(s.wrap);
+                unsafe { (self.io.cf_release)(s.surf) };
+            }
         }
         release(self.model);
         release(self.client);
