@@ -1642,140 +1642,373 @@ pub fn emit_matmul_ns(
 
 /// `c64k4` reference: `__text` at file offset `0x8000`, size `0x5f0`.
 const SKELETON_CHAIN4: &[u8] = include_bytes!("../assets/chain/c64k4.hwx");
-/// `c64k2` reference: `__text` at file offset `0x4000`, size `0x32c`;
-/// supplies the short i=1 last-task record variant (0x16c).
-const SKELETON_CHAIN2: &[u8] = include_bytes!("../assets/chain/c64k2.hwx");
 
 /// `__text` task-table header (`+0x2c` carries the multi-task flag).
 const CHAIN4_TEXT: usize = 0x8000;
-const CHAIN2_TEXT: usize = 0x4000;
 /// The signature/argv load command begins at `0x2690`; everything
 /// before it is the command prefix (`pre`) reused verbatim.
 const CHAIN_PRE_OFF: usize = 0x2690;
 
-/// Intermediate-buffer descriptor tail for a non-last record.
-/// `feeder` selects the variant used by the buffer consumed by the
-/// last task (`0x64` id + `0xfff860`/`0x04000000`); `sole` is the
-/// k==2 first-record special case (`0x63` id).
-fn chain_out_desc(rec: &mut [u8], i: usize, k: usize) {
-    let sole = k == 2;
-    let feeder = i == k - 2;
-    let id: u32 = if feeder && sole {
-        0x63
-    } else if feeder {
-        0x64
-    } else if i == 0 {
-        0x55
-    } else {
-        0x56
-    };
-    // desc offsets differ between the first record (0x190) and the
-    // middle records (0x160)
-    let base = rec.len() - 0x30;
-    put_u32(rec, base + 0x10, (id << 16) | (i as u32 + 1));
-    put_u32(rec, base + 0x18, if feeder { 0x0400_0000 } else { 0 });
-    put_u32(rec, base + 0x20, if feeder { 0xfff860 } else { 0xfff820 });
-    put_u32(rec, base + 0x2c, if feeder { 0 } else { 1 });
+/// Narrow-channel regime: `f128 = ceil(cout/16)` in `5..=8`. Narrow-cout
+/// task records drop the f128 word (everything below `+0xf8` shifts up
+/// one u32) and carry the `0x91418005` marker instead of `0x93418005`.
+fn chain_narrow(cout: usize) -> bool {
+    (65..=128).contains(&cout)
 }
 
-/// Emit a complete HWX image for a chain of `k` identical `conv1x1`
-/// ops (`Cin == Cout == 64`), where task `i` consumes task `i-1`'s
-/// output — the multi-task analogue of [`emit_conv1x1_ns`]. `weights`
-/// is `k` consecutive `[64,64]` fp16 matrices; each task's stream is
-/// [`weight_layout_ns`] at `__KERN_0` offset `i * 0x2000`, and its
-/// kernel family name hashes the blob data offset `0x80 + i * 0x2040`.
+
+/// Emit a complete HWX image for a chain of `conv1x1` tasks where
+/// task `i` consumes task `i-1`'s output — the multi-task analogue of
+/// [`emit_conv1x1_ns`]. `shapes[i] = (cin, cout)`; `weights` holds
+/// each task's `[cin,cout]` fp16 matrix concatenated; `data_offs[i]`
+/// is task `i`'s weight payload offset inside the referenced
+/// `weights/weight.bin` (hashed into its kernel family name).
 /// `out_name` is the network output symbol (`y{k}` in the corpus).
-pub fn emit_conv_chain64(
-    k: usize,
+///
+/// Verified byte-for-byte against ANEC for same-shape chains
+/// (C=64 at depths 2..6,8) and the mixed `64→32→64` pair.
+pub fn emit_conv_chain(
+    shapes: &[(usize, usize)],
     weights: &[u16],
+    data_offs: &[u64],
     out_name: &str,
     mil_path: &str,
     out_path: &str,
 ) -> Result<Vec<u8>, String> {
+    let k = shapes.len();
     if k < 2 {
         return Err("chain emitter needs >=2 tasks".into());
     }
-    if weights.len() < k * 4096 {
-        return Err(format!("expected {} weights, got {}", k * 4096, weights.len()));
+    if data_offs.len() != k {
+        return Err("data_offs must carry one entry per task".into());
+    }
+    let need: usize = shapes.iter().map(|&(ci, co)| ci * co).sum();
+    if weights.len() < need {
+        return Err(format!("expected {need} weights, got {}", weights.len()));
     }
 
-    let kern_va: u64 = 0x3001_0000;
-    let rec_lens = |i: usize| -> usize {
-        match (i, k) {
-            (0, _) => 0x190,
-            (i, k) if i == k - 1 => {
-                if i == 1 {
-                    0x16c
-                } else {
-                    0x170
-                }
-            }
-            _ => 0x160,
+    // per-task kernel stream + lane tables
+    let mut streams: Vec<Vec<u16>> = Vec::with_capacity(k);
+    let mut lane_offs: Vec<Vec<usize>> = Vec::with_capacity(k);
+    let mut lane_szs: Vec<Vec<usize>> = Vec::with_capacity(k);
+    let mut kern_off: Vec<usize> = Vec::with_capacity(k);
+    let mut off = 0usize;
+    let mut wcur = 0usize;
+    for &(ci, co) in shapes {
+        kern_off.push(off);
+        let (s, lo, ls) = weight_layout_ns(&weights[wcur..wcur + ci * co], ci, co);
+        off += s.len() * 2;
+        wcur += ci * co;
+        streams.push(s);
+        lane_offs.push(lo);
+        lane_szs.push(ls);
+    }
+    let kern_bytes = off;
+    // Network I/O channel counts drive the FVMLIB buffer sizes and the
+    // VA cascade: each FVMLIB segment is max(0x4000, c*0x40) and every
+    // downstream section base follows.
+    let c_in = shapes[0].0 as u32;
+    let c_out = shapes[k - 1].1 as u32;
+    let fv_in = (c_in * 0x40).max(0x4000) as u64;
+    let fv_out = (c_out * 0x40).max(0x4000) as u64;
+    let out_va = 0x3000_0000u64 + fv_in;
+    let text_va = out_va + fv_out;
+    let kern_va = text_va + 0x8000;
+    // per-descriptor page-count word (desc block +4 and blob 0xbe8):
+    // only nonzero once the input FVMLIB region spans a full 0x4000
+    // page (c_in * 0x40 >= 0x4000, i.e. c_in >= 256).
+    let f14 = c_in * 0x40 / 0x4000;
+    let desc_flag = |cout: usize| -> u32 {
+        if f14 != 0 {
+            (cout as u32 * 0x40).div_ceil(0x4000)
+        } else {
+            0
+        }
+    };
+    let f128_of = |cout: usize| -> u32 {
+        match cout.div_ceil(16) {
+            ..=2 => 1,
+            3 | 4 => 2,
+            9..=16 => 4,
+            _ => 5,
         }
     };
 
+    // ---- intermediate buffer pool -----------------------------------
+    // Buffer `j` is task j's output (y_{j+1}), live during tasks
+    // {j, j+1}; slot size = cout*16. If the intermediates are not
+    // already in non-increasing size order, ANEC packs them into a
+    // descending-size arena; otherwise offsets are plain cumulative
+    // (no reuse). Reuse is single-slot: a buffer joins the *most
+    // recently created* slot iff every tenant is liveness-disjoint
+    // (|m - b| > 1); otherwise a new slot is carved at the arena end.
+    let n_int = k - 1;
+    let isz: Vec<usize> = (0..n_int).map(|j| shapes[j].1 * 16).collect();
+    let mut order: Vec<usize> = (0..n_int).collect();
+    order.sort_by(|&a, &b| isz[b].cmp(&isz[a]));
+    let reordered = order.iter().enumerate().any(|(p, &b)| p != b);
+    let mut pool_off = vec![0usize; n_int];
+    // whether a buffer's slot was created after the pool's first reuse
+    // event (controls the `0x120` word in long input descriptors on
+    // buffers after y1).
+    let mut slot_after_reuse = vec![false; n_int];
+    if !reordered {
+        let mut acc = 0usize;
+        for j in 0..n_int {
+            pool_off[j] = acc;
+            acc += isz[j];
+        }
+    } else {
+        // (offset, created_post_reuse, tenants)
+        let mut slots: Vec<(usize, bool, Vec<usize>)> = Vec::new();
+        let mut end = 0usize;
+        let mut reused = false;
+        for &b in &order {
+            let mut hit = false;
+            if let Some((so, created_post, occ)) = slots.last_mut() {
+                if occ.iter().all(|&m| usize::abs_diff(m, b) > 1) {
+                    pool_off[b] = *so;
+                    slot_after_reuse[b] = *created_post;
+                    occ.push(b);
+                    hit = true;
+                }
+            }
+            if !hit {
+                pool_off[b] = end;
+                end += isz[b];
+                slot_after_reuse[b] = reused;
+                slots.push((end - isz[b], reused, vec![b]));
+            }
+            if !reused && slots.last().map_or(false, |s| s.2.len() > 1) {
+                reused = true;
+            }
+        }
+    }
+    // intermediates strictly larger than buffer `b` that precede it in
+    // the pool order (feeds the descriptor-id decrement).
+    let narrow_before = |b: usize| -> u32 {
+        if !reordered {
+            return 0;
+        }
+        let sz = isz[b];
+        (0..n_int)
+            .filter(|&m| isz[m] > sz && chain_narrow(shapes[m].1))
+            .count() as u32
+    };
+
     // ---- __text: header + task records ------------------------------
+    // The task-table header's +0x10 hi16 encodes the x descriptor id.
+    // Empirically (all corpus chains): 0x62 when the first intermediate
+    // is narrow-class and no larger than... over (y1, y2):
+    //   narrow(y1): y2 <= y1 -> 0x62, y2 > y1 -> 0x63
+    //   else:       y2 >  y1 -> 0x64, else    -> 0x63
+    // k=2 has a single intermediate: 0x62 iff narrow(y1).
+    let hdr10: u32 = {
+        let y1 = shapes[0].1;
+        if k == 2 {
+            if chain_narrow(y1) { 0x62 } else { 0x63 }
+        } else {
+            let y2 = shapes[1].1;
+            if chain_narrow(y1) {
+                if y2 <= y1 { 0x62 } else { 0x63 }
+            } else if y2 > y1 {
+                0x64
+            } else {
+                0x63
+            }
+        }
+    };
     let mut text = SKELETON_CHAIN4[CHAIN4_TEXT..CHAIN4_TEXT + 0x30].to_vec();
+    put_u32(&mut text, 0x10, hdr10 << 16);
+    put_u32(&mut text, 0x14, f14 as u32);
     put_u32(&mut text, 0x2c, 1); // multi-task flag
+    let head = &SKELETON_CHAIN4[CHAIN4_TEXT + 0x1c0..CHAIN4_TEXT + 0x1c0 + 0xf8];
     let mut relocs: Vec<[u8; 8]> = Vec::with_capacity(k);
     let mut rec_base = 0x30usize;
+    let push = |rec: &mut Vec<u8>, v: u32| rec.extend_from_slice(&v.to_le_bytes());
     for i in 0..k {
+        let (ci, co) = shapes[i];
         let last = i == k - 1;
-        let (mut rec, reloc_off) = if i == 0 {
-            (
-                SKELETON_CHAIN4[CHAIN4_TEXT + 0x30..CHAIN4_TEXT + 0x1c0].to_vec(),
-                0x150usize,
-            )
-        } else if last && i == 1 {
-            (
-                SKELETON_CHAIN2[CHAIN2_TEXT + 0x1c0..CHAIN2_TEXT + 0x32c].to_vec(),
-                0x150usize,
-            )
-        } else if last {
-            (
-                SKELETON_CHAIN4[CHAIN4_TEXT + 0x480..CHAIN4_TEXT + 0x5f0].to_vec(),
-                0x154usize,
-            )
-        } else if i == 1 {
-            (
-                SKELETON_CHAIN4[CHAIN4_TEXT + 0x1c0..CHAIN4_TEXT + 0x320].to_vec(),
-                0x12cusize,
-            )
-        } else {
-            (
-                SKELETON_CHAIN4[CHAIN4_TEXT + 0x320..CHAIN4_TEXT + 0x480].to_vec(),
-                0x130usize,
-            )
-        };
-        // shared head fields
+        let narrow = chain_narrow(co);
+        let feeder = i + 1 == k - 1;
+        // input buffer y_i = intermediate i-1; output y_{i+1} = i.
+        let in_off = if i == 0 { 0 } else { pool_off[i - 1] };
+        let out_off = if last { 0 } else { pool_off[i] };
+
+        let mut rec = head.to_vec();
         put_u32(&mut rec, 0x00, if last { 0x0005_0009 } else { 0x0005_0001 });
         put_u32(&mut rec, 0x08, 0x10240 + (i as u32) * 0x10000 + if last { 0x80 } else { 0 });
         for j in 0..16 {
             let o = 0x0c + j * 4 + if j >= 9 { 4 } else { 0 };
             put_u32(&mut rec, o, 0x21 + (i as u32) * 0x10000);
         }
-        // input-side descriptor: mid/last records for i>=2 carry the
-        // `0x104, 0x400*(i-1)` word pair; the i=1 forms collapse them
-        // into the single `0x120` word (template already carries it).
-        if i >= 2 {
-            put_u32(&mut rec, 0x108, 0x400 * (i as u32 - 1));
-            put_u32(&mut rec, 0x118, 0x400 * i as u32);
+        for j in 0..15 {
+            put_u32(&mut rec, 0x54 + j * 4, lane_offs[i][j + 1] as u32);
         }
-        if last {
-            // network-output tail: task marker + kern stream offset
-            let e0 = if i == 1 { 0x13c } else { 0x140 };
-            put_u32(&mut rec, e0, ((i as u32) << 16) | 0xe0);
-            let kf = if i == 1 { 0x150 } else { 0x154 };
-            put_u32(&mut rec, kf, 0x2000 * i as u32);
-            let lastw = rec.len() - 4;
-            put_u32(&mut rec, lastw, 0x0100_0031 + (i as u32) * 0x10000);
-        } else {
-            if i == 1 {
-                put_u32(&mut rec, 0x12c, 0x2000 * i as u32);
-            } else if i > 1 {
-                put_u32(&mut rec, 0x130, 0x2000 * i as u32);
+        for j in 0..16 {
+            put_u32(&mut rec, 0x90 + j * 4, lane_szs[i][j] as u32);
+        }
+        put_u32(&mut rec, 0xdc, ci as u32);
+        put_u32(
+            &mut rec,
+            0xe0,
+            if narrow { 0x9141_8005 } else { 0x9341_8005 },
+        );
+        put_u32(&mut rec, 0xec, co as u32);
+        if !narrow {
+            push(&mut rec, f128_of(co));
+        }
+        push(&mut rec, 0x0010_0000);
+
+        let reloc_off;
+        if i == 0 {
+            for v in [
+                0x8008_1342u32,
+                0xce,
+                0x40,
+                0x135a,
+                0x0100_2031,
+                0x0000_9041,
+                0x0050_0172,
+                0x0050_0130,
+            ] {
+                push(&mut rec, v);
             }
-            chain_out_desc(&mut rec, i, k);
+            push(
+                &mut rec,
+                if out_off == 0 { 0xd007_9044 } else { 0xf007_9044 },
+            );
+            push(&mut rec, (out_off + co * 16) as u32);
+            push(&mut rec, 0x10);
+            for _ in 0..3 {
+                push(&mut rec, (ci * 16) as u32);
+            }
+            push(&mut rec, 0x0050_0170);
+            if out_off != 0 {
+                push(&mut rec, out_off as u32);
+            }
+            push(&mut rec, 0x10);
+            for v in [0x8002_1241u32, 0x0010_3c00, 0x0000_3c00, 0x2380_9544] {
+                push(&mut rec, v);
+            }
+            reloc_off = rec.len();
+            push(&mut rec, kern_off[i] as u32);
+            for v in [0u32, 0x2280_9344, 0, 0, 0x2200_1340, 0x21] {
+                push(&mut rec, v);
+            }
+            while rec.len() < 0x170 {
+                push(&mut rec, 0);
+            }
+            debug_assert_eq!(rec.len(), 0x170);
+        } else {
+            // input descriptor: short form at pool offset 0, long form
+            // otherwise. The long form's second word turns 0x120 when
+            // the buffer's slot was created after the first reuse.
+            if in_off == 0 {
+                for v in [0x8004_1041u32, 0x120, 0x10] {
+                    push(&mut rec, v);
+                }
+            } else {
+                let w2 = if i > 1 && slot_after_reuse[i - 1] {
+                    0x120
+                } else {
+                    0x104
+                };
+                for v in [0x8006_1041u32, w2, in_off as u32, 0x10] {
+                    push(&mut rec, v);
+                }
+            }
+            if last {
+                push(&mut rec, 0x0000_9052);
+                push(&mut rec, 0x14a);
+                push(&mut rec, (in_off + ci * 16) as u32);
+                for v in [
+                    0x8002_1241u32,
+                    0x0010_3c00,
+                    0x0000_3c00,
+                    0x8080_1445,
+                    0x40,
+                    0x0130_2031,
+                    0x8311_9640,
+                    0x12,
+                    0x00a0_00a0,
+                    ((i as u32) << 16) | 0xe0,
+                    0,
+                    0x007f_0000,
+                    0x2001_0701,
+                    0x2380_9544,
+                ] {
+                    push(&mut rec, v);
+                }
+                reloc_off = rec.len();
+                push(&mut rec, kern_off[i] as u32);
+                for v in [0u32, 0x2300_9442, 0, 0, 0x2200_1440] {
+                    push(&mut rec, v);
+                }
+                push(&mut rec, 0x0100_0031 + (i as u32) * 0x10000);
+            } else {
+                if out_off == 0 {
+                    for v in [0x8001_1052u32, 0x140, 0x10] {
+                        push(&mut rec, v);
+                    }
+                } else {
+                    for v in [0x0001_1052u32, 0x140, out_off as u32, 0x10] {
+                        push(&mut rec, v);
+                    }
+                }
+                for v in [0x8002_1241u32, 0x0010_3c00, 0x0000_3c00, 0x2380_9544] {
+                    push(&mut rec, v);
+                }
+                reloc_off = rec.len();
+                push(&mut rec, kern_off[i] as u32);
+            }
+        }
+
+        if !last {
+            // intermediate-buffer descriptor block at a fixed tail
+            // offset. Narrow records sit 0x10 lower — except when both
+            // the input and output descriptors carry pool offsets
+            // (long/long), which restores the wide-record length.
+            let base = if i == 0 {
+                0x170
+            } else if narrow && !(in_off != 0 && out_off != 0) {
+                0x130
+            } else {
+                0x140
+            };
+            while rec.len() < base {
+                push(&mut rec, 0);
+            }
+            let oid = if feeder {
+                // buffer consumed by the last task: 0x63 when it grew
+                // past the previous intermediate or the output is
+                // narrow-class; 0x64 otherwise. k=2 runs one class lower.
+                let cond = chain_narrow(shapes[k - 1].1)
+                    || (k >= 3 && shapes[k - 2].1 > shapes[k - 3].1);
+                (if k == 2 { 0x63u32 } else { 0x64u32 }) - cond as u32
+            } else if i == 0 && k == 3 {
+                // single intermediate besides the feeder (k=3):
+                // 0x54 when the feeder is narrow-class and at least as
+                // large as this buffer, else 0x55.
+                if chain_narrow(shapes[1].1) && shapes[1].1 >= shapes[0].1 {
+                    0x54
+                } else {
+                    0x55
+                }
+            } else if i == 0 {
+                0x55 - narrow_before(i)
+            } else {
+                // 0x56 less out-at-offset-0 and displaced-by-narrow.
+                0x56 - (out_off == 0) as u32 - narrow_before(i)
+            };
+            push(&mut rec, (oid << 16) | (i as u32 + 1));
+            push(&mut rec, desc_flag(shapes[i].1));
+            push(&mut rec, if feeder { 0x0400_0000 } else { 0 });
+            push(&mut rec, 0);
+            push(&mut rec, if feeder { 0xfff8_60 } else { 0xfff8_20 });
+            push(&mut rec, 0);
+            push(&mut rec, 0);
+            push(&mut rec, if feeder { 0 } else { 1 });
         }
         relocs.push([
             (rec_base + reloc_off) as u8,
@@ -1787,22 +2020,19 @@ pub fn emit_conv_chain64(
             0,
             0x07,
         ]);
-        rec_base += rec_lens(i);
+        rec_base += rec.len();
         text.extend_from_slice(&rec);
     }
     let textlen = text.len();
 
     // ---- symtab entries ---------------------------------------------
-    let (stream0, lane_off, _) = weight_layout_ns(&weights[..4096], 64, 64);
-    let _ = stream0;
-    let mut entries: Vec<(String, u8, u8, u16, u64)> =
-        Vec::with_capacity(27 + 16 * k);
+    let mut entries: Vec<(String, u8, u8, u16, u64)> = Vec::with_capacity(27 + 16 * k);
     entries.push(("x".into(), 0x0f, 1, 0, 0x3000_0000));
-    entries.push((out_name.into(), 0x0f, 2, 0, 0x3000_4000));
+    entries.push((out_name.into(), 0x0f, 2, 0, out_va));
     // ANEC orders the table x, out, then every family's primary `ne_0`
     // (desc=2), then each family's remaining `ne_1..15` lanes.
     let knames: Vec<String> = (0..k)
-        .map(|i| conv_kernel_name_ns(64, 64, 0x80 + i as u64 * 0x2040))
+        .map(|i| conv_kernel_name_ns(shapes[i].0 as u64, shapes[i].1 as u64, data_offs[i]))
         .collect();
     for (i, kn) in knames.iter().enumerate() {
         entries.push((
@@ -1810,7 +2040,7 @@ pub fn emit_conv_chain64(
             0x0f,
             5,
             2,
-            kern_va + (i * 0x2000 + lane_off[0]) as u64,
+            kern_va + (kern_off[i] + lane_offs[i][0]) as u64,
         ));
     }
     for (i, kn) in knames.iter().enumerate() {
@@ -1820,45 +2050,72 @@ pub fn emit_conv_chain64(
                 0x0f,
                 5,
                 0,
-                kern_va + (i * 0x2000 + lane_off[j]) as u64,
+                kern_va + (kern_off[i] + lane_offs[i][j]) as u64,
             ));
         }
     }
     for ty in TYPE_SYMS {
         entries.push(((*ty).into(), 0x80, 0, 0, 0));
     }
-    entries.push((layout_desc("x", 24, 64), 0x20, 0, 0x18, 0));
-    entries.push((layout_desc(out_name, 29, 64), 0x20, 0, 0x1d, 0));
+    entries.push((layout_desc("x", 24, shapes[0].0 as u32), 0x20, 0, 0x18, 0));
+    entries.push((layout_desc(out_name, 29, shapes[k - 1].1 as u32), 0x20, 0, 0x1d, 0));
 
     // ---- envelope: prefix + generated tail ---------------------------
     let const2_span = textlen.div_ceil(0x40) * 0x40;
-    let kern_bytes = k * 0x2000;
     let kern_vsz = kern_bytes.div_ceil(0x4000) * 0x4000;
     let pre = &SKELETON_CHAIN4[..CHAIN_PRE_OFF];
     let (mut img, text_off) =
         build_tail_at_reloc(pre, CHAIN_PRE_OFF, &entries, &relocs, mil_path, out_path, 0x218);
     let const2_fo = text_off + const2_span;
     let kern_fo = text_off + 0x8000;
-    let const2_va = 0x3000_8000u64 + const2_span as u64;
+    let const2_va = text_va + const2_span as u64;
 
+    // FVMLIB buffer segments: cmd1 = network input, cmd2 = network
+    // output — section size = channels * 0x40 (verified C=32/64/64→32→32)
+    put_u64(&mut img, 0x88, fv_in); // __FVMLIB(in) seg vmsize
+    put_u64(&mut img, 0xd8, (c_in * 0x40) as u64);
+    put_u64(&mut img, 0x118, out_va); // __FVMLIB(out) seg vmaddr
+    put_u64(&mut img, 0x120, fv_out); // __FVMLIB(out) seg vmsize
+    put_u64(&mut img, 0x168, out_va); // __data sect addr
+    put_u64(&mut img, 0x170, (c_out * 0x40) as u64);
+    put_u64(&mut img, 0x1b0, text_va); // __TEXT seg vmaddr
     put_u64(&mut img, 0x1c0, text_off as u64); // __TEXT seg fileoff
+    put_u64(&mut img, 0x200, text_va); // __text sect addr
     put_u64(&mut img, 0x208, textlen as u64); // __text sect size
     put_u32(&mut img, 0x210, text_off as u32); // __text sect offset
     put_u32(&mut img, 0x21c, k as u32); // __text nreloc
     put_u64(&mut img, 0x250, const2_va); // __const sect addr
     put_u32(&mut img, 0x260, const2_fo as u32); // __const sect offset
+    put_u64(&mut img, 0x298, kern_va); // __KERN_0 seg vmaddr
     put_u64(&mut img, 0x2a0, kern_vsz as u64); // __KERN_0 vmsize
     put_u64(&mut img, 0x2a8, kern_fo as u64); // __KERN_0 fileoff
     put_u64(&mut img, 0x2b0, kern_vsz as u64); // __KERN_0 filesize
+    put_u64(&mut img, 0x2e8, kern_va); // __kern_0 sect addr
     put_u64(&mut img, 0x2f0, kern_bytes as u64); // __kern_0 sect size
     put_u32(&mut img, 0x2f8, kern_fo as u32); // __kern_0 sect offset
     // bind1 (network output) +0x18 carries a symbol-table reference:
     // (0x30 + k) in the high byte — same `k + 0x30` as cmd 0x4 #3.
+    put_u32(&mut img, 0x348, out_va as u32); // cmd 0x4 #0: out VA
     put_u32(&mut img, 0x350, ((0x30 + k as u32) << 8) | 0x79);
+    put_u32(&mut img, 0x368, text_va as u32); // cmd 0x4 #0: text VA
     put_u32(&mut img, 0x378, const2_va as u32); // cmd 0x4 #1: const VA
+    put_u32(&mut img, 0x3c8, out_va as u32); // cmd 0x4 #?: out VA
+    put_u32(&mut img, 0x3d8, kern_va as u32); // cmd 0x4 #?: kern VA
+    put_u32(&mut img, 0xb68, text_va as u32); // cmd 0x4 #1: text VA
+    put_u32(&mut img, 0xbe8, f14 as u32); // cmd 0x4 #1: io page count
     put_u32(&mut img, 0xb7c, (textlen / 4) as u32); // cmd 0x4 #1: text words
     put_u32(&mut img, 0xb88, k as u32); // cmd 0x4 #1: task count
     put_u32(&mut img, 0xbb8, (14 * k + 3) as u32); // cmd 0x4 #1: sched count
+    // cmd 0x4 #1 input side: channel count + three buffer-size copies
+    put_u32(&mut img, 0xc24, c_in);
+    for o in [0xc48usize, 0xc68, 0xc78] {
+        put_u32(&mut img, o, c_in * 0x40);
+    }
+    // cmd 0x4 #3 output side: channel count + three buffer-size copies
+    put_u32(&mut img, 0x196c, c_out);
+    for o in [0x1990usize, 0x19b0, 0x19c0] {
+        put_u32(&mut img, o, c_out * 0x40);
+    }
     put_u32(&mut img, 0x267c, 0x4030_7900 + (k as u32) * 0x10000);
     put_u32(&mut img, 0x2688, (0x30 + k) as u32);
 
@@ -1866,10 +2123,8 @@ pub fn emit_conv_chain64(
     img.resize(text_off, 0);
     img.extend_from_slice(&text);
     img.resize(kern_fo, 0);
-    for i in 0..k {
-        let (stream, _, _) =
-            weight_layout_ns(&weights[i * 4096..(i + 1) * 4096], 64, 64);
-        for v in &stream {
+    for s in &streams {
+        for v in s {
             img.extend_from_slice(&v.to_le_bytes());
         }
     }
@@ -1877,6 +2132,26 @@ pub fn emit_conv_chain64(
     Ok(img)
 }
 
+/// Same-shape convenience wrapper over [`emit_conv_chain`].
+pub fn emit_conv_chain64(
+    k: usize,
+    weights: &[u16],
+    out_name: &str,
+    mil_path: &str,
+    out_path: &str,
+) -> Result<Vec<u8>, String> {
+    emit_conv_chain(
+        &vec![(64usize, 64usize); k],
+        weights,
+        &(0..k).map(|i| 0x80 + i as u64 * 0x2040).collect::<Vec<_>>(),
+        out_name,
+        mil_path,
+        out_path,
+    )
+}
+
+/// Emit a complete HWX image for the fused chain
+/// `z = sigmoid(conv1x1(x, w))` — the real-model pattern — for `C=64`.
 ///
 /// `__KERN_0` layout differs from bare conv: sixteen bands of
 /// `0x280` bytes each, `[0x80 sigmoid LUT][0x200 band weights]`

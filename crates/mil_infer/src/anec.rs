@@ -56,6 +56,7 @@ extern "C" {
     fn CFArrayGetCount(arr: *const c_void) -> i64;
     fn CFArrayGetValueAtIndex(arr: *const c_void, idx: i64) -> *const c_void;
     fn CFNumberGetValue(num: *const c_void, ty: i32, out: *mut c_void) -> bool;
+    fn CFNumberCreate(alloc: *const c_void, ty: i32, val: *const c_void) -> *mut c_void;
     fn CFGetTypeID(obj: *const c_void) -> u64;
     fn CFStringGetTypeID() -> u64;
     fn CFNumberGetTypeID() -> u64;
@@ -182,6 +183,13 @@ fn dset(d: *mut c_void, k: &str, v: *const c_void) {
 
 fn dset_str(d: *mut c_void, k: &str, v: &str) {
     dset(d, k, cfstr(v) as *const c_void);
+}
+
+fn dset_num(d: *mut c_void, k: &str, v: i64) {
+    unsafe {
+        let n = CFNumberCreate(std::ptr::null(), CF_NUMBER_SINT64, &v as *const i64 as *const c_void);
+        CFDictionarySetValue(d, cfstr(k) as *const c_void, n);
+    }
 }
 
 fn carray(items: &[*const c_void]) -> *mut c_void {
@@ -363,6 +371,25 @@ impl Anec {
     fn params_dict(arch: &str) -> *mut c_void {
         let p = mdict();
         dset_str(p, "TargetArchitecture", arch);
+        if let Ok(mask) = std::env::var("ANEC_DEBUG_MASK") {
+            if let Ok(v) = mask.parse::<i64>() {
+                dset_num(p, "DebugMask", v);
+            }
+        }
+        if std::env::var_os("ANEC_DEBUG_COMPILE").is_some() {
+            dset_num(p, "CompileANEProgramForDebugging", 1);
+        }
+        if let Ok(v) = std::env::var("ANEC_OPT") {
+            for kv in v.split(',') {
+                if let Some((k, n)) = kv.split_once('=') {
+                    if let Ok(iv) = n.parse::<i64>() {
+                        dset_num(p, k, iv);
+                    } else {
+                        dset_str(p, k, n);
+                    }
+                }
+            }
+        }
         p
     }
 
