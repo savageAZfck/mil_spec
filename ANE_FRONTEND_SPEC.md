@@ -174,3 +174,34 @@ all 8 `kv_*` states write back exactly their [2,3,5,64] update regions,
 output fully populated. `milc ane run <model.mil> [--steps N]` drives it.
 
       milc ane run model.ane.mil --steps 3   # compile → bind → execute
+
+## Stateful emission decode (hwx backend)
+
+Verified grammar (ANECCompile + ANECValidate, ios18 only — ios19 rejects
+state params):
+
+- `write_state(data=X, input=st)` accepts **only** state-derived X:
+  the `read_state` result or a `slice_update`/`slice_by_index` chain on
+  it. Writing an arbitrary computed tensor → `InvalidMILProgram`.
+- `slice_update` on state requires the FULL arg list
+  (`begin`,`begin_mask`,`end`,`end_mask`,`squeeze_mask`,`stride`,
+  `update`,`x`); minimal form is rejected. `update` may be a const blob
+  or runtime input.
+
+Mach-O structure for `state<>` params (diffed vs stateless):
+
+- One `__FVMLIB.__data` section per state, sized exactly to the dense
+  tensor bytes (no 64B row alignment — states pack stride-2, e.g.
+  [2,3,5,64] desc `ar1;0;2 → n=3 → c=5 → h=64` dense row-major).
+- State sections come FIRST in bind order; io symbols shift (cur is
+  symtab section 1 when it's the first state).
+- `__text` gains a state-copy record: instruction id `0x9365` (4-D
+  states) / `0x9361` (3-D), family `0x93xx` vs compute `0x9541`.
+  Field map so far (passthrough corpus [4,16,32]/[8,4,32]/[4,16,64]):
+  words 14-16 and 18-20 = dims reversed (innermost at w14); leading-1
+  dims are dropped entirely ([1,4,16,32] ≡ [4,16,32] byte-identical);
+  record grows by ~4 words when a dim crosses an encoding threshold
+  (word 12 = 0x50001 long-form vs 0x40001).
+- Espresso `modelAtURL` loads stateful artifacts directly: state ports
+  surface as inouts (hidden from input_descs/output_descs), program
+  runs — verified: `st_compile`-compiled rsw triple loads + evals.
