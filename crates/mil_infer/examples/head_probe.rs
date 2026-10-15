@@ -10,7 +10,8 @@
 //!   o = out·Wo                    matmul_ns
 use mil_infer::espresso::EspressoProgram;
 use mil_infer::hwx::{
-    emit_add4d64, emit_attn_v, emit_avw, emit_matmul_ns, emit_outer, emit_softmax_ch,
+    emit_add4d64, emit_attn_v, emit_avw, emit_maskadd64, emit_matmul_ns, emit_outer,
+    emit_softmax_ch,
 };
 use std::path::Path;
 fn f16(v: f32) -> u16 {
@@ -49,6 +50,8 @@ fn main() {
     let mut av = load(emit_add4d64("/tmp/ha.mil", &p), &p);
     let p = format!("/tmp/hp_s_{pid}.macho");
     let mut sc = load(emit_avw(t_max as u32, d as u32, "/tmp/hs.mil", &p), &p);
+    let p = format!("/tmp/hp_mk_{pid}.macho");
+    let mut mk_ = load(emit_maskadd64("/tmp/hk.mil", &p), &p);
     let p = format!("/tmp/hp_sm_{pid}.macho");
     let mut sm = load(
         emit_softmax_ch(t_max as u32, "/tmp/hm.mil", &p).unwrap(),
@@ -103,8 +106,10 @@ fn main() {
     // scores avw: a=q proj output adopted; v=K cache frame adopted
     sc.adopt_input(0, pq.output_surf(0)).expect("q");
     sc.adopt_input(1, ak.output_surf(0)).expect("K");
-    // softmax in-place on scores surface
+    // scores += mask in-place, then softmax in-place on scores surface
     let scores = sc.output_surf(0);
+    mk_.adopt_input(0, scores).expect("mk in");
+    mk_.adopt_output(0, scores).expect("mk out");
     sm.adopt_input(0, scores).expect("sm in");
     sm.adopt_output(0, scores).expect("sm out");
     // attn_v: s=softmax out, v=V cache

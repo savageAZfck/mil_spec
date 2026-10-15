@@ -4998,6 +4998,25 @@ pub fn emit_add4d64(mil_path: &str, out_path: &str) -> Vec<u8> {
     .expect("add4d tail fits under __text")
 }
 
+/// Strided `[1,64,1,1]` add — the causal-mask op: `scores += mask`
+/// where mask[t] = 0 for t ≤ now, -inf (fp16 `-65504`) beyond. Strides
+/// match the `avw`/`smc` score surface exactly.
+const SKELETON_MASKADD64: &[u8] = include_bytes!("../assets/maskadd64_skeleton.hwx");
+
+pub fn emit_maskadd64(mil_path: &str, out_path: &str) -> Vec<u8> {
+    let (entries, relocs) = tail_meta(SKELETON_MASKADD64);
+    rebuild_tail_at_text(
+        SKELETON_MASKADD64,
+        0x33f0,
+        0x8000,
+        &entries,
+        &relocs,
+        mil_path,
+        out_path,
+    )
+    .expect("maskadd tail fits under __text")
+}
+
 /// Emit the attn·V matvec for `(t, d)` pairs on the skeleton table.
 pub fn emit_attn_v(t: u32, d: u32, mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> {
     let skel = match (t, d) {
