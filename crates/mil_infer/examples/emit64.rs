@@ -1,8 +1,7 @@
 use mil_infer::hwx::{emit_elementwise2, EwOp};
 fn main() {
-    let a = emit_elementwise2(EwOp::Mul, 256, "kv_mul.mil", "/tmp/kv_mul.macho");
-    std::fs::write("/tmp/kv_a.macho", &a).unwrap();
-    let b = emit_elementwise2(EwOp::Mul, 256, "kv_mul.mil", "/tmp/kv_mul.macho");
-    std::fs::write("/tmp/kv_b.macho", &b).unwrap();
-    println!("identical={}", a == b);
+    for (op, name) in [(EwOp::Mul, "m1024"), (EwOp::Add, "a1024")] {
+        let p = format!("/tmp/{name}.macho");
+        std::fs::write(&p, emit_elementwise2(op, 1024, "/tmp/a.mil", &p)).unwrap();
+    }
 }

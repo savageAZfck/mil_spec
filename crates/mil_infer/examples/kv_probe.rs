@@ -17,7 +17,7 @@ use mil_infer::espresso::EspressoProgram;
 use mil_infer::hwx::{emit_elementwise2, EwOp};
 use std::path::Path;
 
-const N: usize = 256; // flat cache: 2 slots x 128 lanes (n<=256 = supported ew layout)
+const N: usize = 1024; // flat cache: 8 slots x 128 lanes (big-n layout, n>256)
 const SLOT: usize = 128;
 
 fn f16(v: f32) -> u16 {
@@ -27,33 +27,49 @@ fn f32_of(h: u16) -> f32 {
     half::f16::from_bits(h).to_f32()
 }
 
+// element axis: channel axis for the n<=256 dim-1 layout, batch axis
+// for the n>256 dim-0 layout
+fn eoff(d: &mil_infer::espresso::TensorDesc, pos: usize) -> usize {
+    if d.n > 1 {
+        d.offset(pos as u64, 0, 0, 0, 0)
+    } else {
+        d.offset(0, 0, pos as u64, 0, 0)
+    }
+}
 fn put(buf: &mut [u8], d: &mil_infer::espresso::TensorDesc, pos: usize, v: f32) {
-    let off = d.offset(0, 0, pos as u64, 0, 0);
+    let off = eoff(d, pos);
     if off + 2 <= buf.len() {
         buf[off..off + 2].copy_from_slice(&f16(v).to_le_bytes());
     }
 }
 fn get(buf: &[u8], d: &mil_infer::espresso::TensorDesc, pos: usize) -> f32 {
-    let off = d.offset(0, 0, pos as u64, 0, 0);
-    f32_of(u16::from_le_bytes([buf[off], buf[off + 1]]))
+    let off = eoff(d, pos);
+    if off + 2 <= buf.len() {
+        f32_of(u16::from_le_bytes([buf[off], buf[off + 1]]))
+    } else {
+        f32::NAN
+    }
 }
 
 fn main() {
-    let mul_path = "/tmp/kv2_mul.macho";
-    let add_path = "/tmp/kv2_add.macho";
+    // unique paths per run — aned's patch cache keys on the embedded
+    // output path and can replay a stale patched image otherwise
+    let pid = std::process::id();
+    let mul_path = format!("/tmp/kv_mul_{pid}.macho");
+    let add_path = format!("/tmp/kv_add_{pid}.macho");
     std::fs::write(
-        mul_path,
-        emit_elementwise2(EwOp::Mul, N as u32, "kv_mul.mil", mul_path),
+        &mul_path,
+        emit_elementwise2(EwOp::Mul, N as u32, "kv_mul.mil", &mul_path),
     )
     .unwrap();
     std::fs::write(
-        add_path,
-        emit_elementwise2(EwOp::Add, N as u32, "kv_add.mil", add_path),
+        &add_path,
+        emit_elementwise2(EwOp::Add, N as u32, "kv_add.mil", &add_path),
     )
     .unwrap();
 
-    let mut pm = EspressoProgram::load_precompiled(Path::new(mul_path), &[]).expect("load mul");
-    let mut pa = EspressoProgram::load_precompiled(Path::new(add_path), &[]).expect("load add");
+    let mut pm = EspressoProgram::load_precompiled(Path::new(&mul_path), &[]).expect("load mul");
+    let mut pa = EspressoProgram::load_precompiled(Path::new(&add_path), &[]).expect("load add");
     println!(
         "mul in={:?} out={:?} | add in={:?} out={:?}",
         pm.input_descs.iter().map(|d| &d.name).collect::<Vec<_>>(),
@@ -78,7 +94,7 @@ fn main() {
     }
 
     let mut bad = 0usize;
-    for t in 0..2usize {
+    for t in 0..4usize {
         // kv token t: value (t*10 + lane) at its slot lanes, 0 elsewhere
         {
             let b = pm.input_mut(0);
@@ -117,7 +133,7 @@ fn main() {
             }
         }
         // untouched slots stay zero
-        for s in t + 1..2 {
+        for s in t + 1..8 {
             let got = get(cache, &d_cache, s * SLOT);
             if got != 0.0 {
                 bad += 1;

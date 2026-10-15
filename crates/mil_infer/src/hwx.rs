@@ -145,6 +145,9 @@ fn put_u64(buf: &mut [u8], off: usize, v: u64) {
 /// `mil_path` / `out_path` are recorded in the signature block's
 /// compilation record, matching the reference format.
 pub fn emit_elementwise2(op: EwOp, n: u32, mil_path: &str, out_path: &str) -> Vec<u8> {
+    if n > 256 {
+        return emit_elementwise2_big(op, n, mil_path, out_path);
+    }
     let mut img = SKELETON.to_vec();
 
     // ---- scalar shape fields -----------------------------------------
@@ -181,6 +184,68 @@ pub fn emit_elementwise2(op: EwOp, n: u32, mil_path: &str, out_path: &str) -> Ve
     put_u32(&mut img, 0x80c4, tail_c4(n) as u32 | (v8 << 8));
     put_u32(&mut img, OP_FIELD, op.opcode());
 
+    img
+}
+
+/// Big-n skeleton: ANEC's `[n,1,1,1]` dim-0 layout for `n > 256`
+/// (the threshold is `n*64 > 0x4000` — one IOSurface page). Task
+/// record is n-invariant except `+0x14` (tile count
+/// `n/128 + n/1024`) and `+0x5c` (element dim `n`); opcode at
+/// `0x80d0`. Verified against ANEC refs at n = 257, 300, 384, 512,
+/// 768, 1024, 1280, 1536.
+const SKELETON_EW2_BIG: &[u8] = include_bytes!("../assets/ew2_big_skeleton.hwx");
+
+/// Emit `z = x ⊕ y` over fp16 `[n,1,1,1]` for `n > 256`. Surfaces are
+/// `S = align(n*64, 0x4000)` bytes each; port VAs step by `S`; the
+/// fourth region (bss/intermediate) sits at `3*S`.
+fn emit_elementwise2_big(op: EwOp, n: u32, mil_path: &str, out_path: &str) -> Vec<u8> {
+    let mut img = SKELETON_EW2_BIG.to_vec();
+    let s = ((n as usize * 64 + 0x3fff) & !0x3fff) as u32;
+
+    // segment vmsize fields (page-aligned) and filesize fields (raw)
+    for &f in &[0x88usize, 0x120, 0x1b8] {
+        put_u32(&mut img, f, s);
+    }
+    let raw = n * 64;
+    for &f in &[0xd8usize, 0x170, 0x208, 0xc98, 0x19e0, 0x2728] {
+        put_u32(&mut img, f, raw);
+    }
+    // symbol/descriptor VAs — 0x3000_0000 | k*S
+    for &f in &[0x118usize, 0x168, 0x348, 0x3e8] {
+        put_u32(&mut img, f, 0x3000_0000 | s);
+    }
+    for &f in &[0x1b0usize, 0x200, 0x368, 0x3f8] {
+        put_u32(&mut img, f, 0x3000_0000 | 2 * s);
+    }
+    for &f in &[0x248usize, 0x298, 0x388, 0xb88] {
+        put_u32(&mut img, f, 0x3000_0000 | 3 * s);
+    }
+    for &f in &[0x2e8usize, 0x398] {
+        put_u32(&mut img, f, 0x3000_0000 | (3 * s + 0x140));
+    }
+    // element-dim fields
+    for &f in &[0xc40usize, 0x1988, 0x26d0] {
+        put_u32(&mut img, f, n);
+    }
+    // tile-group count (kernel loop bound)
+    let tiles = n / 128 + n / 1024;
+    put_u32(&mut img, 0xc08, tiles);
+
+    rebuild_tail_g(
+        &mut img,
+        n,
+        mil_path,
+        out_path,
+        &SKELETON_EW2_BIG[0x8000..],
+        s,
+        true,
+    );
+
+    // task-record fields — after the tail splice, which restores the
+    // instruction region from the skeleton
+    put_u32(&mut img, 0x8014, tiles);
+    put_u32(&mut img, 0x805c, n);
+    put_u32(&mut img, 0x80d0, op.opcode());
     img
 }
 
@@ -417,10 +482,41 @@ fn layout_desc_w(name: &str, base: u32, c: u32, w: u32) -> String {
     )
 }
 
+/// Big-n (`n > 256`) elementwise descriptors: the element axis moves
+/// to dim-0 (`ar1;0;{n}` stride `s64`) and every other dim collapses
+/// to extent 1 — the layout ANEC emits once `n*64` exceeds one page.
+fn layout_desc_hi(name: &str, base: u32, n: u32) -> String {
+    format!(
+        "{name}:t{base}=ar1;0;{n};{b1}=s64n:ar1;0;1;{b2}=s64c:ar1;0;1;{b3}=s64h:ar1;0;1;{b4}=s2w:5",
+        base = base,
+        n = n,
+        b1 = base + 1,
+        b2 = base + 2,
+        b3 = base + 3,
+        b4 = base + 4,
+    )
+}
+
 /// Rebuild everything after the z-task-descriptor (file offset
 /// `0x33f0`): signature command, `rt.version`, `LC_SYMTAB`, symbol
 /// table, string table — then fix `sizeofcmds` in the header.
 fn rebuild_tail(img: &mut Vec<u8>, n: u32, mil_path: &str, out_path: &str, post: &[u8]) {
+    rebuild_tail_g(img, n, mil_path, out_path, post, 0x4000, false)
+}
+
+/// Generic form: `va_step` is the per-port IOSurface stride in the
+/// symbol table (0x4000 for the one-page small-n layout, `align(n*64,
+/// 0x4000)` for the big-n dim-0 layout); `big` selects the dim-0
+/// element-axis descriptor.
+fn rebuild_tail_g(
+    img: &mut Vec<u8>,
+    n: u32,
+    mil_path: &str,
+    out_path: &str,
+    post: &[u8],
+    va_step: u32,
+    big: bool,
+) {
     let sig = signature(mil_path, out_path);
     let sig_pad = (8 - (sig.len() + 1) % 8) % 8 + 1; // NUL + 8-align
     let csz = 8 + sig.len() + sig_pad;
@@ -443,14 +539,22 @@ fn rebuild_tail(img: &mut Vec<u8>, n: u32, mil_path: &str, out_path: &str, post:
     let symoff = 0x33f0 + tail.len() + 0x18;
     let io_syms: &[(&str, u8, u64)] = &[
         ("x", 1, 0x3000_0000),
-        ("y", 2, 0x3000_4000),
-        ("z", 3, 0x3000_8000),
+        ("y", 2, 0x3000_0000 | va_step as u64),
+        ("z", 3, 0x3000_0000 | 2 * va_step as u64),
     ];
-    let layout_strs = [
-        layout_desc("x", 24, n),
-        layout_desc("y", 29, n),
-        layout_desc("z", 34, n),
-    ];
+    let layout_strs = if big {
+        [
+            layout_desc_hi("x", 24, n),
+            layout_desc_hi("y", 29, n),
+            layout_desc_hi("z", 34, n),
+        ]
+    } else {
+        [
+            layout_desc("x", 24, n),
+            layout_desc("y", 29, n),
+            layout_desc("z", 34, n),
+        ]
+    };
 
     // string table
     let mut strtab = vec![0u8];
