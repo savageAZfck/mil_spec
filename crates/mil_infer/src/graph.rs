@@ -24,9 +24,9 @@
 
 use crate::espresso::EspressoProgram;
 use crate::hwx::{
-    self, emit_add4d64, emit_attn_v, emit_avw, emit_conv1x1_w, emit_elementwise2, emit_matmul_ns,
-    emit_outer, emit_relu, emit_repack128, emit_repack64, emit_sigmoid128, emit_softmax,
-    emit_softmax_ch, emit_unary_lut, EwOp, LutOp, MilOp,
+    self, emit_add4d, emit_attn_v, emit_avw, emit_conv1x1_w, emit_elementwise2, emit_matmul_ns,
+    emit_outer_t, emit_relu, emit_repack, emit_sigmoid_strided, emit_softmax, emit_softmax_ch,
+    emit_unary_lut, EwOp, LutOp, MilOp,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -330,24 +330,17 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
                     arg_of(o, "y").unwrap_or("y").to_string(),
                 );
                 // packed 4-D add `[1,T,1,D]` — the KV-cache accumulator
-                if o.op == "add"
-                    && o.shape.len() == 4
-                    && o.shape[1] > 1
-                    && o.shape[3] > 1
-                    && o.shape[1] == 64
-                    && o.shape[3] == 64
-                {
-                    let img = emit_add4d64(mil_path, &format!("{out_dir}/.tmp4d_{}", o.result));
+                if o.op == "add" && o.shape.len() == 4 && o.shape[1] > 1 && o.shape[3] > 1 {
+                    let (t, dd) = (o.shape[1] as u32, o.shape[3] as u32);
+                    let img =
+                        emit_add4d(t, dd, mil_path, &format!("{out_dir}/.tmp4d_{}", o.result))?;
                     let idx = push_prog(&mut nodes, &mut created, o.result.clone(), img, out_dir)?;
                     if let Node::Prog { alias, zero, .. } = &mut nodes[idx] {
                         *alias = vec![(0, 0)];
                         *zero = vec![0];
                     }
-                    prod.insert(o.result.clone(), (idx, Cur::Packed(64, 64)));
-                    wants.push((
-                        idx,
-                        vec![(x, Cur::Packed(64, 64)), (y, Cur::Packed(64, 64))],
-                    ));
+                    prod.insert(o.result.clone(), (idx, Cur::Packed(t, dd)));
+                    wants.push((idx, vec![(x, Cur::Packed(t, dd)), (y, Cur::Packed(t, dd))]));
                     continue;
                 }
                 let img =
@@ -362,9 +355,11 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
             "sigmoid" | "tanh" | "relu" => {
                 let x = arg_of(o, "x").unwrap_or("x").to_string();
                 let img = match o.op.as_str() {
-                    "sigmoid" if elems == 128 => {
-                        emit_sigmoid128(mil_path, &format!("{out_dir}/.tmps_{}", o.result))
-                    }
+                    "sigmoid" if elems == 128 || elems == 256 => emit_sigmoid_strided(
+                        elems,
+                        mil_path,
+                        &format!("{out_dir}/.tmps_{}", o.result),
+                    )?,
                     "sigmoid" => emit_unary_lut(
                         LutOp::Sigmoid,
                         elems,
@@ -409,11 +404,7 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
             }
             "transpose" => {
                 let x = arg_of(o, "x").unwrap_or("x").to_string();
-                let img = match elems {
-                    64 => emit_repack64(mil_path, &format!("{out_dir}/.tmpt_{}", o.result)),
-                    128 => emit_repack128(mil_path, &format!("{out_dir}/.tmpt_{}", o.result)),
-                    _ => return Err(format!("transpose n={elems} off repack table")),
-                };
+                let img = emit_repack(elems, mil_path, &format!("{out_dir}/.tmpt_{}", o.result))?;
                 let idx = push_prog(&mut nodes, &mut created, o.result.clone(), img, out_dir)?;
                 prod.insert(o.result.clone(), (idx, Cur::Contig(elems)));
                 wants.push((idx, vec![(x, Cur::Strided(elems))]));
@@ -510,10 +501,8 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
                 if tx && xs.len() == 4 && ys.len() == 4 && y_widem == 1 && ys[3] > 1 {
                     // outer: x=[1,T,1,1] strided one-hot, y=[1,1,1,D]
                     let (t, d) = (xt as u32, ys[3] as u32);
-                    if t != 64 || d != 64 {
-                        return Err(format!("outer ({t},{d}) off skeleton table"));
-                    }
-                    let img = emit_outer(mil_path, &format!("{out_dir}/.tmpo_{}", o.result));
+                    let img =
+                        emit_outer_t(t, d, mil_path, &format!("{out_dir}/.tmpo_{}", o.result))?;
                     let idx = push_prog(&mut nodes, &mut created, o.result.clone(), img, out_dir)?;
                     prod.insert(o.result.clone(), (idx, Cur::Packed(t, d)));
                     wants.push((idx, vec![(x, Cur::Strided(t)), (y, Cur::Contig(d))]));
@@ -562,13 +551,8 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
                 } else {
                     match (have, *want) {
                         (Cur::Strided(n), Cur::Contig(m)) if n == m => {
-                            let img = match n {
-                                64 => emit_repack64(mil_path, &format!("{out_dir}/.tmpa64_{name}")),
-                                128 => {
-                                    emit_repack128(mil_path, &format!("{out_dir}/.tmpa128_{name}"))
-                                }
-                                _ => return Err(format!("no repack skeleton for N={n}")),
-                            };
+                            let img =
+                                emit_repack(n, mil_path, &format!("{out_dir}/.tmpa{n}_{name}"))?;
                             let aidx = nodes.len();
                             let path = format!("{out_dir}/n{aidx}_{name}_rp.macho");
                             std::fs::write(&path, &img).map_err(|e| format!("{path}: {e}"))?;

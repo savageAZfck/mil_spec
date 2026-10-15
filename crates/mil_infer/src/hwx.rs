@@ -4960,22 +4960,25 @@ const SKELETON_AV1024X128: &[u8] = include_bytes!("../assets/attnv_1024x128_skel
 /// `r` into row `t` of a `[1,T,1,K]` frame — the on-device KV-cache row
 /// append (`cache += outer(e_t, kv_t)` via a flat ew add).
 const SKELETON_OUTER64: &[u8] = include_bytes!("../assets/outer64_skeleton.hwx");
+const SKELETON_OUTER256: &[u8] = include_bytes!("../assets/outer256_skeleton.hwx");
 
-/// Emit the outer-product row scatter for `t=k=64` (the shape whose
-/// record was reverse-verified; other sizes pending decode).
-pub fn emit_outer(mil_path: &str, out_path: &str) -> Vec<u8> {
-    let (entries, relocs) = tail_meta(SKELETON_OUTER64);
+/// Emit the outer-product row scatter for `(t, d)` on the skeleton
+/// table — `t` is the cache/frame length, `d` the channel width.
+pub fn emit_outer_t(t: u32, d: u32, mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> {
+    let skel = match (t, d) {
+        (64, 64) => SKELETON_OUTER64,
+        (256, 64) => SKELETON_OUTER256,
+        _ => return Err(format!("outer ({t},{d}) off skeleton table")),
+    };
+    let (entries, relocs) = tail_meta(skel);
     // __text at 0x8000 like the attnv family
-    rebuild_tail_at_text(
-        SKELETON_OUTER64,
-        0x33f0,
-        0x8000,
-        &entries,
-        &relocs,
-        mil_path,
-        out_path,
-    )
-    .expect("outer64 tail fits under __text")
+    rebuild_tail_at_text(skel, 0x33f0, 0x8000, &entries, &relocs, mil_path, out_path)
+        .map_err(|e| e.to_string())
+}
+
+/// Emit the outer-product row scatter for `t=d=64`.
+pub fn emit_outer(mil_path: &str, out_path: &str) -> Vec<u8> {
+    emit_outer_t(64, 64, mil_path, out_path).expect("outer64 tail fits under __text")
 }
 
 /// Packed 4-D elementwise add `z = x + y` on `[1,64,1,64]` — element
@@ -4983,38 +4986,44 @@ pub fn emit_outer(mil_path: &str, out_path: &str) -> Vec<u8> {
 /// output and the `avw`/`attn_v` cache frames, so it drops into the
 /// KV-append slot (`cache += outer(e_t, kv_t)` in place via aliasing).
 const SKELETON_ADD4D64: &[u8] = include_bytes!("../assets/add4d64_skeleton.hwx");
+const SKELETON_ADD4D256: &[u8] = include_bytes!("../assets/add4d256_skeleton.hwx");
+
+/// Packed 4-D add on `[1,T,1,D]` for `(t,d)` on the skeleton table.
+pub fn emit_add4d(t: u32, d: u32, mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> {
+    let skel = match (t, d) {
+        (64, 64) => SKELETON_ADD4D64,
+        (256, 64) => SKELETON_ADD4D256,
+        _ => return Err(format!("add4d ({t},{d}) off skeleton table")),
+    };
+    let (entries, relocs) = tail_meta(skel);
+    rebuild_tail_at_text(skel, 0x33f0, 0x8000, &entries, &relocs, mil_path, out_path)
+        .map_err(|e| e.to_string())
+}
 
 pub fn emit_add4d64(mil_path: &str, out_path: &str) -> Vec<u8> {
-    let (entries, relocs) = tail_meta(SKELETON_ADD4D64);
-    rebuild_tail_at_text(
-        SKELETON_ADD4D64,
-        0x33f0,
-        0x8000,
-        &entries,
-        &relocs,
-        mil_path,
-        out_path,
-    )
-    .expect("add4d tail fits under __text")
+    emit_add4d(64, 64, mil_path, out_path).expect("add4d64 tail fits under __text")
 }
 
 /// Strided `[1,64,1,1]` add — the causal-mask op: `scores += mask`
 /// where mask[t] = 0 for t ≤ now, -inf (fp16 `-65504`) beyond. Strides
 /// match the `avw`/`smc` score surface exactly.
 const SKELETON_MASKADD64: &[u8] = include_bytes!("../assets/maskadd64_skeleton.hwx");
+const SKELETON_MASKADD256: &[u8] = include_bytes!("../assets/maskadd256_skeleton.hwx");
+
+/// Strided `[1,T,1,1]` add for `t` on the skeleton table.
+pub fn emit_maskadd(t: u32, mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> {
+    let skel = match t {
+        64 => SKELETON_MASKADD64,
+        256 => SKELETON_MASKADD256,
+        _ => return Err(format!("maskadd t={t} off skeleton table")),
+    };
+    let (entries, relocs) = tail_meta(skel);
+    rebuild_tail_at_text(skel, 0x33f0, 0x8000, &entries, &relocs, mil_path, out_path)
+        .map_err(|e| e.to_string())
+}
 
 pub fn emit_maskadd64(mil_path: &str, out_path: &str) -> Vec<u8> {
-    let (entries, relocs) = tail_meta(SKELETON_MASKADD64);
-    rebuild_tail_at_text(
-        SKELETON_MASKADD64,
-        0x33f0,
-        0x8000,
-        &entries,
-        &relocs,
-        mil_path,
-        out_path,
-    )
-    .expect("maskadd tail fits under __text")
+    emit_maskadd(64, mil_path, out_path).expect("maskadd64 tail fits under __text")
 }
 
 /// Layout repack `transpose(x=[1,64,1,1], perm=[0,2,3,1])` →
@@ -5041,21 +5050,46 @@ pub fn emit_repack64(mil_path: &str, out_path: &str) -> Vec<u8> {
 const SKELETON_RPK128: &[u8] = include_bytes!("../assets/rpk128_skeleton.hwx");
 
 pub fn emit_repack128(mil_path: &str, out_path: &str) -> Vec<u8> {
-    let (entries, relocs) = tail_meta(SKELETON_RPK128);
-    rebuild_tail_at(
-        SKELETON_RPK128,
-        0x25f0,
-        &entries,
-        &relocs,
-        mil_path,
-        out_path,
-    )
+    emit_repack(128, mil_path, out_path).expect("repack128 tail fits")
+}
+
+/// 256-wide repack — same transpose task at FFN width 256.
+const SKELETON_RPK256: &[u8] = include_bytes!("../assets/rpk256_skeleton.hwx");
+
+/// Strided `[1,N,1,1]` -> contiguous `[1,1,1,N]` repack for `n` on the
+/// skeleton table `{64,128,256}`.
+pub fn emit_repack(n: u32, mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> {
+    let skel = match n {
+        64 => SKELETON_REPACK64,
+        128 => SKELETON_RPK128,
+        256 => SKELETON_RPK256,
+        _ => return Err(format!("repack n={n} off skeleton table")),
+    };
+    let (entries, relocs) = tail_meta(skel);
+    Ok(rebuild_tail_at(
+        skel, 0x25f0, &entries, &relocs, mil_path, out_path,
+    ))
 }
 
 /// Strided `sigmoid(x=[1,128,1,1])` — elementwise on the channel axis,
 /// same plane layout as the strided vectors; fits `gate·σ(gate)` SiLU
 /// without leaving the strided currency.
 const SKELETON_SIG128: &[u8] = include_bytes!("../assets/sig128_skeleton.hwx");
+const SKELETON_SIG256: &[u8] = include_bytes!("../assets/sig256_skeleton.hwx");
+
+/// Strided sigmoid `[1,N,1,1]` for `n` on the skeleton table
+/// `{128,256}`.
+pub fn emit_sigmoid_strided(n: u32, mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> {
+    let skel = match n {
+        128 => SKELETON_SIG128,
+        256 => SKELETON_SIG256,
+        _ => return Err(format!("sigmoid strided n={n} off skeleton table")),
+    };
+    let (entries, relocs) = tail_meta(skel);
+    Ok(rebuild_tail_at(
+        skel, 0x2688, &entries, &relocs, mil_path, out_path,
+    ))
+}
 
 pub fn emit_sigmoid128(mil_path: &str, out_path: &str) -> Vec<u8> {
     let (entries, relocs) = tail_meta(SKELETON_SIG128);

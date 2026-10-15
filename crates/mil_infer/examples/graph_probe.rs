@@ -9,9 +9,9 @@ use half::f16;
 use mil_infer::graph::{compile_graph, GraphRuntime};
 use std::path::Path;
 
-const T_MAX: usize = 64;
+const T_MAX: usize = 256;
 const D: usize = 64;
-const FF: usize = 128;
+const FF: usize = 256;
 const EPS: f32 = 1e-5;
 
 fn f32_of(h: u16) -> f32 {
@@ -82,17 +82,17 @@ fn main() {
         r#"program(1.3)
 {{
     func main<ios18>(tensor<fp16, [1, 64, 1, 1]> x,
-                     tensor<fp16, [1, 64, 1, 1]> e_t,
-                     tensor<fp16, [1, 64, 1, 1]> msk,
-                     tensor<fp16, [1, 64, 1, 64]> kcache,
-                     tensor<fp16, [1, 64, 1, 64]> vcache) {{
+                     tensor<fp16, [1, 256, 1, 1]> e_t,
+                     tensor<fp16, [1, 256, 1, 1]> msk,
+                     tensor<fp16, [1, 256, 1, 64]> kcache,
+                     tensor<fp16, [1, 256, 1, 64]> vcache) {{
         tensor<fp16, [64, 64]> Wq = const()[val = tensor<fp16, [64, 64]>(BLOBFILE(path = string("{dir}/wq.bin"), offset = uint64(0)))];
         tensor<fp16, [64, 64]> Wk = const()[val = tensor<fp16, [64, 64]>(BLOBFILE(path = string("{dir}/wk.bin"), offset = uint64(0)))];
         tensor<fp16, [64, 64]> Wv = const()[val = tensor<fp16, [64, 64]>(BLOBFILE(path = string("{dir}/wv.bin"), offset = uint64(0)))];
         tensor<fp16, [64, 64]> Wo = const()[val = tensor<fp16, [64, 64]>(BLOBFILE(path = string("{dir}/wo.bin"), offset = uint64(0)))];
-        tensor<fp16, [128, 64]> Wu = const()[val = tensor<fp16, [128, 64]>(BLOBFILE(path = string("{dir}/wup.bin"), offset = uint64(0)))];
-        tensor<fp16, [128, 64]> Wg = const()[val = tensor<fp16, [128, 64]>(BLOBFILE(path = string("{dir}/wg.bin"), offset = uint64(0)))];
-        tensor<fp16, [64, 128]> Wd = const()[val = tensor<fp16, [64, 128]>(BLOBFILE(path = string("{dir}/wdn.bin"), offset = uint64(0)))];
+        tensor<fp16, [256, 64]> Wu = const()[val = tensor<fp16, [128, 64]>(BLOBFILE(path = string("{dir}/wup.bin"), offset = uint64(0)))];
+        tensor<fp16, [256, 64]> Wg = const()[val = tensor<fp16, [128, 64]>(BLOBFILE(path = string("{dir}/wg.bin"), offset = uint64(0)))];
+        tensor<fp16, [64, 256]> Wd = const()[val = tensor<fp16, [64, 128]>(BLOBFILE(path = string("{dir}/wdn.bin"), offset = uint64(0)))];
         tensor<fp16, [64]> gam1 = const()[val = tensor<fp16, [64]>(BLOBFILE(path = string("{dir}/gam.bin"), offset = uint64(0)))];
         tensor<fp16, [64]> gam2 = const()[val = tensor<fp16, [64]>(BLOBFILE(path = string("{dir}/gam.bin"), offset = uint64(0)))];
         tensor<int32, []> ax1 = const()[val = int32(1)];
@@ -102,22 +102,22 @@ fn main() {
         tensor<fp16, [1, 1, 1, 64]> q = matmul(x = xn1, y = Wq, transpose_y = bt)[name = string("q")];
         tensor<fp16, [1, 1, 1, 64]> kk = matmul(x = xn1, y = Wk, transpose_y = bt)[name = string("kk")];
         tensor<fp16, [1, 1, 1, 64]> vv = matmul(x = xn1, y = Wv, transpose_y = bt)[name = string("vv")];
-        tensor<fp16, [1, 64, 1, 64]> ek = matmul(x = e_t, y = kk, transpose_x = bt)[name = string("ek")];
-        tensor<fp16, [1, 64, 1, 64]> ev = matmul(x = e_t, y = vv, transpose_x = bt)[name = string("ev")];
-        tensor<fp16, [1, 64, 1, 64]> knew = add(x = kcache, y = ek)[name = string("knew")];
-        tensor<fp16, [1, 64, 1, 64]> vnew = add(x = vcache, y = ev)[name = string("vnew")];
-        tensor<fp16, [1, 64, 1, 1]> s = matmul(x = q, y = knew, transpose_y = bt)[name = string("s")];
-        tensor<fp16, [1, 64, 1, 1]> sm2 = add(x = s, y = msk)[name = string("sm2")];
-        tensor<fp16, [1, 64, 1, 1]> p = softmax(x = sm2, axis = ax1)[name = string("p")];
+        tensor<fp16, [1, 256, 1, 64]> ek = matmul(x = e_t, y = kk, transpose_x = bt)[name = string("ek")];
+        tensor<fp16, [1, 256, 1, 64]> ev = matmul(x = e_t, y = vv, transpose_x = bt)[name = string("ev")];
+        tensor<fp16, [1, 256, 1, 64]> knew = add(x = kcache, y = ek)[name = string("knew")];
+        tensor<fp16, [1, 256, 1, 64]> vnew = add(x = vcache, y = ev)[name = string("vnew")];
+        tensor<fp16, [1, 256, 1, 1]> s = matmul(x = q, y = knew, transpose_y = bt)[name = string("s")];
+        tensor<fp16, [1, 256, 1, 1]> sm2 = add(x = s, y = msk)[name = string("sm2")];
+        tensor<fp16, [1, 256, 1, 1]> p = softmax(x = sm2, axis = ax1)[name = string("p")];
         tensor<fp16, [1, 1, 1, 64]> aout = matmul(x = p, y = vnew, transpose_x = bt)[name = string("aout")];
         tensor<fp16, [1, 1, 1, 64]> o = matmul(x = aout, y = Wo, transpose_y = bt)[name = string("o")];
         tensor<fp16, [1, 64, 1, 1]> r1 = add(x = x, y = o)[name = string("r1")];
         tensor<fp16, [1, 64, 1, 1]> xn2 = rms_norm(x = r1, w = gam2, eps = fp16(0.00001))[name = string("xn2")];
-        tensor<fp16, [1, 1, 1, 128]> u = matmul(x = xn2, y = Wu, transpose_y = bt)[name = string("u")];
-        tensor<fp16, [1, 1, 1, 128]> g = matmul(x = xn2, y = Wg, transpose_y = bt)[name = string("g")];
-        tensor<fp16, [1, 128, 1, 1]> gs = sigmoid(x = g)[name = string("gs")];
-        tensor<fp16, [1, 128, 1, 1]> gsl = mul(x = g, y = gs)[name = string("gsl")];
-        tensor<fp16, [1, 128, 1, 1]> fu = mul(x = u, y = gsl)[name = string("fu")];
+        tensor<fp16, [1, 1, 1, 256]> u = matmul(x = xn2, y = Wu, transpose_y = bt)[name = string("u")];
+        tensor<fp16, [1, 1, 1, 256]> g = matmul(x = xn2, y = Wg, transpose_y = bt)[name = string("g")];
+        tensor<fp16, [1, 256, 1, 1]> gs = sigmoid(x = g)[name = string("gs")];
+        tensor<fp16, [1, 256, 1, 1]> gsl = mul(x = g, y = gs)[name = string("gsl")];
+        tensor<fp16, [1, 256, 1, 1]> fu = mul(x = u, y = gsl)[name = string("fu")];
         tensor<fp16, [1, 1, 1, 64]> dn = matmul(x = fu, y = Wd, transpose_y = bt)[name = string("dn")];
         tensor<fp16, [1, 64, 1, 1]> y = add(x = r1, y = dn)[name = string("y")];
     }} -> (y);
