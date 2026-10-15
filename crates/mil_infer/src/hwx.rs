@@ -696,19 +696,29 @@ pub fn weight_interleave(w: &[u16], c: usize) -> Vec<u16> {
 /// against ANEC for 34 channel counts, `C = 8..1056`, including uneven
 /// `C = 24, 33, 40, 56, 72, 80, 112, 520`.
 pub fn weight_layout(w: &[u16], c: usize) -> (Vec<u16>, Vec<usize>, Vec<usize>) {
-    debug_assert_eq!(w.len(), c * c);
-    let (mut out, mut offs, mut sizes) = (Vec::with_capacity(c * c), Vec::new(), Vec::new());
+    weight_layout_ns(w, c, c)
+}
+
+/// Non-square form: `w` is a row-major `[cout, cin]` weight. Same 16
+/// lane / 512-row-pass structure as [`weight_layout`] — the row dim is
+/// `cout`, the inner `ic` loop runs the full `cin`. Verified
+/// byte-exact against ANEC over ~150 swept `(cin, cout)` pairs
+/// including partial lane rows (`cout % 16 != 0`), `cout < 32` and
+/// multi-pass `cout > 512`.
+pub fn weight_layout_ns(w: &[u16], cin: usize, cout: usize) -> (Vec<u16>, Vec<usize>, Vec<usize>) {
+    debug_assert_eq!(w.len(), cin * cout);
+    let (mut out, mut offs, mut sizes) = (Vec::with_capacity(cin * cout), Vec::new(), Vec::new());
     for g in 0..16 {
         offs.push(out.len() * 2);
         let mut base = 0;
-        while base < c {
-            let pr = (c - base).min(512);
+        while base < cout {
+            let pr = (cout - base).min(512);
             let (pq, pr2) = (pr / 16, pr % 16);
             let rows = pq + usize::from(g < pr2);
             let row0 = base + g * pq + g.min(pr2);
-            for ic in 0..c {
+            for ic in 0..cin {
                 for m in 0..rows {
-                    out.push(w[(row0 + m) * c + ic]);
+                    out.push(w[(row0 + m) * cin + ic]);
                 }
             }
             base += pr;
@@ -734,21 +744,29 @@ pub fn weight_layout(w: &[u16], c: usize) -> (Vec<u16>, Vec<usize>, Vec<usize>) 
 /// activation's spatial size. Verified against 19 swept channel counts
 /// and the corpus conv32/64/128 artifacts (square weights only).
 pub fn conv_kernel_name(c: u64, data_offset: u64) -> String {
+    conv_kernel_name_ns(c, c, data_offset)
+}
+
+/// Non-square form: `[cout, cin, 1, 1]` weight. The desc block is the
+/// weight's `[cout, cin]` dims with `cin` repeated as the row stride;
+/// the lane-depth trailer keys off `cout`. Verified at (64,32) and
+/// (64,256) against ANEC kernel symbols.
+pub fn conv_kernel_name_ns(cin: u64, cout: u64, data_offset: u64) -> String {
     let mut s: Vec<u8> = Vec::with_capacity(235);
     s.extend_from_slice(b"weight");
     s.extend_from_slice(b"weight.bin0");
     s.extend_from_slice(&data_offset.to_le_bytes());
-    s.extend_from_slice(&(c * c * 2).to_le_bytes());
+    s.extend_from_slice(&(cout * cin * 2).to_le_bytes());
     s.extend_from_slice(&[0; 5]);
     s.extend_from_slice(b"desc");
     s.extend_from_slice(&[0; 40]);
-    for v in [c, c, 1, 1, 1, c, 1, 1, 1, 1, 0, 0] {
+    for v in [cout, cin, 1, 1, 1, cin, 1, 1, 1, 1, 0, 0] {
         s.extend_from_slice(&v.to_le_bytes());
     }
     for v in [1u32, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0] {
         s.extend_from_slice(&v.to_le_bytes());
     }
-    s.extend_from_slice(&c.div_ceil(16).min(32).to_le_bytes());
+    s.extend_from_slice(&cout.div_ceil(16).min(32).to_le_bytes());
     s.push(0);
     debug_assert_eq!(s.len(), 235);
     format!("K{}", mil_spec::sha256::sha256_hex(&s).to_uppercase())
@@ -1040,15 +1058,40 @@ fn conv_chan_params(c: usize, kern_sz: usize) -> (u32, usize, bool) {
         }
         return (v & 0xfff, ((v >> 12) & 0xf) as usize, v & 0x10000 != 0);
     }
-    (
-        if kern_sz > 0x8000 {
-            kern_sz.div_ceil(0xc000) as u32
-        } else {
-            0
-        },
-        0,
-        kern_sz > 0x100000,
-    )
+    conv_ns_fallback(c, c, kern_sz)
+}
+
+/// Fallback `(f14, pad16, big)` for shapes outside the probed tables:
+/// `f14` sums the per-512-row-pass kernel chunk counts (exact for most
+/// swept pairs; ANEC's residual rounding is irregular), `pad16` and
+/// `big` key on the observed `kern > 1 MiB` transition.
+fn conv_ns_fallback(cin: usize, cout: usize, kern_sz: usize) -> (u32, usize, bool) {
+    let mut f14 = 0u32;
+    let mut rem = cout;
+    while rem > 0 {
+        let pr = rem.min(512);
+        f14 += ((pr * cin * 2).div_ceil(0xc000)) as u32;
+        rem -= pr;
+    }
+    let big = kern_sz > 0x100000;
+    (f14, if big { 3 } else { 0 }, big)
+}
+
+/// `(f14, pad16, big)` for a `(cin, cout)` pair: exact square values on
+/// the diagonal, [`crate::conv_ns_table::CONV_NS_TABLE`] for probed
+/// non-square pairs (multiples of 32 through 2048), structural
+/// fallback otherwise.
+fn conv_ns_params(cin: usize, cout: usize, kern_sz: usize) -> (u32, usize, bool) {
+    if cin == cout {
+        return conv_chan_params(cin, kern_sz);
+    }
+    if cin % 32 == 0 && cout % 32 == 0 && cin <= 2048 && cout <= 2048 {
+        let v = crate::conv_ns_table::CONV_NS_TABLE[(cin / 32 - 1) * 64 + (cout / 32 - 1)];
+        if v != u32::MAX {
+            return (v & 0xfff, ((v >> 12) & 0xf) as usize, v & 0x10000 != 0);
+        }
+    }
+    conv_ns_fallback(cin, cout, kern_sz)
 }
 
 /// Emit `z = conv1x1(x, w)` — `[1,C,1,1]` in, `[C,C,1,1]` weight — for
@@ -1082,27 +1125,53 @@ pub fn emit_conv1x1_dyn(
     mil_path: &str,
     out_path: &str,
 ) -> Result<Vec<u8>, String> {
-    if c < 32 {
+    emit_conv1x1_ns(c, c, weights, mil_path, out_path)
+}
+
+/// Non-square form: `z = conv1x1(x, w)` with x `[1,Cin,1,1]`, weight
+/// `[Cout,Cin,1,1]`, z `[1,Cout,1,1]`. Same program plan as the square
+/// emitter — every field the square code keyed on `C` splits cleanly:
+/// input-side descriptors (`0x10c`, `0xc24`, the `0xc48` group, the
+/// `0x158` `*16` group, `__const` size) take `cin`; output-side
+/// descriptors (`0x11c`, `0x196c`, the `0x1990` group, `__data` size)
+/// and the text regime (`f128`, narrow) take `cout`; the lane table
+/// and kernel payload come from [`weight_layout_ns`]; the kernel name
+/// from [`conv_kernel_name_ns`]. No `(cin,cout)` pair probed — including
+/// the square-variant range 713..=720 in either dim — produced a
+/// non-43-symbol plan, so the variant window only applies on the
+/// diagonal. Requires `cin >= 32` and `cout >= 32`.
+pub fn emit_conv1x1_ns(
+    cin: usize,
+    cout: usize,
+    weights: &[u16],
+    mil_path: &str,
+    out_path: &str,
+) -> Result<Vec<u8>, String> {
+    if cin < 32 || cout < 32 {
         return Err(format!(
-            "conv1x1 dyn: C={c} below the C>=32 template regimes"
+            "conv1x1 dyn: (Cin={cin},Cout={cout}) below the C>=32 template regimes"
         ));
     }
-    if weights.len() < c * c {
-        return Err(format!("expected {} weights, got {}", c * c, weights.len()));
+    if weights.len() < cin * cout {
+        return Err(format!(
+            "expected {} weights, got {}",
+            cin * cout,
+            weights.len()
+        ));
     }
-    let (stream, lane_off, lane_sz) = weight_layout(&weights[..c * c], c);
+    let (stream, lane_off, lane_sz) = weight_layout_ns(&weights[..cin * cout], cin, cout);
     let kern_sz = stream.len() * 2;
-    let q = c.div_ceil(16);
+    let q = cout.div_ceil(16);
     let narrow = (5..=8).contains(&q);
     let textlen: usize = if narrow { 0x1cc } else { 0x1d0 };
     // scheduler scalars — ANEC's planning heuristic is table-driven
     // inside the probed range; outside it falls back to the nearest
     // structural approximation (kern chunk count, no pad, big flag by
     // the 1 MiB boundary the window implies).
-    let (f14, pad16, big) = conv_chan_params(c, kern_sz);
+    let (f14, pad16, big) = conv_ns_params(cin, cout, kern_sz);
     if f14 == u32::MAX {
         return Err(format!(
-            "conv1x1 dyn: C={c} is in the 59-symbol variant window (713..=720) — different program plan"
+            "conv1x1 dyn: C={cin} is in the 59-symbol variant window (713..=720) — different program plan"
         ));
     }
     let f128 = match q {
@@ -1112,23 +1181,24 @@ pub fn emit_conv1x1_dyn(
         9..=16 => 4,
         _ => 5,
     };
-    let slot = (c * 64 + 0x3fff) & !0x3fff;
+    let slot_in = (cin * 64 + 0x3fff) & !0x3fff;
+    let slot_out = (cout * 64 + 0x3fff) & !0x3fff;
     let const_va = 0x3000_0000u64;
-    let data_va = const_va + slot as u64;
-    let text_va = data_va + slot as u64;
+    let data_va = const_va + slot_in as u64;
+    let text_va = data_va + slot_out as u64;
     let const2_va = text_va + textlen.div_ceil(0x40) as u64 * 0x40;
     let kern_va = text_va + 0x8000;
     let kern_vsz = (kern_sz + 0x3fff) & !0x3fff;
 
     // ---- header + segments + command blobs -------------------------
     let mut pre = SKELETON_CONV32[..CONV_TAIL_OFF].to_vec();
-    put_u64(&mut pre, 0x88, slot as u64); // __const seg vmsize
+    put_u64(&mut pre, 0x88, slot_in as u64); // __const seg vmsize
     put_u64(&mut pre, 0xd0, const_va); // __const sect addr
-    put_u64(&mut pre, 0xd8, (c * 64) as u64); // __const sect size
+    put_u64(&mut pre, 0xd8, (cin * 64) as u64); // __const sect size
     put_u64(&mut pre, 0x118, data_va); // __data seg vmaddr
-    put_u64(&mut pre, 0x120, slot as u64); // __data seg vmsize
+    put_u64(&mut pre, 0x120, slot_out as u64); // __data seg vmsize
     put_u64(&mut pre, 0x168, data_va); // __data sect addr
-    put_u64(&mut pre, 0x170, (c * 64) as u64); // __data sect size
+    put_u64(&mut pre, 0x170, (cout * 64) as u64); // __data sect size
     put_u64(&mut pre, 0x1b0, text_va); // __TEXT seg vmaddr
     put_u64(&mut pre, 0x200, text_va); // __text sect addr
     put_u64(&mut pre, 0x208, textlen as u64); // __text sect size
@@ -1149,16 +1219,21 @@ pub fn emit_conv1x1_dyn(
     put_u32(&mut pre, 0x378, const2_va as u32);
     put_u32(&mut pre, 0xb7c, if narrow { 0x73 } else { 0x74 });
     put_u32(&mut pre, 0xbe8, f14 as u32);
-    // cmd4 blobs 2 @0xbf8 / 3 @0x1940: channel count + section byte size
-    for &o in &[0xc24usize, 0x196c] {
-        put_u32(&mut pre, o, c as u32);
+    // cmd4 blobs 2 @0xbf8 / 3 @0x1940: input/output dims + section byte
+    // sizes — the 0xc?? group is the x-side (cin*64), 0x19?? the z-side
+    for &o in &[0xc24usize] {
+        put_u32(&mut pre, o, cin as u32);
     }
-    for &o in &[0xc48usize, 0xc68, 0xc78, 0x1990, 0x19b0, 0x19c0] {
-        put_u32(&mut pre, o, (c * 64) as u32);
+    put_u32(&mut pre, 0x196c, cout as u32);
+    for &o in &[0xc48usize, 0xc68, 0xc78] {
+        put_u32(&mut pre, o, (cin * 64) as u32);
+    }
+    for &o in &[0x1990usize, 0x19b0, 0x19c0] {
+        put_u32(&mut pre, o, (cout * 64) as u32);
     }
 
     // ---- tail: signature, rt.version, LC_SYMTAB, strtab, reloc -----
-    let kname = conv_kernel_name(c as u64, 0x80);
+    let kname = conv_kernel_name_ns(cin as u64, cout as u64, 0x80);
     let mut entries: Vec<(String, u8, u8, u16, u64)> = Vec::with_capacity(43);
     entries.push(("x".into(), 0x0f, 1, 0, const_va));
     entries.push(("z".into(), 0x0f, 2, 0, data_va));
@@ -1174,8 +1249,8 @@ pub fn emit_conv1x1_dyn(
     for ty in TYPE_SYMS {
         entries.push(((*ty).into(), 0x80, 0, 0, 0));
     }
-    entries.push((layout_desc("x", 24, c as u32), 0x20, 0, 0x18, 0));
-    entries.push((layout_desc("z", 29, c as u32), 0x20, 0, 0x1d, 0));
+    entries.push((layout_desc("x", 24, cin as u32), 0x20, 0, 0x18, 0));
+    entries.push((layout_desc("z", 29, cout as u32), 0x20, 0, 0x1d, 0));
     // one __text relocation pointing at the kernel reference word —
     // 0x1a0 in the std template, 0x19c in the narrower one
     let reloc_addr: u32 = if narrow { 0x19c } else { 0x1a0 };
@@ -1190,8 +1265,15 @@ pub fn emit_conv1x1_dyn(
         0x07,
     ]];
 
-    let (mut img, text_off) =
-        build_tail_at_reloc(&pre, CONV_TAIL_OFF, &entries, &relocs, mil_path, out_path, 0x218);
+    let (mut img, text_off) = build_tail_at_reloc(
+        &pre,
+        CONV_TAIL_OFF,
+        &entries,
+        &relocs,
+        mil_path,
+        out_path,
+        0x218,
+    );
     // file offsets slide if the tail overflows 0x4000
     put_u32(&mut img, 0x1c0, text_off as u32); // __TEXT seg fileoff
     put_u32(&mut img, 0x210, text_off as u32); // __text sect offset
@@ -1214,18 +1296,18 @@ pub fn emit_conv1x1_dyn(
     for i in 0..16 {
         put_u32(&mut text, 0xc0 + i * 4, lane_sz[i] as u32);
     }
-    put_u32(&mut text, 0x10c, c as u32);
-    put_u32(&mut text, 0x11c, c as u32);
+    put_u32(&mut text, 0x10c, cin as u32);
+    put_u32(&mut text, 0x11c, cout as u32);
     if !narrow {
         put_u32(&mut text, 0x124, if big { 0x244404 } else { 0x200004 });
         put_u32(&mut text, 0x128, f128);
     }
     let cx: usize = if narrow { 0x154 } else { 0x158 };
-    // first and last of the four copies carry the padded row count
-    put_u32(&mut text, cx, ((c + pad16) * 16) as u32);
-    put_u32(&mut text, cx + 4, (c * 16) as u32);
-    put_u32(&mut text, cx + 8, (c * 16) as u32);
-    put_u32(&mut text, cx + 0x10, ((c + pad16) * 16) as u32);
+    // first and last of the four copies carry the padded input dim
+    put_u32(&mut text, cx, ((cin + pad16) * 16) as u32);
+    put_u32(&mut text, cx + 4, (cin * 16) as u32);
+    put_u32(&mut text, cx + 8, (cin * 16) as u32);
+    put_u32(&mut text, cx + 0x10, ((cin + pad16) * 16) as u32);
     debug_assert_eq!(text.len(), textlen);
 
     // ---- section contents ------------------------------------------
@@ -3847,12 +3929,21 @@ fn emit_from_mil_inner(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String
         ["conv"] => {
             let o = &ops[0];
             let (c, w) = (o.shape.get(1).copied().unwrap_or(0), o.shape.get(2).copied().unwrap_or(1));
-            // square `[1,C,1,1]` conv1x1 with C>=32 goes through the
-            // parametric emitter — byte-verified against ANEC for every
-            // channel count in 32..=4096 (except the 713..=720 variant
-            // window, which errors cleanly)
+            // `[1,Cout,1,1]` conv1x1 with both dims >=32 goes through
+            // the parametric emitter — byte-verified against ANEC for
+            // every square `C` in 32..=4096 and a dense non-square
+            // `(Cin,Cout)` grid (Cin comes from the weight's element
+            // count, `[Cout,Cin,1,1]`). The square 713..=720 variant
+            // window still errors cleanly.
             if w == 1 && c >= 32 {
-                return emit_conv1x1_dyn(c as usize, &weights_of(o)?, mil_path, out_path);
+                let weights = weights_of(o)?;
+                let cout = c as usize;
+                if weights.len() % cout == 0 {
+                    let cin = weights.len() / cout;
+                    if cin >= 32 {
+                        return emit_conv1x1_ns(cin, cout, &weights, mil_path, out_path);
+                    }
+                }
             }
             let shape = match (c, w) {
                 (64, 5) => ConvShape::C64W5,
@@ -4885,6 +4976,40 @@ mod tests {
                 diffs.first().copied().unwrap_or(0)
             );
         }
+    }
+
+    /// Non-square conv1x1: `emit_conv1x1_ns(64, 32)` reproduces the
+    /// captured ANEC artifact byte-for-byte — the `Cin`/`Cout` field
+    /// split, the lane stream, the kernel-name hash and all metadata.
+    #[test]
+    fn conv1x1_ns_byte_identical() {
+        let _g = SIG_LOCK.lock().unwrap();
+        let weights: Vec<u16> = (0..64 * 32).map(|i| i as u16).collect();
+        std::env::set_var("HWX_SIG_ANEC", "1");
+        let img = emit_conv1x1_ns(
+            64,
+            32,
+            &weights,
+            "/tmp/ane_corpus/convns64x32/net.mil",
+            "/tmp/ane_corpus/convns64x32/out/net.macho",
+        )
+        .unwrap();
+        std::env::remove_var("HWX_SIG_ANEC");
+        let expect = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/convns64x32_reference.hwx"
+        ))
+        .unwrap();
+        assert_eq!(
+            img,
+            expect,
+            "convns64x32: first diff at {:#x}",
+            img.iter()
+                .zip(&expect)
+                .position(|(a, b)| a != b)
+                .map(|i| i as i64)
+                .unwrap_or(-1)
+        );
     }
 
     /// Arbitrary io names on the conv family: same-sort, reordered,
