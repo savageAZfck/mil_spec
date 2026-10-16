@@ -282,18 +282,28 @@ ones. The command prints inputs/outputs with shapes, an op histogram, the
 `weight.bin` size and the bound dims, and embeds provenance so
 `milc attest` works afterwards.
 
-## Updatable layers — the honest answer
+## On-chip Neural Engine training (`mil_infer::graph`) vs. CoreML `mlProgram`
 
-CoreML's real updatable-model machinery (`NeuralNetwork.updatable`,
-the `set_updatable` flags coremltools flips) lives on the
-**neural-network proto**. `mlProgram` — what this toolchain emits —
-has no per-op or per-const updatable field for it to map onto, so
-there is nothing real to set. Instead `convert --updatable a,b,c`
-writes a documented `mil.updatable` marker in the userDefined
-metadata naming the weight consts; `milc inspect` shows it and the
-package compiles unchanged. It is intent metadata, not CoreML
-on-device training support — anything claiming otherwise would be a
-fake.
+CoreML's legacy updatable-model machinery (`NeuralNetwork.updatable`)
+only exists on the old neural-network proto; Apple's `mlProgram`
+wrapper bakes weights as read-only constants (`convert --updatable
+a,b,c` records a `mil.updatable` metadata marker for `mlProgram`
+packages).
+
+On the **sovereign native HWX path (`mil_infer::graph` + `espresso`)**,
+weights do not have to be baked constants: a `[1, R, 1, K]` weight
+matrix can live inside a persistent `SharedSurface` `IOSurface` buffer
+on the Neural Engine, and `compile_graph` lowers the full training loop
+to native HWX kernels:
+- **Forward:** `y = matmul(x = x, y = W, transpose_y = true)` (`emit_avw`)
+- **Backward:** `dx = matmul(x = dy, y = W, transpose_x = true)` (`emit_attn_v`, with automatic bidirectional `Contig <-> Strided` layout adaptation)
+- **Weight gradient:** `dW = matmul(x = neg_lr_dy, y = x, transpose_x = true)` (`emit_outer_t`)
+- **In-place weight update:** `W_new = add(x = W, y = dW)` (`emit_add4d`, aliased in-place onto `W`'s `SharedSurface`)
+
+Verified on hardware in `graph::tests::ane_onchip_backprop_training_exec`
+(2-layer MLP forward + backprop + in-place SGD executing 100% on the
+ANE, MSE `0.076198 -> 0.000096` in 16 steps, 0 mismatches vs. CPU
+backprop reference).
 
 ## Why a hand-rolled writer
 
