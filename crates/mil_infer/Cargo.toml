@@ -1,9 +1,9 @@
 [package]
 name = "mil_infer"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 rust-version = "1.80"
-description = "Sovereign Apple Neural Engine compiler and runtime: native HWX Mach-O emitter, MIL DAG graph scheduler, on-chip ANE backprop/SGD training, zero-copy IOSurface/Espresso execution, and e5rt pipeline."
+description = "Sovereign Apple Neural Engine compiler, decompiler, and runtime: native HWX Mach-O emitter + decompiler, MIL DAG graph scheduler, on-chip ANE backprop/SGD training, zero-copy IOSurface/Espresso execution."
 license = "MIT OR Apache-2.0"
 authors = ["Adam Clark <savagetism@icloud.com>"]
 repository = "https://github.com/savageAZfck/mil_spec"

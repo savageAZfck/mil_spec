@@ -6807,6 +6807,396 @@ fn apply_io_names(
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// HWX -> MIL + weight.bin Decompiler
+// ---------------------------------------------------------------------------
+
+/// Exact inverse of [`weight_layout_ns`]: de-interleaves the 16-lane,
+/// 64-byte-padded `__KERN_0` stream back into the row-major `[cout, cin]`
+/// fp16 weight matrix, returning `(weights, u16_words_consumed)`.
+pub fn weight_unlayout_ns(stream: &[u16], cin: usize, cout: usize) -> (Vec<u16>, usize) {
+    let mut w = vec![0u16; cin * cout];
+    let mut cur = 0usize;
+    for g in 0..16 {
+        let g_start = cur;
+        let mut base = 0;
+        while base < cout {
+            let pr = (cout - base).min(512);
+            let (pq, pr2) = (pr / 16, pr % 16);
+            let rows = pq + usize::from(g < pr2);
+            let row0 = base + g * pq + g.min(pr2);
+            for ic in 0..cin {
+                for m in 0..rows {
+                    if cur < stream.len() {
+                        w[(row0 + m) * cin + ic] = stream[cur];
+                    }
+                    cur += 1;
+                }
+            }
+            base += pr;
+        }
+        let bytes = (cur - g_start) * 2;
+        let pad = (64 - bytes % 64) % 64;
+        cur += pad / 2;
+    }
+    (w, cur)
+}
+
+/// One lifted operation from a compiled `.hwx` Mach-O binary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecompiledOp {
+    Conv1x1 {
+        cin: usize,
+        cout: usize,
+        spatial: usize,
+        weight_idx: usize,
+    },
+    MatmulConst {
+        k: usize,
+        n: usize,
+        weight_idx: usize,
+    },
+    MatmulAvw {
+        r: usize,
+        k: usize,
+    },
+    MatmulOuter {
+        t: usize,
+        d: usize,
+    },
+    MatmulAttnV {
+        t: usize,
+        d: usize,
+    },
+    Elementwise {
+        op: String,
+    },
+    Unary {
+        op: String,
+    },
+    Softmax {
+        axis: i32,
+    },
+    Transpose,
+}
+
+/// Complete lifted representation of a precompiled ANE `.hwx` Mach-O:
+/// IO signatures, decoded task operations, de-interleaved `[cout, cin]`
+/// fp16 weight tensors, and reconstructed MIL source text.
+#[derive(Clone, Debug)]
+pub struct DecompiledHwx {
+    pub inputs: Vec<(String, [usize; 4])>,
+    pub outputs: Vec<(String, [usize; 4])>,
+    pub ops: Vec<DecompiledOp>,
+    /// De-interleaved row-major `[cout, cin]` fp16 weights per weight-bearing op.
+    pub weights: Vec<Vec<u16>>,
+    /// Reconstructed `program(1.3)` MIL text.
+    pub mil: String,
+}
+
+fn get_u32(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+}
+
+/// Decompile a precompiled ANE `.hwx`/`.macho` binary back into its
+/// [`DecompiledHwx`] (IO descriptors, task sequence, de-interleaved
+/// `__KERN_0` fp16 weights, and reconstructed MIL program).
+pub fn decompile_hwx(img: &[u8], weight_dir: &str) -> Result<DecompiledHwx, String> {
+    if img.len() < 0x200 || &img[0..4] != &0xbeef_face_u32.to_le_bytes() {
+        return Err("not an ANE HWX Mach-O (missing 0xbeefface magic)".into());
+    }
+    let ncmds = get_u32(img, 0x10) as usize;
+    let mut lc = 0x20usize;
+    let mut text_range = (0usize, 0usize);
+    let mut kern_range = (0usize, 0usize);
+    for _ in 0..ncmds {
+        if lc + 8 > img.len() {
+            break;
+        }
+        let cmd = get_u32(img, lc);
+        let cmdsz = get_u32(img, lc + 4) as usize;
+        if cmd == 0x19 && lc + 72 <= img.len() {
+            let nsects = get_u32(img, lc + 64) as usize;
+            for si in 0..nsects {
+                let s = lc + 72 + si * 80;
+                if s + 80 > img.len() {
+                    break;
+                }
+                let sname = std::str::from_utf8(&img[s..s + 16])
+                    .unwrap_or("")
+                    .trim_end_matches('\0');
+                let sz = u64::from_le_bytes(img[s + 40..s + 48].try_into().unwrap()) as usize;
+                let fo = get_u32(img, s + 48) as usize;
+                match sname {
+                    "__text" => text_range = (fo, sz),
+                    "__kern_0" => kern_range = (fo, sz),
+                    _ => {}
+                }
+            }
+        }
+        if cmdsz == 0 {
+            break;
+        }
+        lc += cmdsz;
+    }
+
+    let (entries, _) = tail_meta(img);
+    let mut io_syms = Vec::new();
+    for (name, n_type, _n_sect, n_desc, _) in &entries {
+        if *n_type == 0x20 && name.contains("ar1;0;") {
+            let sym = name.split(':').next().unwrap_or("x").to_string();
+            let dv: Vec<usize> = name
+                .split("ar1;0;")
+                .skip(1)
+                .filter_map(|s| s.split(';').next()?.parse().ok())
+                .collect();
+            if dv.len() >= 4 {
+                let dims = if dv[0] > 1 && dv[1] == 1 {
+                    [1, dv[0], dv[2], dv[3]]
+                } else {
+                    [dv[0], dv[1], dv[2], dv[3]]
+                };
+                io_syms.push((sym, dims, *n_desc));
+            }
+        }
+    }
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    for (idx, (sym, dims, desc)) in io_syms.iter().enumerate() {
+        if *desc == 0x1d || (idx + 1 == io_syms.len() && outputs.is_empty()) {
+            outputs.push((sym.clone(), *dims));
+        } else {
+            inputs.push((sym.clone(), *dims));
+        }
+    }
+    if inputs.is_empty() {
+        inputs.push(("x".into(), [1, 64, 1, 1]));
+    }
+    if outputs.is_empty() {
+        outputs.push(("z".into(), [1, 64, 1, 1]));
+    }
+
+    let text = if text_range.0 + text_range.1 <= img.len() && text_range.1 > 0 {
+        &img[text_range.0..text_range.0 + text_range.1]
+    } else {
+        &[]
+    };
+    let mut ops = Vec::new();
+    let mut weights = Vec::new();
+
+    if kern_range.1 > 0 && kern_range.0 + kern_range.1 <= img.len() {
+        let kern_u16: Vec<u16> = img[kern_range.0..kern_range.0 + kern_range.1]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let k_tasks = if img.len() > 0xb8c {
+            get_u32(img, 0xb88).max(1) as usize
+        } else {
+            1
+        };
+        let multi_flag = text.len() > 0x30 && get_u32(text, 0x2c) == 1;
+        if k_tasks > 1 && multi_flag {
+            let mut kcur = 0usize;
+            for ti in 0..k_tasks {
+                let want_hdr =
+                    0x10240u32 + (ti as u32) * 0x10000 + if ti + 1 == k_tasks { 0x80 } else { 0 };
+                let rec_off = (0x30..text.len().saturating_sub(0xf0))
+                    .step_by(4)
+                    .find(|&o| get_u32(text, o + 8) == want_hdr)
+                    .ok_or_else(|| format!("task {ti} record header not found in __text"))?;
+                let cin = get_u32(text, rec_off + 0xdc) as usize;
+                let cout = get_u32(text, rec_off + 0xec) as usize;
+                let (w, used) = weight_unlayout_ns(&kern_u16[kcur..], cin, cout);
+                kcur += used;
+                let widx = weights.len();
+                weights.push(w);
+                ops.push(DecompiledOp::Conv1x1 {
+                    cin,
+                    cout,
+                    spatial: 1,
+                    weight_idx: widx,
+                });
+            }
+        } else {
+            let in0 = inputs[0].1;
+            let out0 = outputs[0].1;
+            if in0[1] == 1 && in0[3] > 1 {
+                let (k, n) = (in0[3], out0[1].max(out0[3]));
+                let (w, _) = weight_unlayout_ns(&kern_u16, k, n);
+                weights.push(w);
+                ops.push(DecompiledOp::MatmulConst {
+                    k,
+                    n,
+                    weight_idx: 0,
+                });
+            } else {
+                let (cin, cout, spatial) = (in0[1], out0[1], in0[3].max(in0[2]).max(1));
+                let (w, _) = weight_unlayout_ns(&kern_u16, cin, cout);
+                weights.push(w);
+                ops.push(DecompiledOp::Conv1x1 {
+                    cin,
+                    cout,
+                    spatial,
+                    weight_idx: 0,
+                });
+            }
+        }
+    } else if inputs.len() >= 2 {
+        let (s0, s1, so) = (inputs[0].1, inputs[1].1, outputs[0].1);
+        let avw_op = if text.len() > 0xd4 {
+            get_u32(text, 0xd0)
+        } else {
+            0
+        };
+        if matches!(avw_op, 0x4a0001 | 0x480001) {
+            let r = get_u32(img, 0x198c) as usize;
+            let k = get_u32(img, 0x1994) as usize;
+            ops.push(DecompiledOp::MatmulAvw { r, k });
+        } else if s0[1] > 1 && s0[3] == 1 && s1[3] > 1 && so[1] == s0[1] && so[3] == s1[3] {
+            ops.push(DecompiledOp::MatmulOuter { t: so[1], d: so[3] });
+        } else if (s0[1] > 1 || s0[2] > 1)
+            && (s1[1] > 1 || s1[2] > 1)
+            && so[1] == 1
+            && so[3] == s1[3]
+        {
+            ops.push(DecompiledOp::MatmulAttnV {
+                t: s1[1].max(s1[2]),
+                d: s1[3],
+            });
+        } else {
+            let opc = if s0[1] > 256 && text.len() > 0xd4 {
+                get_u32(text, 0xd0)
+            } else if text.len() > 0xd0 {
+                get_u32(text, 0xcc)
+            } else {
+                0x0001_0000
+            };
+            let op = match opc {
+                x if x == EwOp::Sub.opcode() => "sub",
+                x if x == EwOp::Mul.opcode() => "mul",
+                x if x == EwOp::Min.opcode() => "minimum",
+                x if x == EwOp::Max.opcode() => "maximum",
+                _ => "add",
+            };
+            ops.push(DecompiledOp::Elementwise { op: op.into() });
+        }
+    } else {
+        let (s0, so) = (inputs[0].1, outputs[0].1);
+        if s0[1] > 1 && s0[3] == 1 && so[1] == 1 && so[3] == s0[1] {
+            ops.push(DecompiledOp::Transpose);
+        } else if text_range.0 == 0x4000 && (so[3] > 1 || text.len() > 0x300) {
+            ops.push(DecompiledOp::Softmax {
+                axis: if so[1] > 1 { 1 } else { -1 },
+            });
+        } else {
+            ops.push(DecompiledOp::Unary {
+                op: "sigmoid".into(),
+            });
+        }
+    }
+
+    // Reconstruct executable MIL text
+    let mut mil = String::from("program(1.3)\n{\n    func main<ios18>(");
+    for (i, (nm, d)) in inputs.iter().enumerate() {
+        if i > 0 {
+            mil.push_str(", ");
+        }
+        mil.push_str(&format!(
+            "tensor<fp16, [{}, {}, {}, {}]> {nm}",
+            d[0], d[1], d[2], d[3]
+        ));
+    }
+    mil.push_str(") {\n");
+    let out_sym = &outputs[0].0;
+    let out_d = outputs[0].1;
+    for (i, op) in ops.iter().enumerate() {
+        let last = i + 1 == ops.len();
+        let res = if last {
+            out_sym.clone()
+        } else {
+            format!("y{}", i + 1)
+        };
+        let xin = if i == 0 {
+            inputs[0].0.clone()
+        } else {
+            format!("y{i}")
+        };
+        match op {
+            DecompiledOp::Conv1x1 {
+                cin,
+                cout,
+                spatial,
+                weight_idx,
+            } => {
+                if i == 0 {
+                    mil.push_str("        tensor<string, []> pt = const()[val = string(\"valid\")];\n        tensor<int32, [2]> st = const()[val = tensor<int32, [2]>([1, 1])];\n        tensor<int32, [4]> pd = const()[val = tensor<int32, [4]>([0, 0, 0, 0])];\n        tensor<int32, [2]> dl = const()[val = tensor<int32, [2]>([1, 1])];\n        tensor<int32, []> gr = const()[val = int32(1)];\n");
+                }
+                mil.push_str(&format!(
+                    "        tensor<fp16, [{cout}, {cin}, 1, 1]> W{weight_idx} = const()[val = tensor<fp16, [{cout}, {cin}, 1, 1]>(BLOBFILE(path = string(\"{weight_dir}/w{weight_idx}.bin\"), offset = uint64(0)))];\n        tensor<fp16, [1, {cout}, 1, {spatial}]> {res} = conv(dilations = dl, groups = gr, pad = pd, pad_type = pt, strides = st, weight = W{weight_idx}, x = {xin})[name = string(\"{res}\")];\n"
+                ));
+            }
+            DecompiledOp::MatmulConst { k, n, weight_idx } => {
+                mil.push_str(&format!(
+                    "        bool bf = const()[val = bool(false)];\n        bool bt = const()[val = bool(true)];\n        tensor<fp16, [1, {n}, 1, {k}]> W{weight_idx} = const()[val = tensor<fp16, [1, {n}, 1, {k}]>(BLOBFILE(path = string(\"{weight_dir}/w{weight_idx}.bin\"), offset = uint64(0)))];\n        tensor<fp16, [1, 1, 1, {n}]> {res} = matmul(transpose_x = bf, transpose_y = bt, x = {xin}, y = W{weight_idx})[name = string(\"{res}\")];\n"
+                ));
+            }
+            DecompiledOp::MatmulAvw { r, .. } => {
+                let yin = &inputs[1].0;
+                mil.push_str(&format!(
+                    "        tensor<bool, []> bf = const()[val = bool(false)];\n        tensor<bool, []> bt = const()[val = bool(true)];\n        tensor<fp16, [1, {r}, 1, 1]> {res} = matmul(transpose_x = bf, transpose_y = bt, x = {xin}, y = {yin})[name = string(\"{res}\")];\n"
+                ));
+            }
+            DecompiledOp::MatmulOuter { t, d } => {
+                let yin = &inputs[1].0;
+                mil.push_str(&format!(
+                    "        tensor<bool, []> bt = const()[val = bool(true)];\n        tensor<fp16, [1, {t}, 1, {d}]> {res} = matmul(transpose_x = bt, x = {xin}, y = {yin})[name = string(\"{res}\")];\n"
+                ));
+            }
+            DecompiledOp::MatmulAttnV { d, .. } => {
+                let yin = &inputs[1].0;
+                mil.push_str(&format!(
+                    "        tensor<bool, []> bt = const()[val = bool(true)];\n        tensor<fp16, [1, 1, 1, {d}]> {res} = matmul(transpose_x = bt, x = {xin}, y = {yin})[name = string(\"{res}\")];\n"
+                ));
+            }
+            DecompiledOp::Elementwise { op } => {
+                let yin = &inputs[1].0;
+                mil.push_str(&format!(
+                    "        tensor<fp16, [{}, {}, {}, {}]> {res} = {op}(x = {xin}, y = {yin})[name = string(\"{res}\")];\n",
+                    out_d[0], out_d[1], out_d[2], out_d[3]
+                ));
+            }
+            DecompiledOp::Unary { op } => {
+                mil.push_str(&format!(
+                    "        tensor<fp16, [{}, {}, {}, {}]> {res} = {op}(x = {xin})[name = string(\"{res}\")];\n",
+                    out_d[0], out_d[1], out_d[2], out_d[3]
+                ));
+            }
+            DecompiledOp::Softmax { axis } => {
+                mil.push_str(&format!(
+                    "        tensor<int32, []> ax = const()[val = int32({axis})];\n        tensor<fp16, [{}, {}, {}, {}]> {res} = softmax(axis = ax, x = {xin})[name = string(\"{res}\")];\n",
+                    out_d[0], out_d[1], out_d[2], out_d[3]
+                ));
+            }
+            DecompiledOp::Transpose => {
+                mil.push_str(&format!(
+                    "        tensor<fp16, [{}, {}, {}, {}]> {res} = transpose(x = {xin})[name = string(\"{res}\")];\n",
+                    out_d[0], out_d[1], out_d[2], out_d[3]
+                ));
+            }
+        }
+    }
+    mil.push_str(&format!("    }} -> ({out_sym});\n}}\n"));
+
+    Ok(DecompiledHwx {
+        inputs,
+        outputs,
+        ops,
+        weights,
+        mil,
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
@@ -8320,5 +8710,107 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn roundtrip_compile_and_decompile_hwx() {
+        let dir = std::env::temp_dir().join(format!("decompile_rt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1) Non-square conv1x1 (64 -> 128): compile -> decompile -> verify bit-exact weights + re-emit byte-identity
+        let w_orig: Vec<u16> = (0..128 * 64)
+            .map(|i| half::f16::from_f32((((i * 19 + 7) % 83) as f32 - 41.0) * 0.01).to_bits())
+            .collect();
+        let hwx1 = emit_conv1x1_ns(64, 128, &w_orig, "/tmp/m.mil", "/tmp/m.macho").unwrap();
+        let dec1 = decompile_hwx(&hwx1, dir.to_str().unwrap()).unwrap();
+        assert_eq!(
+            dec1.ops,
+            vec![DecompiledOp::Conv1x1 {
+                cin: 64,
+                cout: 128,
+                spatial: 1,
+                weight_idx: 0
+            }]
+        );
+        assert_eq!(dec1.weights.len(), 1);
+        assert_eq!(
+            dec1.weights[0], w_orig,
+            "decompiled conv1x1 weights bit-exact"
+        );
+
+        // Write decompiled weights + MIL and re-compile via emit_from_mil: must produce identical HWX bytes
+        let wb0: Vec<u8> = dec1.weights[0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        std::fs::write(dir.join("w0.bin"), &wb0).unwrap();
+        let mil1_path = dir.join("dec1.mil");
+        std::fs::write(&mil1_path, &dec1.mil).unwrap();
+        let hwx1_re = emit_from_mil(mil1_path.to_str().unwrap(), "/tmp/m.macho").unwrap();
+        let hwx1_expected = emit_conv1x1_ns(
+            64,
+            128,
+            &w_orig,
+            mil1_path.to_str().unwrap(),
+            "/tmp/m.macho",
+        )
+        .unwrap();
+        assert_eq!(
+            hwx1_re, hwx1_expected,
+            "recompiled decompiled MIL matches HWX byte-for-byte"
+        );
+
+        // 2) Multi-task mixed-shape conv_chain (64 -> 96 -> 32 -> 64): decompile recovers all 3 task shapes & weights
+        let shapes = [(64usize, 96usize), (96, 32), (32, 64)];
+        let mut flat_w = Vec::new();
+        let mut per_task_w = Vec::new();
+        for (ti, &(ci, co)) in shapes.iter().enumerate() {
+            let tw: Vec<u16> = (0..ci * co)
+                .map(|i| {
+                    half::f16::from_f32((((i * 13 + ti * 29) % 71) as f32 - 35.0) * 0.01).to_bits()
+                })
+                .collect();
+            flat_w.extend_from_slice(&tw);
+            per_task_w.push(tw);
+        }
+        let offs = [
+            128u64,
+            128 + 64 * 96 * 2 + 64,
+            128 + (64 * 96 + 96 * 32) * 2 + 128,
+        ];
+        let hwx_chain =
+            emit_conv_chain(&shapes, &flat_w, &offs, "y3", "/tmp/c.mil", "/tmp/c.macho").unwrap();
+        let dec_chain = decompile_hwx(&hwx_chain, dir.to_str().unwrap()).unwrap();
+        assert_eq!(dec_chain.ops.len(), 3);
+        for (ti, &(ci, co)) in shapes.iter().enumerate() {
+            assert_eq!(
+                dec_chain.ops[ti],
+                DecompiledOp::Conv1x1 {
+                    cin: ci,
+                    cout: co,
+                    spatial: 1,
+                    weight_idx: ti
+                }
+            );
+            assert_eq!(
+                dec_chain.weights[ti], per_task_w[ti],
+                "chain task {ti} weights bit-exact"
+            );
+        }
+
+        // 3) Elementwise mul & avw broadcast matvec decompilation
+        let hwx_mul = emit_elementwise2(EwOp::Mul, 64, "/tmp/e.mil", "/tmp/e.macho");
+        let dec_mul = decompile_hwx(&hwx_mul, dir.to_str().unwrap()).unwrap();
+        assert_eq!(
+            dec_mul.ops,
+            vec![DecompiledOp::Elementwise { op: "mul".into() }]
+        );
+
+        let hwx_avw = emit_avw(128, 64, "/tmp/a.mil", "/tmp/a.macho");
+        let dec_avw = decompile_hwx(&hwx_avw, dir.to_str().unwrap()).unwrap();
+        assert_eq!(dec_avw.ops, vec![DecompiledOp::MatmulAvw { r: 128, k: 64 }]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -110,7 +110,7 @@ fn cmd_ane(args: &[String]) -> ExitCode {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "lower" | "validate" | "compile" | "run" | "decode" => {
+            "lower" | "validate" | "compile" | "run" | "decode" | "decompile" => {
                 if mode.is_empty() {
                     mode = args[i].as_str();
                 }
@@ -156,6 +156,52 @@ fn cmd_ane(args: &[String]) -> ExitCode {
         eprintln!("milc ane <lower|validate|compile|run> <model.mil> [-o <out>] [--arch h16g] [--pos N]\n       milc ane decode <shard_dir> --tokens <a,b,c> [--max-new N]");
         return ExitCode::from(2);
     };
+    if mode == "decompile" {
+        let bytes = match std::fs::read(&mil) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("milc ane decompile: {}: {e}", mil.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        let dir = out.unwrap_or_else(|| mil.with_extension("decompiled"));
+        let _ = std::fs::create_dir_all(&dir);
+        return match mil_infer::hwx::decompile_hwx(&bytes, &dir.display().to_string()) {
+            Ok(dec) => {
+                for (i, w) in dec.weights.iter().enumerate() {
+                    let wb: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let wp = dir.join(format!("w{i}.bin"));
+                    if let Err(e) = std::fs::write(&wp, &wb) {
+                        eprintln!("milc ane decompile: {}: {e}", wp.display());
+                        return ExitCode::FAILURE;
+                    }
+                }
+                let mp = dir.join("model.mil");
+                if let Err(e) = std::fs::write(&mp, &dec.mil) {
+                    eprintln!("milc ane decompile: {}: {e}", mp.display());
+                    return ExitCode::FAILURE;
+                }
+                println!(
+                    "decompiled {} -> {} ({} op(s), {} weight tensor(s))",
+                    mil.display(),
+                    mp.display(),
+                    dec.ops.len(),
+                    dec.weights.len()
+                );
+                for (i, op) in dec.ops.iter().enumerate() {
+                    println!("  task {i}: {op:?}");
+                }
+                if detail {
+                    print!("{}", dec.mil);
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("milc ane decompile: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if mode == "decode" {
         let max_new = if pos > 0 { pos as usize } else { 8 };
         let mut dec = match mil_infer::ane_decode::Decoder::open_dir(
