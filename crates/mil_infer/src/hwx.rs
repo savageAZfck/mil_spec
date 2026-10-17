@@ -8714,6 +8714,7 @@ mod tests {
 
     #[test]
     fn roundtrip_compile_and_decompile_hwx() {
+        let _g = SIG_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("decompile_rt_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
