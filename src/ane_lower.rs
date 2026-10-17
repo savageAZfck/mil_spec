@@ -141,10 +141,9 @@ fn split_attrs(t: &str) -> (&str, Vec<(String, String)>) {
                     return (t, vec![]);
                 }
             }
-            '{'
-                if stack.pop() != Some('}') => {
-                    return (t, vec![]);
-                }
+            '{' if stack.pop() != Some('}') => {
+                return (t, vec![]);
+            }
             _ => {}
         }
     }

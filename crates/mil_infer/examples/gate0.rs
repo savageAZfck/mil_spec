@@ -138,10 +138,7 @@ fn main() {
             // chunk = { magic u32, type u32, len u64, data_off u64, zero pad
             //           to 64 } with data immediately after; BLOBFILE
             // offsets point at chunk headers.
-            let data: Vec<u8> = [f16(2.5); N]
-                .iter()
-                .flat_map(|b| b.to_le_bytes())
-                .collect();
+            let data: Vec<u8> = [f16(2.5); N].iter().flat_map(|b| b.to_le_bytes()).collect();
             let mut blob = Vec::new();
             blob.extend_from_slice(&[0x0c, 0, 0, 0, 0x02, 0, 0, 0]);
             blob.resize(64, 0);

@@ -220,9 +220,9 @@ fn main() {
     fn dset(d: *mut c_void, k: &str, v: *const c_void) {
         unsafe { CFDictionarySetValue(d, cfstr(k) as *const c_void, v as *const c_void) }
     }
-    let mil = std::env::args().nth(1).unwrap_or_else(|| {
-        concat!(env!("CARGO_MANIFEST_DIR"), "/assets/chain/c64k1.mil").into()
-    });
+    let mil = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/assets/chain/c64k1.mil").into());
     let (dir0, base) = mil.rsplit_once('/').unwrap();
     let dir = format!("{dir0}/");
     let net = mdict();

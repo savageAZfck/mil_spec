@@ -7,8 +7,6 @@ use mil_infer::Anec;
 use std::fs;
 use std::path::Path;
 
-
-
 fn chain_mil(c: u32, k: usize) -> String {
     let mut s =
         format!("program(1.3)\n{{\n    func main<ios18>(tensor<fp16, [1, {c}, 1, 1]> x) {{\n");

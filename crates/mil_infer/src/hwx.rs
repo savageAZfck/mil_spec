@@ -302,7 +302,11 @@ pub fn emit_elementwise_chain(
         put_u32(&mut img, r + f, n);
     }
     put_u32(&mut img, r + 0x168, n * 2);
-    put_u32(&mut img, r + 0x178, ((n * 2) & 0xff) | ((v16 + n / 128) << 8));
+    put_u32(
+        &mut img,
+        r + 0x178,
+        ((n * 2) & 0xff) | ((v16 + n / 128) << 8),
+    );
 
     // lane descriptors: which program input is op2's free operand
     // swaps the two descriptor halves.
@@ -3081,7 +3085,10 @@ pub fn emit_conv_act_n_dw(
             }
         }
     }
-    img.resize((kern_off + (stream_sz * streams.len() + 0x3fff)) & !0x3fff, 0);
+    img.resize(
+        (kern_off + (stream_sz * streams.len() + 0x3fff)) & !0x3fff,
+        0,
+    );
 
     patch_chain_scalars(
         &mut img,
@@ -5253,7 +5260,8 @@ pub(crate) fn mil_ops(text: &str) -> (Vec<MilOp>, Vec<(String, String)>) {
             continue;
         }
         let shape = lhs
-            .find('[').zip(lhs.find(']'))
+            .find('[')
+            .zip(lhs.find(']'))
             .map(|(l, r)| {
                 lhs[l + 1..r]
                     .split(',')
@@ -5481,7 +5489,8 @@ pub(crate) fn load_mil_weight_u16(
             })
             .unwrap_or_else(|| "fp16".to_string());
         let shape: Vec<usize> = lhs
-            .find('[').zip(lhs.find(']'))
+            .find('[')
+            .zip(lhs.find(']'))
             .map(|(l, r)| {
                 lhs[l + 1..r]
                     .split(',')
@@ -6189,9 +6198,7 @@ fn mil_io_sig(text: &str) -> Option<IoSig> {
                         .collect()
                 })
                 .unwrap_or_default();
-            p.rsplit([' ', '>'])
-                .next()
-                .map(|n| (n.to_string(), dims))
+            p.rsplit([' ', '>']).next().map(|n| (n.to_string(), dims))
         })
         .unzip();
     let arrow = text[close..].find("->")? + close;
