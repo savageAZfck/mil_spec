@@ -153,7 +153,7 @@ fn cmd_ane(args: &[String]) -> ExitCode {
         i += 1;
     }
     let Some(mil) = mil else {
-        eprintln!("milc ane <lower|validate|compile|run> <model.mil> [-o <out>] [--arch h16g] [--pos N]\n       milc ane decode <shard_dir> --tokens <a,b,c> [--max-new N]");
+        eprintln!("milc ane <lower|validate|compile|run> <model.mil> [-o <out>] [--arch h16g] [--pos N]\n       milc ane decompile <file.hwx> [-o <out_dir>] [--detail]\n       milc ane decode <shard_dir> --tokens <a,b,c> [--max-new N]");
         return ExitCode::from(2);
     };
     if mode == "decompile" {
