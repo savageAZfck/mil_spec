@@ -54,7 +54,7 @@ fn main() {
     }
     blob(
         &format!("{dir}/gam.bin"),
-        &vec![f16::from_f32(1.0).to_bits(); D],
+        &[f16::from_f32(1.0).to_bits(); D],
     );
     // half-rotation permutation matrix: Perm[j][k] = delta(j, k ^ 32)
     blob(

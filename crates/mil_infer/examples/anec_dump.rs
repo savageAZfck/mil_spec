@@ -67,7 +67,7 @@ fn main() {
                         "  {} vmaddr={:#x} vmsize={:#x} fileoff={:#x} filesz={:#x}",
                         seg, sg.vmaddr, sg.vmsize, sg.fileoff, sg.filesize
                     );
-                    let data = std::slice::from_raw_parts((lc as usize - 32) as *const u8, 0); // placeholder
+                    let data = std::slice::from_raw_parts((lc - 32) as *const u8, 0); // placeholder
                     let _ = data;
                     // image base = mh; segment contents at mh + (vmaddr - first_text_vmaddr)?
                     // In dyld cache, image is mapped contiguously from mh upward by fileoff order?

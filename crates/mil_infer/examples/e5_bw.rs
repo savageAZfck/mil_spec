@@ -17,10 +17,10 @@ fn main() {
         .unwrap_or(1);
 
     let live: Vec<(&str, u64)> = vec![
-        ("cos", 1 * 1 * 5 * 64),
-        ("mask", 1 * 1 * 5 * 64),
-        ("sin", 1 * 1 * 5 * 64),
-        ("x", 1 * 576 * 5 * 1),
+        ("cos", 5 * 64),
+        ("mask", 5 * 64),
+        ("sin", 5 * 64),
+        ("x", (576 * 5)),
     ];
     let mut inouts: Vec<(&str, u64)> = vec![];
     if std::env::var("E5_NOSTATE").is_err() {
@@ -40,7 +40,7 @@ fn main() {
             ));
         }
     }
-    let outs: Vec<(&str, u64)> = vec![("l7_rm", 1 * 576 * 5 * 1)];
+    let outs: Vec<(&str, u64)> = vec![("l7_rm", (576 * 5))];
 
     eprintln!(
         "[e5] compiling {} ({} in, {} inout, {} out)",

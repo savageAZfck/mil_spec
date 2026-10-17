@@ -334,7 +334,7 @@ fn main() {
         let c = CString::new(s).unwrap();
         let mut b = [0u8; 24];
         b[..8].copy_from_slice(&(c.as_ptr() as usize).to_le_bytes());
-        b[8..16].copy_from_slice(&(s.len() as usize).to_le_bytes());
+        b[8..16].copy_from_slice(&s.len().to_le_bytes());
         let cap = s.len() | (1usize << 63);
         b[16..24].copy_from_slice(&cap.to_le_bytes());
         (b, c)

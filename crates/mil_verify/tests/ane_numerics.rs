@@ -102,7 +102,7 @@ fn ane_vs_cpu_truncated_smollm2() {
         mil_convert::convert(&dir, &pkg, &opts).unwrap();
         let comp = mil_compile::compile(&pkg, &root.join("c")).unwrap();
         let _ = std::fs::remove_dir_all(&pkg);
-        let ins = mil_verify::golden::package_inputs(&cfg, &w, &ids, 64).unwrap();
+        let ins = mil_verify::golden::package_inputs(&cfg, &w, ids, 64).unwrap();
         let cpu = run(&pkg, &comp.path, &ins, ComputeUnits::CpuOnly);
         let ane = run(&pkg, &comp.path, &ins, ComputeUnits::CpuAndNeuralEngine);
         match (cpu, ane) {

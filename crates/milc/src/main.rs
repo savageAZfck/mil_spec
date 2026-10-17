@@ -1674,8 +1674,8 @@ fn cmd_plan(args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     println!(
-        "{:<5} {:<28} {:<6} {:<10} {}",
-        "dev", "op", "cost%", "supported", "output"
+        "{:<5} {:<28} {:<6} {:<10} output",
+        "dev", "op", "cost%", "supported"
     );
     for o in &ops {
         if o.preferred.is_none() {

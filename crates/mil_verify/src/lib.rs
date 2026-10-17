@@ -767,7 +767,7 @@ fn op_out_info(nvt: &Msg) -> (Option<String>, Option<mil_spec::DType>, Vec<i64>)
         .and_then(|vt| vt.msg(1).or_else(|| vt.msg(2).and_then(|st| st.msg(1))));
     match tt {
         Some(t) => {
-            let (dt, shape) = tensor_type_info(&t);
+            let (dt, shape) = tensor_type_info(t);
             (name, dt, shape)
         }
         None => (name, None, Vec::new()),

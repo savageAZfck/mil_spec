@@ -47,8 +47,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut kv = vec![0u16; seq];
     kv[0] = half::f16::from_f32(1.0).to_bits();
     pipe.set_shared("kv_write_mask", &kv)?;
-    pipe.set_shared("rope_cos", &vec![half::f16::from_f32(1.0).to_bits(); 64])?;
-    pipe.set_shared("rope_sin", &vec![0u16; 64])?;
+    pipe.set_shared("rope_cos", &[half::f16::from_f32(1.0).to_bits(); 64])?;
+    pipe.set_shared("rope_sin", &[0u16; 64])?;
     pipe.reset_state()?;
 
     pipe.step()?;

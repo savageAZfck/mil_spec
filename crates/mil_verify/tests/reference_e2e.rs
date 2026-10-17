@@ -1036,7 +1036,7 @@ fn qwen3_seq_range_equals_fixed_on_all_units() {
         );
         assert_eq!(argmax(&a), argmax(&b), "pos {p}: top-1 differs");
         assert!(
-            (cosine(&a, &b) as f64) >= MIN_COS,
+            cosine(&a, &b) >= MIN_COS,
             "pos {p}: range-vs-fixed cosine below {MIN_COS}"
         );
         assert!(

@@ -23,7 +23,7 @@ fn weight_blob(data: &[u8]) -> Vec<u8> {
 
 /// All-ones fp16 payload.
 fn ones_blob(n_elem: usize) -> Vec<u8> {
-    weight_blob(&vec![0x00, 0x3c].repeat(n_elem))
+    weight_blob(&[0x00, 0x3c].repeat(n_elem))
 }
 
 /// Perm-pattern weights: element `i` is the raw u16 `i`, so the

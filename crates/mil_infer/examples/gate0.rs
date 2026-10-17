@@ -138,7 +138,7 @@ fn main() {
             // chunk = { magic u32, type u32, len u64, data_off u64, zero pad
             //           to 64 } with data immediately after; BLOBFILE
             // offsets point at chunk headers.
-            let data: Vec<u8> = vec![f16(2.5); N]
+            let data: Vec<u8> = [f16(2.5); N]
                 .iter()
                 .flat_map(|b| b.to_le_bytes())
                 .collect();

@@ -11,7 +11,7 @@ fn main() {
         .map(|i| f16(((i / d * 7 + i % d * 3) % 17) as f32 / 64.0))
         .collect();
     let p = format!("/tmp/hdbg_{pid}.macho");
-    std::fs::write(&p, &emit_matmul_ns(d, d, &w, "/tmp/hd.mil", &p).unwrap()).unwrap();
+    std::fs::write(&p, emit_matmul_ns(d, d, &w, "/tmp/hd.mil", &p).unwrap()).unwrap();
     let mut m = EspressoProgram::load_precompiled(Path::new(&p), &[]).unwrap();
     let dx = m.input_descs[0].clone();
     let dz = m.output_descs[0].clone();

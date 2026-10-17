@@ -38,7 +38,7 @@ fn main() {
         // stream exposes ANEC's row assignment directly.
         let by_row = std::env::var_os("CONV_PROBE_WROWS").is_some();
         let mut d = Vec::with_capacity(c as usize * c as usize * 2);
-        for i in 0..(c * c) as u32 {
+        for i in 0..(c * c) {
             let v = if by_row { i / c } else { i };
             d.extend_from_slice(&(v as u16).to_le_bytes());
         }

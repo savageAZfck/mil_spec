@@ -162,8 +162,8 @@ fn main() {
             wpath.clone()
         } else {
             // derive from committed corpus: weights live in the mil dir
-            let alt = refh.replace(".hwx", "/weights/weight.bin");
-            alt
+            
+            refh.replace(".hwx", "/weights/weight.bin")
         };
         let w = match std::panic::catch_unwind(|| weights_of(&wpath2, *k)) {
             Ok(w) => w,

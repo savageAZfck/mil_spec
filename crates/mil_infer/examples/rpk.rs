@@ -9,7 +9,7 @@ fn f32_of(h: u16) -> f32 {
 }
 fn main() {
     let p = format!("/tmp/rpk_{}.macho", std::process::id());
-    std::fs::write(&p, &emit_repack64("/tmp/rpk.mil", &p)).unwrap();
+    std::fs::write(&p, emit_repack64("/tmp/rpk.mil", &p)).unwrap();
     let mut m = EspressoProgram::load_precompiled(Path::new(&p), &[]).unwrap();
     let dx = m.input_descs[0].clone();
     let dz = m.output_descs[0].clone();

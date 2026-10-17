@@ -215,10 +215,10 @@ fn emit_elementwise2_big(op: EwOp, n: u32, mil_path: &str, out_path: &str) -> Ve
         put_u32(&mut img, f, 0x3000_0000 | s);
     }
     for &f in &[0x1b0usize, 0x200, 0x368, 0x3f8] {
-        put_u32(&mut img, f, 0x3000_0000 | 2 * s);
+        put_u32(&mut img, f, 0x3000_0000 | (2 * s));
     }
     for &f in &[0x248usize, 0x298, 0x388, 0xb88] {
-        put_u32(&mut img, f, 0x3000_0000 | 3 * s);
+        put_u32(&mut img, f, 0x3000_0000 | (3 * s));
     }
     for &f in &[0x2e8usize, 0x398] {
         put_u32(&mut img, f, 0x3000_0000 | (3 * s + 0x140));
@@ -302,11 +302,11 @@ pub fn emit_elementwise_chain(
         put_u32(&mut img, r + f, n);
     }
     put_u32(&mut img, r + 0x168, n * 2);
-    put_u32(&mut img, r + 0x178, (n * 2 & 0xff) | ((v16 + n / 128) << 8));
+    put_u32(&mut img, r + 0x178, ((n * 2) & 0xff) | ((v16 + n / 128) << 8));
 
     // lane descriptors: which program input is op2's free operand
     // swaps the two descriptor halves.
-    let ac = (n * 2 & 0xff) + if n % 64 == 0 { 0x40 } else { 0 };
+    let ac = ((n * 2) & 0xff) + if n % 64 == 0 { 0x40 } else { 0 };
     let hi = v16 + n / 128;
     let b4 = if n >= 64 && n % 64 == 0 {
         0x20
@@ -540,7 +540,7 @@ fn rebuild_tail_g(
     let io_syms: &[(&str, u8, u64)] = &[
         ("x", 1, 0x3000_0000),
         ("y", 2, 0x3000_0000 | va_step as u64),
-        ("z", 3, 0x3000_0000 | 2 * va_step as u64),
+        ("z", 3, 0x3000_0000 | (2 * va_step as u64)),
     ];
     let layout_strs = if big {
         [
@@ -729,7 +729,7 @@ fn rebuild_tail_ulut(img: &mut Vec<u8>, op: LutOp, n: u32, mil_path: &str, out_p
     entries.push((strx("x"), 0x0f, 1, 0, 0x3000_0000));
     entries.push((strx("z"), 0x0f, 2, 0, 0x3000_4000));
     entries.push((strx(&kb_actlut), 0x0f, 5, 2, 0x3001_0000));
-    entries.push((strx(&kb), 0x0f, 5, 0, 0x3001_0080));
+    entries.push((strx(kb), 0x0f, 5, 0, 0x3001_0080));
     for ty in TYPE_SYMS {
         entries.push((strx(ty), 0x80, 0, 0, 0));
     }
@@ -755,7 +755,7 @@ fn rebuild_tail_ulut(img: &mut Vec<u8>, op: LutOp, n: u32, mil_path: &str, out_p
 
     // __text relocation: one entry at align8(strtab end), fixes the
     // instruction word at __text+0xf0 to reference __KERN_0 (sect 5).
-    let reloff = 0x2688 + (tail.len() + 7) / 8 * 8;
+    let reloff = 0x2688 + tail.len().div_ceil(8) * 8;
     while 0x2688 + tail.len() < reloff {
         tail.push(0);
     }
@@ -1077,7 +1077,7 @@ fn build_tail_at_reloc(
 
     let mut img = skel[..tail_off].to_vec();
     if !relocs.is_empty() {
-        let reloff = tail_off + (tail.len() + 7) / 8 * 8;
+        let reloff = tail_off + tail.len().div_ceil(8) * 8;
         while tail_off + tail.len() < reloff {
             tail.push(0);
         }
@@ -1395,7 +1395,7 @@ pub fn emit_conv1x1_w(
     put_u32(&mut pre, 0xb68, text_va as u32);
     put_u32(&mut pre, 0x378, const2_va as u32);
     put_u32(&mut pre, 0xb7c, if narrow { 0x73 } else { 0x74 });
-    put_u32(&mut pre, 0xbe8, f14 as u32);
+    put_u32(&mut pre, 0xbe8, f14);
     // cmd4 blobs 2 @0xbf8 / 3 @0x1940: input/output dims + section byte
     // sizes — the 0xc?? group is the x-side (stride64*cin + row stride),
     // 0x19?? the z-side
@@ -1482,7 +1482,7 @@ pub fn emit_conv1x1_w(
     } else {
         SKELETON_CONV32[0x4000..0x4000 + 0x1d0].to_vec()
     };
-    put_u32(&mut text, 0x14, f14 as u32);
+    put_u32(&mut text, 0x14, f14);
     for i in 0..15 {
         put_u32(&mut text, 0x84 + i * 4, lane_off[i + 1] as u32);
     }
@@ -1993,7 +1993,7 @@ pub fn emit_conv_chain(
                 slot_after_reuse[b] = reused;
                 slots.push((end - isz[b], reused, vec![b]));
             }
-            if !reused && slots.last().map_or(false, |s| s.2.len() > 1) {
+            if !reused && slots.last().is_some_and(|s| s.2.len() > 1) {
                 reused = true;
             }
         }
@@ -2030,7 +2030,7 @@ pub fn emit_conv_chain(
     };
     let mut text = SKELETON_CHAIN4[CHAIN4_TEXT..CHAIN4_TEXT + 0x30].to_vec();
     put_u32(&mut text, 0x10, hdr10 << 16);
-    put_u32(&mut text, 0x14, f14 as u32);
+    put_u32(&mut text, 0x14, f14);
     put_u32(&mut text, 0x2c, 1); // multi-task flag
     let head = &SKELETON_CHAIN4[CHAIN4_TEXT + 0x1c0..CHAIN4_TEXT + 0x1c0 + 0xf8];
     let mut relocs: Vec<[u8; 8]> = Vec::with_capacity(k);
@@ -2337,7 +2337,7 @@ pub fn emit_conv_chain(
     put_u32(&mut img, 0x3c8, out_va as u32); // cmd 0x4 #?: out VA
     put_u32(&mut img, 0x3d8, kern_va as u32); // cmd 0x4 #?: kern VA
     put_u32(&mut img, 0xb68, text_va as u32); // cmd 0x4 #1: text VA
-    put_u32(&mut img, 0xbe8, f14 as u32); // cmd 0x4 #1: io page count
+    put_u32(&mut img, 0xbe8, f14); // cmd 0x4 #1: io page count
     put_u32(&mut img, 0xb7c, (textlen / 4) as u32); // cmd 0x4 #1: text words
     put_u32(&mut img, 0xb88, k as u32); // cmd 0x4 #1: task count
     put_u32(&mut img, 0xbb8, (14 * k + 3) as u32); // cmd 0x4 #1: sched count
@@ -3059,7 +3059,7 @@ pub fn emit_conv_act_n_dw(
     img.extend_from_slice(&rec);
     // zero fill through the __const section, then pad __KERN_0 to the
     // next 0x4000 boundary and splice each stream's band group
-    let const_end = text_off + (stream_len + 0x3f) / 0x40 * 0x40 + 0x4000;
+    let const_end = text_off + stream_len.div_ceil(0x40) * 0x40 + 0x4000;
     img.resize(const_end, 0);
     let kern_off = (const_end + 0x3fff) & !0x3fff;
     img.resize(kern_off + stream_sz * streams.len(), 0);
@@ -3081,7 +3081,7 @@ pub fn emit_conv_act_n_dw(
             }
         }
     }
-    img.resize(kern_off + (stream_sz * streams.len() + 0x3fff) & !0x3fff, 0);
+    img.resize((kern_off + (stream_sz * streams.len() + 0x3fff)) & !0x3fff, 0);
 
     patch_chain_scalars(
         &mut img,
@@ -3108,7 +3108,7 @@ fn patch_chain_scalars(
     text_off: usize,
     kern_off: usize,
 ) {
-    let aligned = (stream_len + 0x3f) / 0x40 * 0x40;
+    let aligned = stream_len.div_ceil(0x40) * 0x40;
     let kern_payload = stream_sz * n_streams;
     let kern_vsz = (kern_payload + 0x3fff) & !0x3fff;
     put_u32(img, 0x1c0, text_off as u32); // __TEXT segment fileoff
@@ -3451,7 +3451,7 @@ pub fn emit_conv_sm_n_dw(
         .copy_from_slice(&SKELETON_CONV64_SM[0xe000..0xe100][..]);
 
     // layer-count scalars for the multi-task family
-    let aligned = (section_size + 0x3f) / 0x40 * 0x40;
+    let aligned = section_size.div_ceil(0x40) * 0x40;
     put_u32(&mut img, 0x1c0, text_off as u32);
     put_u32(&mut img, 0x208, section_size as u32);
     put_u32(&mut img, 0x210, text_off as u32);
@@ -3674,7 +3674,7 @@ pub fn emit_conv_ln_n_dw(
                 put_u16(&mut t, o, ca);
             }
             if last {
-                let cb = (4 + (i + 2) / 3) as u16;
+                let cb = (4 + i.div_ceil(3)) as u16;
                 for &o in &[0x191usize, 0x1fd, 0x209, 0x281, 0x311] {
                     put_u16(&mut t, o, cb);
                 }
@@ -3730,7 +3730,7 @@ pub fn emit_conv_ln_n_dw(
 
     // layer-count scalars — the record-end fields use the
     // 0x40-aligned text size like the other families
-    let aligned = (section_size + 0x3f) / 0x40 * 0x40;
+    let aligned = section_size.div_ceil(0x40) * 0x40;
     put_u32(&mut img, 0x1c0, text_off as u32);
     put_u32(&mut img, 0x208, section_size as u32);
     put_u32(&mut img, 0x210, text_off as u32);
@@ -5253,8 +5253,7 @@ pub(crate) fn mil_ops(text: &str) -> (Vec<MilOp>, Vec<(String, String)>) {
             continue;
         }
         let shape = lhs
-            .find('[')
-            .and_then(|l| lhs.find(']').map(|r| (l, r)))
+            .find('[').zip(lhs.find(']'))
             .map(|(l, r)| {
                 lhs[l + 1..r]
                     .split(',')
@@ -5278,7 +5277,7 @@ pub(crate) fn mil_ops(text: &str) -> (Vec<MilOp>, Vec<(String, String)>) {
             })
             .collect();
         let result = lhs
-            .rsplit(|c: char| c == ' ' || c == '>')
+            .rsplit([' ', '>'])
             .next()
             .unwrap_or("")
             .trim()
@@ -5326,8 +5325,8 @@ pub(crate) fn func_input_shapes(text: &str) -> Vec<(String, Vec<i64>)> {
                 .filter_map(|s| s.trim().parse().ok())
                 .collect();
             let name = after[l + r + 1..]
-                .trim_start_matches(|c: char| c == '>' || c == ' ' || c == ',')
-                .split(|c: char| c == ' ' || c == ',' || c == ')')
+                .trim_start_matches(['>', ' ', ','])
+                .split([' ', ',', ')'])
                 .next()
                 .unwrap_or("")
                 .to_string();
@@ -5467,7 +5466,7 @@ pub(crate) fn load_mil_weight_u16(
         let (lhs, rhs) = line.split_at(eq);
         let rhs = &rhs[3..];
         let name = lhs
-            .rsplit(|c: char| c == ' ' || c == '>')
+            .rsplit([' ', '>'])
             .next()
             .unwrap_or("")
             .trim()
@@ -5477,13 +5476,12 @@ pub(crate) fn load_mil_weight_u16(
             .and_then(|t| {
                 let after = &lhs[t + 7..];
                 after
-                    .find(|c: char| c == ',' || c == '>')
+                    .find([',', '>'])
                     .map(|e| after[..e].trim().to_string())
             })
             .unwrap_or_else(|| "fp16".to_string());
         let shape: Vec<usize> = lhs
-            .find('[')
-            .and_then(|l| lhs.find(']').map(|r| (l, r)))
+            .find('[').zip(lhs.find(']'))
             .map(|(l, r)| {
                 lhs[l + 1..r]
                     .split(',')
@@ -5652,7 +5650,7 @@ pub(crate) fn mil_scalar_f16(text: &str, name: &str) -> Option<u16> {
     for raw in text.lines() {
         let line = raw.trim();
         let Some(eq) = line.find(" = ") else { continue };
-        if line[..eq].rsplit(|c: char| c == ' ' || c == '>').next() != Some(name) {
+        if line[..eq].rsplit([' ', '>']).next() != Some(name) {
             continue;
         }
         let rhs = &line[eq + 3..];
@@ -5670,7 +5668,7 @@ pub(crate) fn mil_scalar_bool(text: &str, name: &str) -> Option<bool> {
     for raw in text.lines() {
         let line = raw.trim();
         let Some(eq) = line.find(" = ") else { continue };
-        if line[..eq].rsplit(|c: char| c == ' ' || c == '>').next() != Some(name) {
+        if line[..eq].rsplit([' ', '>']).next() != Some(name) {
             continue;
         }
         let rhs = &line[eq + 3..];
@@ -5857,7 +5855,7 @@ fn emit_from_mil_inner(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String
             ))
         }
         ["softmax"] => {
-            let n = elems(&ops[0]) as u32;
+            let n = elems(&ops[0]);
             return emit_softmax(n, mil_path, out_path);
         }
         ["relu"] => return Ok(emit_relu(mil_path, out_path)),
@@ -6088,7 +6086,7 @@ fn emit_from_mil_inner(mil_path: &str, out_path: &str) -> Result<Vec<u8>, String
         .collect::<Result<_, _>>()?;
     let wrefs: Vec<&[u16]> = ws.iter().map(|w| w.as_slice()).collect();
     let aux: &[&str] = &layers[0].1;
-    let uniform = layers.iter().all(|(_, a)| a == &aux);
+    let uniform = layers.iter().all(|(_, a)| a == aux);
     if !uniform {
         return Err("chain layers have non-uniform aux-op patterns".into());
     }
@@ -6191,7 +6189,7 @@ fn mil_io_sig(text: &str) -> Option<IoSig> {
                         .collect()
                 })
                 .unwrap_or_default();
-            p.rsplit(|c: char| c == ' ' || c == '>')
+            p.rsplit([' ', '>'])
                 .next()
                 .map(|n| (n.to_string(), dims))
         })
@@ -6902,7 +6900,7 @@ fn get_u32(buf: &[u8], off: usize) -> u32 {
 /// [`DecompiledHwx`] (IO descriptors, task sequence, de-interleaved
 /// `__KERN_0` fp16 weights, and reconstructed MIL program).
 pub fn decompile_hwx(img: &[u8], weight_dir: &str) -> Result<DecompiledHwx, String> {
-    if img.len() < 0x200 || &img[0..4] != &0xbeef_face_u32.to_le_bytes() {
+    if img.len() < 0x200 || img[0..4] != 0xbeef_face_u32.to_le_bytes() {
         return Err("not an ANE HWX Mach-O (missing 0xbeefface magic)".into());
     }
     let ncmds = get_u32(img, 0x10) as usize;

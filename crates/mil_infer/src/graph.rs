@@ -280,7 +280,7 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
         let l = line.trim();
         if let Some(p) = l.find("-> (") {
             for nm in l[p + 4..]
-                .trim_end_matches(|c| c == ')' || c == ';')
+                .trim_end_matches([')', ';'])
                 .split(',')
             {
                 func_outs.push(nm.trim().to_string());
@@ -871,13 +871,13 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
         ext_map.entry(name).or_default().push((nidx, port));
     }
     let externals: Vec<(String, Vec<(usize, usize)>)> =
-        ext_map.into_iter().map(|(k, v)| (k, v)).collect();
+        ext_map.into_iter().collect();
     let mut outputs = Vec::new();
     for line in text.lines() {
         let l = line.trim();
         if let Some(p) = l.find("-> (") {
             for nm in l[p + 4..]
-                .trim_end_matches(|c| c == ')' || c == ';')
+                .trim_end_matches([')', ';'])
                 .split(',')
             {
                 let nm = nm.trim();

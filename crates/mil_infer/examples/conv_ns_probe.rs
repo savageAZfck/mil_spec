@@ -44,7 +44,7 @@ fn main() {
         // its source element exactly. WROWS writes w[oc][ic]=oc instead.
         let mut d = Vec::with_capacity(cin as usize * cout as usize * 2);
         let by_ic = std::env::var_os("CONV_PROBE_WIC").is_some();
-        for i in 0..(cin * cout) as u32 {
+        for i in 0..(cin * cout) {
             let v = if by_row {
                 i / cin
             } else if by_ic {
