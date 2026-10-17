@@ -7207,6 +7207,7 @@ mod tests {
 
     #[test]
     fn emits_image_with_magic() {
+        let _g = SIG_LOCK.lock().unwrap();
         let img = emit_elementwise2(EwOp::Add, 64, "/tmp/x/net.mil", "/tmp/x/net.macho");
         assert_eq!(&img[0..4], &0xbeef_face_u32.to_le_bytes());
         assert_eq!(img.len(), 0x10000);
@@ -7215,6 +7216,7 @@ mod tests {
 
     #[test]
     fn emits_unary_lut_image() {
+        let _g = SIG_LOCK.lock().unwrap();
         let img = emit_unary_lut(LutOp::Sigmoid, 64, "/tmp/x/net.mil", "/tmp/x/net.macho");
         assert_eq!(&img[0..4], &0xbeef_face_u32.to_le_bytes());
         assert_eq!(img.len(), 0x10000);

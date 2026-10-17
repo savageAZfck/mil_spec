@@ -133,7 +133,7 @@ fn main() {
     ov.adopt_input(1, rv.output_surf(0)).expect("v row");
 
     // --- run a few decode steps ---
-    let (dq, de, dr, dkc, dvc, dz) = (
+    let (dq, de, dr, dkc, _dvc, dz) = (
         pq.input_descs[0].clone(),
         ok.input_descs[0].clone(),
         ok.input_descs[1].clone(),

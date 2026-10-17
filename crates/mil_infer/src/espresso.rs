@@ -175,43 +175,6 @@ impl Objc {
         }
     }
 
-    /// `NSDictionary dictionaryWithObjects:forKeys:count:` for one pair.
-    fn one_dict(&self, key: &str, val: Id) -> Id {
-        unsafe {
-            let k = self.ns_string(key);
-            msg!((*const Id, *const Id, usize) -> Id)(
-                self.ns_dict,
-                selp("dictionaryWithObjects:forKeys:count:"),
-                &val as *const Id,
-                &k as *const Id,
-                1,
-            )
-        }
-    }
-
-    /// `dictionaryWithObjects:forKeys:count:` over (key, u64) pairs.
-    fn num_dict(&self, pairs: &[(&str, u64)]) -> Id {
-        unsafe {
-            let keys: Vec<Id> = pairs.iter().map(|(k, _)| self.ns_string(k)).collect();
-            let vals: Vec<Id> = pairs.iter().map(|(_, v)| self.ns_int(*v)).collect();
-            msg!((*const Id, *const Id, usize) -> Id)(
-                self.ns_dict,
-                selp("dictionaryWithObjects:forKeys:count:"),
-                vals.as_ptr(),
-                keys.as_ptr(),
-                pairs.len(),
-            )
-        }
-    }
-
-    /// `NSMutableDictionary setObject:forKey:`.
-    fn dict_set(&self, dict: Id, key: &str, val: Id) {
-        unsafe {
-            let k = self.ns_string(key);
-            msg!((Id, Id) -> ())(dict, selp("setObject:forKey:"), val, k);
-        }
-    }
-
     /// `objectForKey:` on an NSDictionary (returns null for missing keys).
     fn dict_get(&self, dict: Id, key: &str) -> Id {
         if dict.is_null() {

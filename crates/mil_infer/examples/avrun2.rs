@@ -16,7 +16,7 @@ fn main() {
             d.name, d.n, d.k, d.h, d.w, d.batch_stride, d.plane_stride, d.row_stride, d.elem
         );
     }
-    let (da, dv, dz) = (
+    let (_da, dv, dz) = (
         m.input_descs[0].clone(),
         m.input_descs[1].clone(),
         m.output_descs[0].clone(),
@@ -52,7 +52,7 @@ fn main() {
             row,
             row.iter()
                 .enumerate()
-                .map(|(w, v)| (v / ((c * 64 + w as u64) as f32 / 64.0)))
+                .map(|(w, v)| v / ((c * 64 + w as u64) as f32 / 64.0))
                 .collect::<Vec<_>>()
         );
     }

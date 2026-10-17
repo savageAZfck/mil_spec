@@ -36,9 +36,9 @@ fn main() {
     let mil = std::path::PathBuf::from(&a[1]);
     let (inp, outp) = (a[2].clone(), a[3].clone());
     let cin: usize = a[4].parse().unwrap();
-    let cout: usize = a[5].parse().unwrap();
+    let _cout: usize = a[5].parse().unwrap();
 
-    let before = newest_bundle();
+    let _before = newest_bundle();
     let (prog, map) = Program::compile_auto(&mil, DeviceMask::Ane).unwrap();
     println!("ports: in={:?} out={:?}", map.inputs, map.outputs);
     let x: Vec<u16> = (0..cin)

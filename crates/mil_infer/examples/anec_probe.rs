@@ -23,14 +23,9 @@
 
 use std::ffi::{c_char, c_void, CString};
 
-type Id = *mut c_void;
-type Sel = *mut c_void;
-
 #[link(name = "objc")]
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
-    fn sel_registerName(name: *const c_char) -> Sel;
-    fn objc_msgSend();
     fn dlopen(path: *const c_char, mode: i32) -> *mut c_void;
     fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
     fn CFStringCreateWithCString(
@@ -52,7 +47,7 @@ extern "C" {
         n: i64,
         cbs: *const c_void,
     ) -> *mut c_void;
-    fn CFNumberCreate(alloc: *const c_void, ty: i32, val: *const c_void) -> *mut c_void;
+
     static _NSConcreteGlobalBlock: c_void;
     static kCFTypeDictionaryKeyCallBacks: c_void;
     static kCFTypeDictionaryValueCallBacks: c_void;
@@ -226,7 +221,7 @@ fn main() {
         unsafe { CFDictionarySetValue(d, cfstr(k) as *const c_void, v as *const c_void) }
     }
     let mil = std::env::args().nth(1).unwrap_or_else(|| {
-        "/Users/savag3/bw3/s_All/layer_00-08/layer_00-08.mlmodelc/model.mil".into()
+        concat!(env!("CARGO_MANIFEST_DIR"), "/assets/chain/c64k1.mil").into()
     });
     let (dir0, base) = mil.rsplit_once('/').unwrap();
     let dir = format!("{dir0}/");
@@ -400,11 +395,11 @@ fn main() {
     static DESC: BlockDesc = BlockDesc { rsvd: 0, size: 32 };
     unsafe impl Sync for Block {}
     static BLK: Block = Block {
-        isa: unsafe { &raw const _NSConcreteGlobalBlock },
+        isa: &raw const _NSConcreteGlobalBlock,
         flags: 1 << 30,
         rsvd: 0,
         invoke: on_complete as *const c_void,
-        desc: unsafe { &raw const DESC as *const c_void },
+        desc: &raw const DESC as *const c_void,
     };
     for (tag, i, p) in cases {
         for (fname, fp) in [

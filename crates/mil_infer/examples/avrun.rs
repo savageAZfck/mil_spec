@@ -12,10 +12,7 @@ fn put(b: &mut [u8], d: &mil_infer::espresso::TensorDesc, c: u64, w: u64, v: f32
     let o = d.offset(0, 0, c, 0, w);
     b[o..o + 2].copy_from_slice(&f16(v).to_le_bytes());
 }
-fn get(b: &[u8], d: &mil_infer::espresso::TensorDesc, c: u64, w: u64) -> f32 {
-    let o = d.offset(0, 0, c, 0, w);
-    f32_of(u16::from_le_bytes([b[o], b[o + 1]]))
-}
+
 fn main() {
     let p = std::env::args().nth(1).unwrap();
     let mut m = EspressoProgram::load_precompiled(Path::new(&p), &[]).unwrap();

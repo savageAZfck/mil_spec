@@ -2,8 +2,8 @@ use std::fs;
 fn main() {
     let mut files = Vec::new();
     for dir in [
-        "/Users/savag3/mil_spec/crates/mil_infer/assets/chain",
-        "/Users/savag3/mil_spec/crates/mil_infer/assets/ioperm",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/assets/chain"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ioperm"),
     ] {
         for e in fs::read_dir(dir).unwrap() {
             let p = e.unwrap().path();

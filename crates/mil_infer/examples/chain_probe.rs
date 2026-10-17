@@ -7,16 +7,7 @@ use mil_infer::Anec;
 use std::fs;
 use std::path::Path;
 
-fn weight_blob(data: &[u8]) -> Vec<u8> {
-    let mut b = vec![0x0c, 0, 0, 0, 0x02, 0, 0, 0];
-    b.resize(64, 0);
-    b.extend_from_slice(&[0xef, 0xbe, 0xad, 0xde, 0x01, 0, 0, 0]);
-    b.extend_from_slice(&(data.len() as u64).to_le_bytes());
-    b.extend_from_slice(&128u64.to_le_bytes());
-    b.resize(128, 0);
-    b.extend_from_slice(data);
-    b
-}
+
 
 fn chain_mil(c: u32, k: usize) -> String {
     let mut s =

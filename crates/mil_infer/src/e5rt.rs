@@ -84,7 +84,7 @@ pub struct CompileCfg {
 impl Default for CompileCfg {
     fn default() -> Self {
         Self {
-            cache_dir: std::path::PathBuf::from("/tmp/e5_cache"),
+            cache_dir: std::env::temp_dir().join("e5_cache"),
             force_recompile: true,
         }
     }
