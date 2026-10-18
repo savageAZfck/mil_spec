@@ -1,6 +1,6 @@
 [package]
 name = "mil_infer"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Sovereign Apple Neural Engine compiler, decompiler, and runtime: native HWX Mach-O emitter + decompiler, MIL DAG graph scheduler, on-chip ANE backprop/SGD training, zero-copy IOSurface/Espresso execution."
