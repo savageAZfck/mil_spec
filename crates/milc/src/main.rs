@@ -104,13 +104,17 @@ fn cmd_ane(args: &[String]) -> ExitCode {
     let mut out: Option<PathBuf> = None;
     let mut arch = "h16g".to_string();
     let mut pos = 0i64;
+    let mut iters = 0i64;
+    let mut seed = 0u64;
+    let mut compile_too = false;
     let mut detail = false;
     let mut emit_hwx = false;
     let mut tokens: Vec<u32> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "lower" | "validate" | "compile" | "run" | "decode" | "decompile" => {
+            "lower" | "validate" | "compile" | "run" | "decode" | "decompile" | "fuzz"
+            | "fuzz-worker" => {
                 if mode.is_empty() {
                     mode = args[i].as_str();
                 }
@@ -129,6 +133,15 @@ fn cmd_ane(args: &[String]) -> ExitCode {
                 i += 1;
                 pos = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
             }
+            "--iters" => {
+                i += 1;
+                iters = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+            }
+            "--seed" => {
+                i += 1;
+                seed = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+            }
+            "--compile" => compile_too = true,
             "--tokens" => {
                 i += 1;
                 if let Some(t) = args.get(i) {
@@ -152,10 +165,250 @@ fn cmd_ane(args: &[String]) -> ExitCode {
         }
         i += 1;
     }
+    if mode == "fuzz" {
+        let iters = if iters > 0 { iters as usize } else { 64 };
+        let dir = out.unwrap_or_else(|| std::env::temp_dir().join("milc_fuzz_corpus"));
+        let cases_dir = dir.join("cases");
+        let findings_dir = dir.join("findings");
+        for d in [&cases_dir, &findings_dir] {
+            if let Err(e) = std::fs::create_dir_all(d) {
+                eprintln!("milc ane fuzz: {}: {e}", d.display());
+                return ExitCode::FAILURE;
+            }
+        }
+        let exe = match std::env::current_exe() {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("milc ane fuzz: current_exe: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let report_path = dir.join("fuzz_report.jsonl");
+        let mut report = match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&report_path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("milc ane fuzz: {}: {e}", report_path.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut rng = mil_infer::fuzz::Rng::new(seed);
+        let mut counts = [0usize; 6];
+        let t_start = std::time::Instant::now();
+        use std::io::Write as _;
+        eprintln!(
+            "fuzzing ANECompiler arch={arch} iters={iters} seed={seed} corpus={}",
+            dir.display()
+        );
+        for i in 0..iters {
+            let case = mil_infer::fuzz::gen_program(&mut rng, i);
+            let case_dir = cases_dir.join(format!("{:05}_{}", i, case.family));
+            if std::fs::create_dir_all(&case_dir).is_err() {
+                continue;
+            }
+            let mil_path = case_dir.join("model.mil");
+            if std::fs::write(&mil_path, &case.mil).is_err() {
+                continue;
+            }
+            if let Some(w) = &case.weights {
+                let wdir = case_dir.join("weights");
+                let _ = std::fs::create_dir_all(&wdir);
+                let _ = std::fs::write(wdir.join("weight.bin"), w);
+            }
+            // fork-isolated worker — an ANECompiler crash kills the
+            // child, not the driver, and lands as a corpus finding.
+            let mut child = match std::process::Command::new(&exe)
+                .args(["ane", "fuzz-worker"])
+                .arg(&mil_path)
+                .args(["--arch", &arch])
+                .args(if compile_too {
+                    vec!["--compile".to_string()]
+                } else {
+                    vec![]
+                })
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("  spawn: {e}");
+                    continue;
+                }
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut timed_out = false;
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(s)) => break Some(s),
+                    Ok(None) => {
+                        if std::time::Instant::now() > deadline {
+                            timed_out = true;
+                            let _ = child.kill();
+                            break None;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    Err(_) => break None,
+                }
+            };
+            let mut out_buf = Vec::new();
+            let mut err_buf = Vec::new();
+            use std::io::Read as _;
+            if let Some(mut so) = child.stdout.take() {
+                let _ = so.read_to_end(&mut out_buf);
+            }
+            if let Some(mut se) = child.stderr.take() {
+                let _ = se.read_to_end(&mut err_buf);
+            }
+            let stdout = String::from_utf8_lossy(&out_buf);
+            let _ = std::fs::write(case_dir.join("stdout.txt"), &out_buf);
+            let _ = std::fs::write(case_dir.join("stderr.txt"), &err_buf);
+
+            let mut crashed = false;
+            let mut accepted = false;
+            match status {
+                None => {
+                    if !timed_out {
+                        crashed = true;
+                    }
+                }
+                Some(s) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::process::ExitStatusExt as _;
+                        crashed = s.signal().is_some() || (!s.success() && s.code().is_none());
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        crashed = !s.success();
+                    }
+                    // worker prints VERDICT ... accepted=<0|1>
+                    for line in stdout.lines() {
+                        if let Some(rest) = line.strip_prefix("VERDICT ") {
+                            for tok in rest.split_whitespace() {
+                                if let Some(a) = tok.strip_prefix("accepted=") {
+                                    accepted = a == "1";
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let class = mil_infer::fuzz::classify(
+                case.expected,
+                accepted,
+                crashed && !timed_out,
+                timed_out,
+            );
+            let class_idx = match class {
+                mil_infer::fuzz::Class::AcceptOk => 0,
+                mil_infer::fuzz::Class::RejectOk => 1,
+                mil_infer::fuzz::Class::UnexpectedReject => 2,
+                mil_infer::fuzz::Class::UnexpectedAccept => 3,
+                mil_infer::fuzz::Class::Crash => 4,
+                mil_infer::fuzz::Class::Timeout => 5,
+            };
+            counts[class_idx] += 1;
+            let finding = class.is_finding();
+            if finding {
+                let dst = findings_dir.join(format!("{:05}_{}_{:?}", i, case.family, class));
+                let _ = std::fs::create_dir_all(&dst);
+                let _ = std::fs::copy(&mil_path, dst.join("model.mil"));
+                if let Some(w) = &case.weights {
+                    let wdir = dst.join("weights");
+                    let _ = std::fs::create_dir_all(&wdir);
+                    let _ = std::fs::write(wdir.join("weight.bin"), w);
+                }
+                let _ = std::fs::write(dst.join("stderr.txt"), &err_buf);
+            }
+            let esc_note = case.note.replace('\\', "\\\\").replace('"', "\\\"");
+            let line = format!(
+                "{{\"id\":{i},\"family\":\"{}\",\"expected\":\"{:?}\",\"class\":\"{:?}\",\"note\":\"{esc_note}\"}}",
+                case.family, case.expected, class
+            );
+            let _ = writeln!(report, "{line}");
+            let tag = if finding { " ***" } else { "" };
+            eprintln!("  [{i:5}] {:<18} {:?}{tag}", case.family, class);
+        }
+        let _ = report.flush();
+        eprintln!(
+            "\ndone in {:?}: accept_ok={} reject_ok={} unexp_reject={} unexp_accept={} crash={} timeout={}",
+            t_start.elapsed(),
+            counts[0], counts[1], counts[2], counts[3], counts[4], counts[5]
+        );
+        eprintln!(
+            "findings → {}  report → {}",
+            findings_dir.display(),
+            report_path.display()
+        );
+        return if counts[4] + counts[3] + counts[2] > 0 {
+            ExitCode::from(3)
+        } else {
+            ExitCode::SUCCESS
+        };
+    }
     let Some(mil) = mil else {
-        eprintln!("milc ane <lower|validate|compile|run> <model.mil> [-o <out>] [--arch h16g] [--pos N]\n       milc ane decompile <file.hwx> [-o <out_dir>] [--detail]\n       milc ane decode <shard_dir> --tokens <a,b,c> [--max-new N]");
+        eprintln!("milc ane <lower|validate|compile|run> <model.mil> [-o <out>] [--arch h16g] [--pos N]\n       milc ane decompile <file.hwx> [-o <out_dir>] [--detail]\n       milc ane decode <shard_dir> --tokens <a,b,c> [--max-new N]\n       milc ane fuzz [--iters N] [--seed S] [-o <corpus_dir>] [--arch h16g] [--compile]");
         return ExitCode::from(2);
     };
+    if mode == "fuzz-worker" {
+        // Isolated single-case probe: validate (and optionally compile)
+        // one MIL file, print a machine-readable VERDICT line, exit 0.
+        // If ANECompiler crashes, the parent driver sees the signal.
+        let ane = match mil_infer::Anec::open() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("fuzz-worker: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        let v = match ane.validate(&mil, &arch) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("fuzz-worker: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        let mut accepted = v.rc == 0 && v.status == 0;
+        let mut det = String::new();
+        for e in &v.errors {
+            let _ = std::fmt::Write::write_fmt(
+                &mut det,
+                format_args!(" ERROR {}", e.replace('\n', " ")),
+            );
+        }
+        if accepted && compile_too {
+            let dir = std::env::temp_dir().join(format!("fw_{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            match ane.compile(&mil, &dir, &arch) {
+                Ok(cv) => {
+                    accepted = accepted && cv.rc == 0 && cv.status == 0;
+                    for e in &cv.errors {
+                        let _ = std::fmt::Write::write_fmt(
+                            &mut det,
+                            format_args!(" COMPILE_ERROR {}", e.replace('\n', " ")),
+                        );
+                    }
+                }
+                Err(e) => {
+                    accepted = false;
+                    let _ = std::fmt::Write::write_fmt(&mut det, format_args!(" COMPILE_OPEN {e}"));
+                }
+            }
+        }
+        println!(
+            "VERDICT status={:#x} rc={} accepted={}{}",
+            v.status,
+            v.rc,
+            if accepted { 1 } else { 0 },
+            det
+        );
+        return ExitCode::SUCCESS;
+    }
     if mode == "decompile" {
         let bytes = match std::fs::read(&mil) {
             Ok(b) => b,

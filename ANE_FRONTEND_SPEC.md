@@ -108,6 +108,31 @@ PARSE/OK/SEMAN as returned by `ANECValidate` (OK = status 0 + plan).
 | chained slice_update / missing write_state | PARSE | |
 | dynamic begin/end | PARSE | const indices only |
 
+## Fuzzer findings (M4 / this build, `milc ane fuzz`)
+
+Differential probing with the fuzzer's generator refined the matrix on
+this machine's ANECompiler build:
+
+- **`const` + `BLOBFILE` → `InvalidMILProgram` in every spelling**
+  (`@model_path/...`, absolute path, relative `weights/weight.bin`,
+  `tensor<string, []>`-wrapped path) — including `assets/chain/c64k1.mil`,
+  a corpus file that produced byte-identical HWX. Embedded weight blobs
+  do not survive this frontend build; weights need the
+  `FileConstants`/`ExternConstants` dict lane (schema unprobed). Inline
+  fp16 list consts are accepted fine.
+- **`gelu` rejected in all spellings** (`mode` first/last, bare `string`
+  or `tensor<string, []>` const) despite the matrix listing it OK.
+- **`matmul` requires exactly one transpose flag** — `tx == ty` (both
+  set or both clear) → `InvalidMILProgram`.
+- **`clip` bounds must be fp16 consts** — int32 alpha/beta → reject.
+- Function name is unchecked: `func frob<ios18>` validates.
+- `const(` missing its closing paren is tolerated.
+- Op arg order is free; dead consts are tolerated; `[1,4,1,1]`-scale
+  shapes pass; bare `int32`/`bool`/`string`/`fp16` and `tensor<T, []>`
+  scalar const spellings are interchangeable.
+- 500-case run (`--compile`, seed 31337): 336 accepts, 160 correct
+  rejects, 4 parser-laxity accepts, **0 crashes, 0 unexpected rejects**.
+
 ## Milestone
 
 An 8-layer transformer shard (attention + MLP + per-layer kv-cache states,
@@ -174,6 +199,79 @@ all 8 `kv_*` states write back exactly their [2,3,5,64] update regions,
 output fully populated. `milc ane run <model.mil> [--steps N]` drives it.
 
       milc ane run model.ane.mil --steps 3   # compile → bind → execute
+
+## Perf-stats ABI (runtime contract — reverse engineered)
+
+The daemon-side counter lane, mapped via `dyld_info -exports`, runtime
+method introspection (`class_copyMethodList` + `method_getTypeEncoding`),
+and staged call probes on the h16g M4:
+
+- **Load side**: `kANEFPerformanceStatsMask` (no `Key` suffix on the
+  option string) already rides `loadModel:options:` at `0x7f` — that
+  mask is what makes `aned`'s `_ANEMachoPatcher` deploy the program at
+  all. `kANEFModelLoadPerformanceStats` (also no suffix) asks the model
+  to publish the procedure→stats-size map.
+- **The map**: `kANEFModelProcedureNameToStatsSizeMapKey` lives inside
+  `modelAttributes → ANEFModelDescription` — procedure name → required
+  stats buffer bytes. **Absent on both our emitted binaries and
+  ANEC-compiled ones** — the map is produced only for programs built
+  with stats instrumentation, and `ProgramCreate stats buffer size:0`
+  (ANEServices log) confirms none of our binaries carry it.
+- **`_ANEPerformanceStats`** (framework export): the decoded-stats
+  object. `statsWithRequestPerformanceBuffer:statsBufferSize:` has
+  encoding `@32@0:8^^v16^I24` — `*buf` must point at a **valid
+  IOSurfaceRef** (not malloc, not nil — both fault), `*size` at its
+  byte extent. Factory wraps it and returns the stats object.
+- **`_ANEPerformanceStatsIOSurface`**: sibling variant with
+  `initWithIOSurface:statType:` (`@32@0:8@16q24`) — `statType=0x7f`
+  instantiates cleanly; `stats` property unwraps to the decode object.
+- **Request side**: `initWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:sharedEvents:transactionHandle:`
+  accepts the stats object in the `perfStats:` slot; request builds,
+  `perfStats`/`perfStatsArray` queryable.
+- **Counter vocabulary** (exports): `hwExecutionTime`,
+  `performanceCounters`, `perfCounterData`, `pStatsRawData`, plus
+  per-counter keys `kANEPerfStatsCounter*` — `NEComputeCycles`,
+  `Fp16Cycles`/`Int8Cycles`, `L2*StallCycles`, `DMARead*Bytes`,
+  `DPEEnergy`, event types (`StartExecution`, `TaskSwitch`,
+  `ContextSwitchOut`, `FetchDone`…) — a full per-task trace format.
+- **The wall**: `-[request validate]` and
+  `evaluateWithModel:options:request:qos:error:` both raise ObjC
+  exceptions when a stats buffer is attached to a program whose
+  `stats buffer size` is 0 — i.e. instrumentation is a **compile-time
+  artifact**, not a runtime flag.
+- **Dead ends verified**: `ANEC_DEBUG_MASK` alters output bytes but not
+  stats descriptors; `EnableProfiling`/`EnableSummaryPerformanceStats`/
+  `ForcePerfTracerRegisters`/`perfStatsMask` in params or input dict →
+  byte-identical binaries (unknown keys ignored silently); e5rt
+  `set_enable_profiling` plumbed (`E5_PROFILE=1`) but our test MIL
+  segments to BNNS; `initWithRestrictedAccessAllowed:` client is
+  refused by aned (`loadModel failed: unknown`) — entitlement-gated.
+- **Open**: the compile-time switch that bakes `PerfTracer1Config`/
+  `PerfTracer2Config` register programs + `perf_param` runtime params
+  into `__kern_0` descriptors (ANECompiler strings show the machinery:
+  `RunPerfTracerInitialization()`, "Insert instrumentation to enable
+  performance recording"). Once identified, our emitter can produce
+  stats-capable HWX and the whole lane lights up.
+
+Working today:
+
+- `EspressoProgram::bench(proc, steps)` — submit→complete latency over
+  the XPC round trip. On self-emitted HWX (c64k1, 1 op): **min 44.8µs /
+  mean 71.5µs / p99 140µs**, ~0.46 GB/s effective I/O.
+  `ane_perf_probe --bench N <hwx>`.
+- **Session telemetry** (`sessionHintWithModel:hint:options:report:error:`
+  — enc `B56@0:8@16@24@32@40^@48`, report is a plain object arg the
+  daemon *mutates*, must be NSMutableDictionary): wrap evals in
+  `ANEHintClientSessionStart`/`Stop`/`Info` hints; options select
+  report keys — `ANEClientSessionStatus`, `ANEClientTotalPages`,
+  `ANEClientResidentPages` — and the daemon fills real numbers
+  (verified: status 2, 1 total page, 4 resident pages around a live
+  eval). Entitlement-free memory-residency telemetry.
+- Export-name → string-value gotcha: `kANEFHint*` globals resolve via
+  `dlsym`+deref — e.g. `kANEFHintSessionStart` →
+  `"ANEHintClientSessionStart"`. Passing symbol names as strings fails
+  silently (`ok=false`, nil error). `kANEFModelLoadPerformanceStats`
+  has *no* export — it's an option-string constant only.
 
 ## Stateful emission decode (hwx backend)
 

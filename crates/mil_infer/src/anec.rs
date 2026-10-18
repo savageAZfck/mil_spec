@@ -343,9 +343,12 @@ impl Anec {
     /// on compile; the dict joins path+name by literal concat, so the
     /// dir string must end in `/`.
     fn input_dict(mil: &Path, out_dir: &Path, arch: &str) -> Result<*mut c_void, AnecError> {
-        let dir = mil
-            .parent()
-            .ok_or_else(|| AnecError::BadPath(mil.to_path_buf()))?;
+        // `parent()` of a bare filename is "" — resolve to "." so
+        // NetworkMILPath points at cwd, not "/".
+        let dir = match mil.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => Path::new("."),
+        };
         let base = mil
             .file_name()
             .and_then(|s| s.to_str())
@@ -376,6 +379,19 @@ impl Anec {
         dset_str(input, "OutputFilePath", &out_s);
         dset_str(input, "OutputFileName", &out_name);
         dset_str(input, "TargetArchitecture", arch);
+        // ANEC_OPT_INPUT: k=v,k2=v2 injected into the input dict — some
+        // options (e.g. perf-stats enablement) live here, not params.
+        if let Ok(v) = std::env::var("ANEC_OPT_INPUT") {
+            for kv in v.split(',') {
+                if let Some((k, n)) = kv.split_once('=') {
+                    if let Ok(iv) = n.parse::<i64>() {
+                        dset_num(input, k, iv);
+                    } else {
+                        dset_str(input, k, n);
+                    }
+                }
+            }
+        }
         Ok(input)
     }
 

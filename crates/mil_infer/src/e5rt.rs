@@ -79,6 +79,9 @@ pub struct CompileCfg {
     pub cache_dir: std::path::PathBuf,
     /// `e5rt_e5_compiler_options_set_force_recompilation`.
     pub force_recompile: bool,
+    /// `e5rt_e5_compiler_options_set_enable_profiling` — bakes
+    /// perf-stats descriptors into the compiled program.
+    pub profiling: bool,
 }
 
 impl Default for CompileCfg {
@@ -86,6 +89,7 @@ impl Default for CompileCfg {
         Self {
             cache_dir: std::env::temp_dir().join("e5_cache"),
             force_recompile: true,
+            profiling: std::env::var_os("E5_PROFILE").is_some(),
         }
     }
 }
@@ -109,6 +113,7 @@ pub(crate) struct Api {
     opts_set_mask: unsafe extern "C" fn(*mut c_void, u64) -> Rc,
     opts_set_recomp: unsafe extern "C" fn(*mut c_void, i32) -> Rc,
     opts_set_segmenter: unsafe extern "C" fn(*mut c_void, *const c_char) -> Rc,
+    opts_set_profiling: unsafe extern "C" fn(*mut c_void, i32) -> Rc,
     compile: unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_void, *mut *mut c_void) -> Rc,
     lib_num_fns: unsafe extern "C" fn(*mut c_void, *mut u64) -> Rc,
     lib_fn_names: unsafe extern "C" fn(*mut c_void, u64, *mut *const c_char) -> Rc,
@@ -158,6 +163,7 @@ impl Api {
             opts_set_mask: e5sym!(h, "e5rt_e5_compiler_options_set_compute_device_types_mask", (*mut c_void, u64) -> Rc),
             opts_set_recomp: e5sym!(h, "e5rt_e5_compiler_options_set_force_recompilation", (*mut c_void, i32) -> Rc),
             opts_set_segmenter: e5sym!(h, "e5rt_e5_compiler_options_set_segmenter", (*mut c_void, *const c_char) -> Rc),
+            opts_set_profiling: e5sym!(h, "e5rt_e5_compiler_options_set_enable_profiling", (*mut c_void, i32) -> Rc),
             compile: e5sym!(h, "e5rt_e5_compiler_compile", (*mut c_void, *const c_char, *mut c_void, *mut *mut c_void) -> Rc),
             lib_num_fns: e5sym!(h, "e5rt_program_library_get_num_functions", (*mut c_void, *mut u64) -> Rc),
             lib_fn_names: e5sym!(h, "e5rt_program_library_get_function_names", (*mut c_void, u64, *mut *const c_char) -> Rc),
@@ -390,6 +396,9 @@ impl Program {
                 (api.opts_set_segmenter)(opts, cstr("graph").as_ptr()),
                 "set_segmenter",
             )?;
+            if cc.profiling {
+                check((api.opts_set_profiling)(opts, 1), "set_enable_profiling")?;
+            }
 
             let mil_c = cstr(&mil.to_string_lossy());
             let mut lib = std::ptr::null_mut();

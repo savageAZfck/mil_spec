@@ -66,6 +66,10 @@ pub use hwx::{EwOp, FusedAct};
 /// IOSurface adoption (`compile_graph` + `GraphRuntime`).
 pub mod graph;
 
+/// Differential fuzzer: random MIL generation + verdict classification
+/// for ANECompiler vs the empirically mapped dialect.
+pub mod fuzz;
+
 /// Which hardware units the model is allowed to use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComputeUnits {
