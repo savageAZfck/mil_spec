@@ -1198,13 +1198,21 @@ impl GraphRuntime {
                         }
                     };
                     let b = surf.bytes();
+                    // element axis: small-n layouts use channels (k), the
+                    // n>256 family moves elements to the batch dim (n),
+                    // and W handles the strided-vector fallthrough.
+                    let off = |d: &crate::espresso::TensorDesc, i: u64| {
+                        if d.k > 1 {
+                            d.offset(0, 0, i, 0, 0)
+                        } else if d.n > 1 {
+                            d.offset(i, 0, 0, 0, 0)
+                        } else {
+                            d.offset(0, 0, 0, 0, i)
+                        }
+                    };
                     let sum: f32 = (0..n as u64)
                         .map(|i| {
-                            let o = if d.k > 1 {
-                                d.offset(0, 0, i, 0, 0)
-                            } else {
-                                d.offset(0, 0, 0, 0, i)
-                            };
+                            let o = off(&d, i);
                             let v =
                                 half::f16::from_bits(u16::from_le_bytes([b[o], b[o + 1]])).to_f32();
                             v * v
@@ -1212,12 +1220,8 @@ impl GraphRuntime {
                         .sum();
                     let r = (sum / n as f32 + eps).sqrt().recip();
                     self.write_ext(&ext, move |b, d| {
-                        for i in 0..d.k.max(d.w) {
-                            let o = if d.k > 1 {
-                                d.offset(0, 0, i, 0, 0)
-                            } else {
-                                d.offset(0, 0, 0, 0, i)
-                            };
+                        for i in 0..d.n.max(d.k).max(d.w) {
+                            let o = off(d, i);
                             let g = gamma
                                 .as_ref()
                                 .and_then(|gv| gv.get(i as usize).copied())
