@@ -1134,6 +1134,18 @@ impl GraphRuntime {
             .map(|(_, i)| *i)
     }
 
+    /// Evict every resident program — frees the runtime's share of the
+    /// ANE residency pool. Surfaces persist; programs lazily reload on
+    /// the next `run`. For multi-runtime hosts (one GraphRuntime per
+    /// compiled program) the pool is global, so a finished call should
+    /// give its residents back.
+    pub fn release_residents(&mut self) {
+        for p in self.progs.iter_mut() {
+            *p = None;
+        }
+        self.lru.clear();
+    }
+
     /// Zero all persistent state surfaces (KV-cache accumulators marked
     /// with `zero` ports) for a fresh decode horizon without unloading
     /// resident ANE programs.
