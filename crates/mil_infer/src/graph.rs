@@ -114,6 +114,13 @@ pub enum HostOp {
         eps: f32,
         gamma: Option<Vec<f32>>,
     },
+    /// Elementwise reciprocal `1.0 / src[i]` written into external input
+    /// `ext` for the downstream ANE `mul(a, b_recip)` (`real_div`).
+    Recip {
+        src: BindSrc,
+        ext: String,
+        n: u32,
+    },
 }
 
 #[derive(Debug)]
@@ -283,6 +290,22 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
                 result: o.result.clone(),
                 shape: o.shape.clone(),
                 args: vec![("x".into(), x), ("y".into(), sig)],
+            });
+        } else if o.op == "real_div" {
+            let x = arg_of(&o, "x").unwrap_or("x").to_string();
+            let y = arg_of(&o, "y").unwrap_or("y").to_string();
+            let r = format!("{}_rcp", o.result);
+            flat.push(MilOp {
+                op: "__recip".into(),
+                result: r.clone(),
+                shape: o.shape.clone(),
+                args: vec![("x".into(), y)],
+            });
+            flat.push(MilOp {
+                op: "mul".into(),
+                result: o.result.clone(),
+                shape: o.shape.clone(),
+                args: vec![("x".into(), x), ("y".into(), r)],
             });
         } else if o.op == "conv" && arg_of(&o, "bias").is_some() {
             let bname = arg_of(&o, "bias").unwrap().to_string();
@@ -496,6 +519,20 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
                 }));
                 created.push(nodes.len() - 1);
                 // rvec is virtual — consumers see it as an external
+                continue;
+            }
+            "__recip" => {
+                let src = arg_of(o, "x").unwrap();
+                let src_bind = match prod.get(src) {
+                    Some((idx, _)) => BindSrc::Out(*idx),
+                    None => BindSrc::Ext(src.to_string()),
+                };
+                nodes.push(Node::Host(HostOp::Recip {
+                    src: src_bind,
+                    ext: o.result.clone(),
+                    n: elems,
+                }));
+                created.push(nodes.len() - 1);
                 continue;
             }
             "add" | "sub" | "mul" | "minimum" | "maximum" => {
@@ -1309,6 +1346,55 @@ impl GraphRuntime {
                             if o + 2 <= b.len() {
                                 b[o..o + 2]
                                     .copy_from_slice(&half::f16::from_f32(r * g).to_le_bytes());
+                            }
+                        }
+                    });
+                }
+                Node::Host(HostOp::Recip { src, ext, n }) => {
+                    let (src, ext, n) = (src.clone(), ext.clone(), *n);
+                    let (surf, d) = match &src {
+                        BindSrc::Out(idx) => {
+                            (self.bufs[*idx].clone().unwrap(), self.out_desc(*idx))
+                        }
+                        BindSrc::Ext(name) => {
+                            if !self.ext_bufs.contains_key(name) {
+                                if let Some((_, uses)) =
+                                    self.plan.externals.iter().find(|(nm, _)| nm == name)
+                                {
+                                    if let Some(&(ni, _)) = uses.first() {
+                                        self.ensure(ni)?;
+                                    }
+                                }
+                            }
+                            (
+                                self.ext_bufs.get(name).unwrap().clone(),
+                                self.ext_descs.get(name).unwrap().clone(),
+                            )
+                        }
+                    };
+                    let b = surf.bytes();
+                    let off = |d: &crate::espresso::TensorDesc, i: u64| {
+                        if d.k > 1 {
+                            d.offset(0, 0, i, 0, 0)
+                        } else if d.n > 1 {
+                            d.offset(i, 0, 0, 0, 0)
+                        } else {
+                            d.offset(0, 0, 0, 0, i)
+                        }
+                    };
+                    let rvals: Vec<f32> = (0..n as u64)
+                        .map(|i| {
+                            let o = off(&d, i);
+                            let v =
+                                half::f16::from_bits(u16::from_le_bytes([b[o], b[o + 1]])).to_f32();
+                            1.0 / v
+                        })
+                        .collect();
+                    self.write_ext(&ext, move |b, d| {
+                        for (i, &rv) in rvals.iter().enumerate() {
+                            let o = off(d, i as u64);
+                            if o + 2 <= b.len() {
+                                b[o..o + 2].copy_from_slice(&half::f16::from_f32(rv).to_le_bytes());
                             }
                         }
                     });
