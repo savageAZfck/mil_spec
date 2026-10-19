@@ -31,6 +31,53 @@ use crate::hwx::{
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::cell::RefCell;
+
+thread_local! {
+    /// Process-wide surface pool. IOSurfaces are a bounded global
+    /// resource — create/destroy churn outruns the driver's reclaim
+    /// path, so released surfaces go back to a bounded reuse pool
+    /// instead of dying. Live set stays at one program's working set
+    /// regardless of runtime count. (GraphRuntime is single-threaded;
+    /// Rc everywhere already.)
+    static SURF_POOL: RefCell<VecDeque<(usize, Rc<SharedSurface>)>> =
+        RefCell::new(VecDeque::new());
+}
+const SURF_POOL_CAP: usize = 4096;
+
+/// Take a surface of at least `bytes` from the pool, else allocate.
+fn surface_pooled(bytes: usize) -> Result<Rc<SharedSurface>, String> {
+    let s = SURF_POOL.with(|p| {
+        let mut p = p.borrow_mut();
+        // smallest fit — keeps big surfaces free for big requests
+        let best = p
+            .iter()
+            .enumerate()
+            .filter(|(_, (b, _))| *b >= bytes)
+            .min_by_key(|(_, (b, _))| *b)
+            .map(|(i, _)| i);
+        best.map(|i| p.remove(i).unwrap().1)
+    });
+    match s {
+        Some(surf) => {
+            for b in surf.bytes_mut().iter_mut() {
+                *b = 0;
+            }
+            Ok(surf)
+        }
+        None => SharedSurface::new(bytes).map(Rc::new).map_err(|e| format!("{e:?}")),
+    }
+}
+
+fn surface_release(surf: Rc<SharedSurface>) {
+    SURF_POOL.with(|p| {
+        let mut p = p.borrow_mut();
+        p.push_back((surf.bytes().len(), surf));
+        while p.len() > SURF_POOL_CAP {
+            p.pop_front();
+        }
+    });
+}
 
 /// Physical tensor currency — byte-level layouts that must match for
 /// zero-copy surface adoption.
@@ -983,11 +1030,8 @@ impl GraphRuntime {
         if let Some(s) = self.ext_bufs.get(name) {
             return Ok(s.clone());
         }
-        let surf = SharedSurface::new(desc.bytes()).map_err(|e| format!("ext {name}: {e:?}"))?;
-        for b in surf.bytes_mut().iter_mut() {
-            *b = 0;
-        }
-        let rc = Rc::new(surf);
+        let rc = surface_pooled(desc.bytes())
+            .map_err(|e| format!("ext {name}: {e}"))?;
         self.ext_descs.insert(name.to_string(), desc.clone());
         if let Some(ws) = self.pending.remove(name) {
             for w in ws {
@@ -1027,9 +1071,9 @@ impl GraphRuntime {
                     .as_ref()
                     .map(|d| d.bytes())
                     .unwrap_or(16384);
-                self.bufs[i] = Some(Rc::new(
-                    SharedSurface::new(bytes).map_err(|e| format!("n{i} out: {e:?}"))?,
-                ));
+                self.bufs[i] = Some(
+                    surface_pooled(bytes).map_err(|e| format!("n{i} out: {e}"))?,
+                );
             }
             let s = self.bufs[i].clone().unwrap();
             p.adopt_output(0, s.as_ptr())
@@ -1154,13 +1198,19 @@ impl GraphRuntime {
     /// when the surface re-materializes.
     pub fn release_all(&mut self) {
         self.release_residents();
+        // surfaces go back to the pool for reuse — create/destroy
+        // churn outruns the driver's reclaim path.
         for b in self.bufs.iter_mut() {
-            *b = None;
+            if let Some(s) = b.take() {
+                surface_release(s);
+            }
         }
         for d in self.out_descs.iter_mut() {
             *d = None;
         }
-        self.ext_bufs.clear();
+        for (_, s) in self.ext_bufs.drain() {
+            surface_release(s);
+        }
         self.ext_descs.clear();
     }
 
