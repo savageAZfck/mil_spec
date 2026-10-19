@@ -1146,6 +1146,24 @@ impl GraphRuntime {
         self.lru.clear();
     }
 
+    /// Drop everything — resident programs AND every IOSurface. For
+    /// hosts that stage all inputs per call and mirror state outside
+    /// the runtime (coyote's VM), nothing here needs to survive a
+    /// call boundary; both bounded pools (programs, IOSurfaces) get
+    /// fully released. Pending ext writes are kept — they re-apply
+    /// when the surface re-materializes.
+    pub fn release_all(&mut self) {
+        self.release_residents();
+        for b in self.bufs.iter_mut() {
+            *b = None;
+        }
+        for d in self.out_descs.iter_mut() {
+            *d = None;
+        }
+        self.ext_bufs.clear();
+        self.ext_descs.clear();
+    }
+
     /// Zero all persistent state surfaces (KV-cache accumulators marked
     /// with `zero` ports) for a fresh decode horizon without unloading
     /// resident ANE programs.
