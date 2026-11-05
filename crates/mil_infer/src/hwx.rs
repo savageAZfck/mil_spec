@@ -4984,6 +4984,8 @@ const SKELETON_AV64X512: &[u8] = include_bytes!("../assets/attnv_64x512_skeleton
 const SKELETON_AV64X1024: &[u8] = include_bytes!("../assets/attnv_64x1024_skeleton.hwx");
 const SKELETON_AV256X128: &[u8] = include_bytes!("../assets/attnv_256x128_skeleton.hwx");
 const SKELETON_AV128X128: &[u8] = include_bytes!("../assets/attnv_128x128_skeleton.hwx");
+const SKELETON_AV256X512: &[u8] = include_bytes!("../assets/attnv_256x512_skeleton.hwx");
+const SKELETON_AV512X256: &[u8] = include_bytes!("../assets/attnv_512x256_skeleton.hwx");
 
 /// Outer product `z[c][j] = e[c]·r[j]` — `matmul(x=e[1,T,1,1],
 /// y=r[1,1,1,K])` → `z[1,T,1,K]`. With `e` a one-hot this scatters row
@@ -5008,6 +5010,8 @@ const SKELETON_OUTER64X256: &[u8] = include_bytes!("../assets/outer64x256_skelet
 const SKELETON_OUTER64X512: &[u8] = include_bytes!("../assets/outer64x512_skeleton.hwx");
 const SKELETON_OUTER64X1024: &[u8] = include_bytes!("../assets/outer64x1024_skeleton.hwx");
 const SKELETON_OUTER256X128: &[u8] = include_bytes!("../assets/outer256x128_skeleton.hwx");
+const SKELETON_OUTER256X512: &[u8] = include_bytes!("../assets/outer256x512_skeleton.hwx");
+const SKELETON_OUTER512X256: &[u8] = include_bytes!("../assets/outer512x256_skeleton.hwx");
 const SKELETON_OUTER128X128: &[u8] = include_bytes!("../assets/outer128x128_skeleton.hwx");
 
 /// Emit the outer-product row scatter for `(t, d)` on the skeleton
@@ -5024,6 +5028,8 @@ pub fn emit_outer_t(t: u32, d: u32, mil_path: &str, out_path: &str) -> Result<Ve
         (64, 512) => SKELETON_OUTER64X512,
         (64, 1024) => SKELETON_OUTER64X1024,
         (256, 128) => SKELETON_OUTER256X128,
+        (256, 512) => SKELETON_OUTER256X512,
+        (512, 256) => SKELETON_OUTER512X256,
         (128, 128) => SKELETON_OUTER128X128,
         _ => return Err(format!("outer ({t},{d}) off skeleton table")),
     };
@@ -5222,6 +5228,8 @@ pub fn emit_attn_v(t: u32, d: u32, mil_path: &str, out_path: &str) -> Result<Vec
         (64, 1024) => SKELETON_AV64X1024,
         (256, 128) => SKELETON_AV256X128,
         (128, 128) => SKELETON_AV128X128,
+        (256, 512) => SKELETON_AV256X512,
+        (512, 256) => SKELETON_AV512X256,
         _ => return Err(format!("attn_v (t={t},d={d}) not on skeleton table")),
     };
     let (entries, relocs) = tail_meta(skel);
