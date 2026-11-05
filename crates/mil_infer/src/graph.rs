@@ -1216,7 +1216,16 @@ impl GraphRuntime {
             match self.load_node(i) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    if !e.contains("no ANE resources") {
+                    // Espresso reports residency exhaustion as
+                    // "Program load failed — no memory (transient;
+                    // retry under lower memory pressure)" — the older
+                    // "no ANE resources" phrasing never fires. Match
+                    // both so `ensure` evicts+retries instead of
+                    // dying on the first pressure spike.
+                    let resource = e.contains("no ANE resources")
+                        || e.contains("no memory")
+                        || e.contains("resource");
+                    if !resource {
                         return Err(e);
                     }
                     // Bélády-optimal for cyclic DAG execution: the node
