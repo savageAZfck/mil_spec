@@ -52,6 +52,7 @@ fn main() {
     let cache = PathBuf::from("/tmp/e5_mut_cache");
     let cc = CompileCfg {
         cache_dir: cache.clone(),
+        profiling: Default::default(),
         force_recompile: true,
     };
     let live: Vec<(&str, u64)> = vec![(in_name.as_str(), in_k)];

@@ -826,8 +826,8 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
                     // attn·V: x strided scores (either axis spelling),
                     // y packed [1,T,1,D] or [1,1,T,D] cache frame
                     let (t, d) = (xt as u32, ys[3] as u32);
-                    let img =
-                        emit_attn_v(t, d, mil_path, &format!("{out_dir}/.tmpv_{}", o.result))?;
+                    let img = emit_attn_v(t, d, mil_path, &format!("{out_dir}/.tmpv_{}", o.result))
+                        .map_err(|e| format!("op {} x={} y={}: {e}", o.result, x, y))?;
                     let idx = push_prog(&mut nodes, &mut created, o.result.clone(), img, out_dir)?;
                     prod.insert(o.result.clone(), (idx, Cur::Contig(d)));
                     wants.push((idx, vec![(x, Cur::Strided(t)), (y, Cur::Packed(t, d))]));
@@ -1145,6 +1145,66 @@ impl GraphRuntime {
         Ok(())
     }
 
+    /// Re-bind resident program `i` to this pass's surfaces. `adopt_*`
+    /// is a retain+wrap swap (~µs) versus a ~ms `load_precompiled`, so
+    /// programs stay resident across `run()` calls while liveness
+    /// recycles the surfaces beneath them — each pass re-points every
+    /// port at the live `Rc` instead of invalidating the program.
+    fn rebind_node(&mut self, i: usize) -> Result<(), String> {
+        let Node::Prog { binds, alias, .. } = &self.plan.nodes[i] else {
+            return Ok(());
+        };
+        let binds = binds.clone();
+        let alias = alias.clone();
+        let mut p = self.progs[i].take().unwrap();
+        let r = (|| {
+            let aliased = alias.iter().any(|(o, _)| *o == 0);
+            if !aliased && self.bufs[i].is_none() {
+                let bytes = self
+                    .out_descs[i]
+                    .as_ref()
+                    .map(|d| d.bytes())
+                    .unwrap_or(16384);
+                self.bufs[i] = Some(
+                    surface_pooled(bytes).map_err(|e| format!("n{i} out: {e}"))?,
+                );
+            }
+            if !aliased {
+                let s = self.bufs[i].clone().unwrap();
+                p.adopt_output(0, s.as_ptr())
+                    .map_err(|e| format!("n{i} adopt out: {e:?}"))?;
+            }
+            for (port, b) in binds.iter().enumerate() {
+                let surf = match b {
+                    BindSrc::Out(src) => self.node_surf(*src),
+                    BindSrc::Ext(name) => {
+                        let d = p.input_descs[port].clone();
+                        Some(self.ext_surface(name, &d)?)
+                    }
+                };
+                if let Some(s) = surf {
+                    p.adopt_input(port, s.as_ptr())
+                        .map_err(|e| format!("bind node{i} port{port}: {e:?}"))?;
+                }
+            }
+            for (o, ii) in &alias {
+                if let Some(s) = self.port_surf(i, *ii) {
+                    p.adopt_output(*o, s.as_ptr())
+                        .map_err(|e| format!("n{i} alias: {e:?}"))?;
+                    if *o == 0 {
+                        self.bufs[i] = Some(s);
+                    }
+                }
+            }
+            Ok(())
+        })();
+        self.progs[i] = Some(p);
+        if r.is_ok() {
+            self.touch(i);
+        }
+        r
+    }
+
     /// Ensure node `i`'s program is resident; on resource exhaustion
     /// evict the least-recently-used resident program and retry.
     fn ensure(&mut self, i: usize) -> Result<(), String> {
@@ -1273,17 +1333,87 @@ impl GraphRuntime {
     }
 
     /// Execute the whole graph once in scheduled order; programs load
-    /// lazily and are evicted LRU-first under ANE residency pressure.
+    /// lazily on first use, stay resident across passes, and re-bind
+    /// their surfaces each pass (`rebind_node` — `adopt_*` is a
+    /// retain+wrap swap, not a reload). Intermediate node-output
+    /// surfaces are recycled as soon as their last consumer has run —
+    /// without this a wide graph materializes one IOSurface per node
+    /// and blows the global surface budget mid-run. Recycled surfaces
+    /// may be re-adopted by later nodes; that is safe because every
+    /// resident program re-points its ports at the live surfaces
+    /// immediately before it evals.
     pub fn run(&mut self) -> Result<(), String> {
+        // liveness: consumers of each node's output surface
+        let mut remaining = vec![0usize; self.plan.nodes.len()];
+        let mut pinned = vec![false; self.plan.nodes.len()];
+        for (_, ni) in &self.plan.outputs {
+            pinned[*ni] = true;
+        }
+        for n in &self.plan.nodes {
+            let mut count = |s: &BindSrc| {
+                if let BindSrc::Out(src) = s {
+                    remaining[*src] += 1;
+                }
+            };
+            match n {
+                Node::Prog { binds, .. } => {
+                    for b in binds {
+                        count(b);
+                    }
+                }
+                Node::Host(h) => match h {
+                    HostOp::RsqrtBroadcast { src, .. } | HostOp::Recip { src, .. } => count(src),
+                },
+            }
+        }
+        // Resident programs are NOT evicted when surfaces recycle:
+        // `rebind_node` re-points every port at the live surface each
+        // pass, so pooled/re-adopted IOSurfaces can never leave a
+        // stale binding. Residency persists across `run()` calls;
+        // ANE memory pressure is handled by `ensure`'s LRU eviction.
+        let t_run = std::time::Instant::now();
+        let mut t_ensure = std::time::Duration::ZERO;
+        let mut t_eval = std::time::Duration::ZERO;
+        let mut n_loads = 0usize;
         for i in self.plan.order.clone() {
+            // sources this node consumes — their use counts drop once it ran
+            let consumed: Vec<usize> = match &self.plan.nodes[i] {
+                Node::Prog { binds, .. } => binds
+                    .iter()
+                    .filter_map(|b| match b {
+                        BindSrc::Out(s) => Some(*s),
+                        _ => None,
+                    })
+                    .collect(),
+                Node::Host(h) => match h {
+                    HostOp::RsqrtBroadcast { src, .. } | HostOp::Recip { src, .. } => {
+                        match src {
+                            BindSrc::Out(s) => vec![*s],
+                            _ => vec![],
+                        }
+                    }
+                },
+            };
             match &self.plan.nodes[i] {
                 Node::Prog { .. } => {
-                    self.ensure(i)?;
+                    let was = self.progs[i].is_some();
+                    let t0 = std::time::Instant::now();
+                    if was {
+                        self.rebind_node(i)?;
+                    } else {
+                        self.ensure(i)?;
+                    }
+                    t_ensure += t0.elapsed();
+                    if !was {
+                        n_loads += 1;
+                    }
+                    let t1 = std::time::Instant::now();
                     self.progs[i]
                         .as_ref()
                         .unwrap()
                         .eval()
-                        .map_err(|e| format!("node {i}: {e:?}"))?
+                        .map_err(|e| format!("node {i}: {e:?}"))?;
+                    t_eval += t1.elapsed();
                 }
                 Node::Host(HostOp::RsqrtBroadcast {
                     src,
@@ -1400,7 +1530,25 @@ impl GraphRuntime {
                     });
                 }
             }
+            // liveness release: producers whose last consumer just ran
+            for s in consumed {
+                remaining[s] = remaining[s].saturating_sub(1);
+                if remaining[s] == 0 && !pinned[s] {
+                    if let Some(surf) = self.bufs[s].take() {
+                        if Rc::strong_count(&surf) == 1 {
+                            surface_release(surf);
+                        }
+                    }
+                }
+            }
         }
+        eprintln!(
+            "graph run: {} nodes, {n_loads} loads, ensure {:?}, eval {:?}, total {:?}",
+            self.plan.order.len(),
+            t_ensure,
+            t_eval,
+            t_run.elapsed()
+        );
         Ok(())
     }
 }

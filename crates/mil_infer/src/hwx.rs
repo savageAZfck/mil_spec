@@ -992,6 +992,24 @@ fn tail_meta(skel: &[u8]) -> (Vec<(String, u8, u8, u16, u64)>, Vec<[u8; 8]>) {
     (entries, relocs)
 }
 
+/// File offset of the variable tail — the `cmd=0x8` ANEC-version load
+/// command that [`build_tail_at`] rebuilds. Skeletons captured with
+/// different segment mixes (e.g. no `__DATA`) shift this offset, so it
+/// is walked from the load commands rather than hardcoded.
+fn skel_tail_off(skel: &[u8]) -> usize {
+    let ncmds = u32::from_le_bytes(skel[0x10..0x14].try_into().unwrap()) as usize;
+    let mut off = 0x20usize;
+    for _ in 0..ncmds {
+        let cmd = u32::from_le_bytes(skel[off..off + 4].try_into().unwrap());
+        let csz = u32::from_le_bytes(skel[off + 4..off + 8].try_into().unwrap()) as usize;
+        if cmd == 0x8 {
+            return off;
+        }
+        off += csz;
+    }
+    panic!("skeleton has no ANEC-version load command");
+}
+
 /// `__text` relocation entries, located through the `reloff`/`nreloc`
 /// field pair at `reloff_field` (header `0x218` on single-section
 /// skeletons; the `__text` section entry on multi-section families).
@@ -4952,6 +4970,20 @@ const SKELETON_AV64X128: &[u8] = include_bytes!("../assets/attnv_64x128_skeleton
 const SKELETON_AV256X64: &[u8] = include_bytes!("../assets/attnv_256x64_skeleton.hwx");
 const SKELETON_AV1024X64: &[u8] = include_bytes!("../assets/attnv_1024x64_skeleton.hwx");
 const SKELETON_AV1024X128: &[u8] = include_bytes!("../assets/attnv_1024x128_skeleton.hwx");
+/// `(t=128, d=64)` — ANEC capture of `matmul(x=[1,128,1,1],
+/// y=[1,128,1,64], transpose_x)`. This is the d_model=128 backward
+/// `dX = adj @ W^T` route (FFN/attn proj grads), not a cache-frame
+/// attn·V — the router's shape signature collides but the MIL operand
+/// layouts match exactly (`x` strided-128, `y` packed 128×64).
+const SKELETON_AV128X64: &[u8] = include_bytes!("../assets/attnv_128x64_skeleton.hwx");
+/// `(t=64, d=256)` — ANEC capture; d_model=256 backward matvec.
+const SKELETON_AV64X256: &[u8] = include_bytes!("../assets/attnv_64x256_skeleton.hwx");
+/// d_model=512/1024 backward matvecs — ANEC captures.
+const SKELETON_AV512X64: &[u8] = include_bytes!("../assets/attnv_512x64_skeleton.hwx");
+const SKELETON_AV64X512: &[u8] = include_bytes!("../assets/attnv_64x512_skeleton.hwx");
+const SKELETON_AV64X1024: &[u8] = include_bytes!("../assets/attnv_64x1024_skeleton.hwx");
+const SKELETON_AV256X128: &[u8] = include_bytes!("../assets/attnv_256x128_skeleton.hwx");
+const SKELETON_AV128X128: &[u8] = include_bytes!("../assets/attnv_128x128_skeleton.hwx");
 
 /// Outer product `z[c][j] = e[c]·r[j]` — `matmul(x=e[1,T,1,1],
 /// y=r[1,1,1,K])` → `z[1,T,1,K]`. With `e` a one-hot this scatters row
@@ -4961,6 +4993,22 @@ const SKELETON_OUTER64: &[u8] = include_bytes!("../assets/outer64_skeleton.hwx")
 const SKELETON_OUTER256: &[u8] = include_bytes!("../assets/outer256_skeleton.hwx");
 const SKELETON_OUTER512: &[u8] = include_bytes!("../assets/outer512_skeleton.hwx");
 const SKELETON_OUTER1024: &[u8] = include_bytes!("../assets/outer1024_skeleton.hwx");
+/// `(t=64, d=128)` — captured via ANEC from `matmul(transpose_x)` with
+/// `y` spelled contiguous `[1,1,1,128]` (the `[1,128,1,1]` strided
+/// spelling is rejected by ANEC at d>64 — the contiguous form is the
+/// only route). First d>64 outer tile; unblocks d_model=128 training.
+const SKELETON_OUTER64X128: &[u8] = include_bytes!("../assets/outer64x128_skeleton.hwx");
+/// `(t=128, d=64)` — ANEC capture; the d_model=128 param-grad outer
+/// (`dW` for `[64→128]` projections). T=128 was the missing row in
+/// the T×{64} outer family.
+const SKELETON_OUTER128: &[u8] = include_bytes!("../assets/outer128_skeleton.hwx");
+/// `(t=64, d=256)` — ANEC capture; d_model=256 param-grad outer.
+const SKELETON_OUTER64X256: &[u8] = include_bytes!("../assets/outer64x256_skeleton.hwx");
+/// `(t=64, d=512)` / `(t=64, d=1024)` — d_model=512/1024 grad outers.
+const SKELETON_OUTER64X512: &[u8] = include_bytes!("../assets/outer64x512_skeleton.hwx");
+const SKELETON_OUTER64X1024: &[u8] = include_bytes!("../assets/outer64x1024_skeleton.hwx");
+const SKELETON_OUTER256X128: &[u8] = include_bytes!("../assets/outer256x128_skeleton.hwx");
+const SKELETON_OUTER128X128: &[u8] = include_bytes!("../assets/outer128x128_skeleton.hwx");
 
 /// Emit the outer-product row scatter for `(t, d)` on the skeleton
 /// table — `t` is the cache/frame length, `d` the channel width.
@@ -4970,11 +5018,19 @@ pub fn emit_outer_t(t: u32, d: u32, mil_path: &str, out_path: &str) -> Result<Ve
         (256, 64) => SKELETON_OUTER256,
         (512, 64) => SKELETON_OUTER512,
         (1024, 64) => SKELETON_OUTER1024,
+        (64, 128) => SKELETON_OUTER64X128,
+        (128, 64) => SKELETON_OUTER128,
+        (64, 256) => SKELETON_OUTER64X256,
+        (64, 512) => SKELETON_OUTER64X512,
+        (64, 1024) => SKELETON_OUTER64X1024,
+        (256, 128) => SKELETON_OUTER256X128,
+        (128, 128) => SKELETON_OUTER128X128,
         _ => return Err(format!("outer ({t},{d}) off skeleton table")),
     };
     let (entries, relocs) = tail_meta(skel);
-    // __text at 0x8000 like the attnv family
-    rebuild_tail_at_text(skel, 0x33f0, 0x8000, &entries, &relocs, mil_path, out_path)
+    // __text at 0x8000 like the attnv family; tail offset walked so
+    // captures with a different segment mix still splice correctly.
+    rebuild_tail_at_text(skel, skel_tail_off(skel), 0x8000, &entries, &relocs, mil_path, out_path)
         .map_err(|e| e.to_string())
 }
 
@@ -4991,6 +5047,16 @@ const SKELETON_ADD4D64: &[u8] = include_bytes!("../assets/add4d64_skeleton.hwx")
 const SKELETON_ADD4D256: &[u8] = include_bytes!("../assets/add4d256_skeleton.hwx");
 const SKELETON_ADD4D512: &[u8] = include_bytes!("../assets/add4d512_skeleton.hwx");
 const SKELETON_ADD4D1024: &[u8] = include_bytes!("../assets/add4d1024_skeleton.hwx");
+/// d_model=128 grad-accumulator frames — ANEC captures of
+/// `add([1,T,1,D])` elementwise; T=64/D=128 and T=128/D=64.
+const SKELETON_ADD4D64128: &[u8] = include_bytes!("../assets/add4d64128_skeleton.hwx");
+const SKELETON_ADD4D12864: &[u8] = include_bytes!("../assets/add4d12864_skeleton.hwx");
+/// d_model=256 grad frames — ANEC captures of `add([1,T,1,D])`.
+const SKELETON_ADD4D64256: &[u8] = include_bytes!("../assets/add4d64256_skeleton.hwx");
+const SKELETON_ADD4D25664: &[u8] = include_bytes!("../assets/add4d25664_skeleton.hwx");
+/// d_model=512/1024 grad frames — ANEC captures of `add([1,T,1,D])`.
+const SKELETON_ADD4D64512: &[u8] = include_bytes!("../assets/add4d64512_skeleton.hwx");
+const SKELETON_ADD4D641024: &[u8] = include_bytes!("../assets/add4d641024_skeleton.hwx");
 
 /// Packed 4-D add on `[1,T,1,D]` for `(t,d)` on the skeleton table.
 pub fn emit_add4d(t: u32, d: u32, mil_path: &str, out_path: &str) -> Result<Vec<u8>, String> {
@@ -4999,10 +5065,16 @@ pub fn emit_add4d(t: u32, d: u32, mil_path: &str, out_path: &str) -> Result<Vec<
         (256, 64) => SKELETON_ADD4D256,
         (512, 64) => SKELETON_ADD4D512,
         (1024, 64) => SKELETON_ADD4D1024,
+        (64, 128) => SKELETON_ADD4D64128,
+        (128, 64) => SKELETON_ADD4D12864,
+        (64, 256) => SKELETON_ADD4D64256,
+        (256, 64) => SKELETON_ADD4D25664,
+        (64, 512) => SKELETON_ADD4D64512,
+        (64, 1024) => SKELETON_ADD4D641024,
         _ => return Err(format!("add4d ({t},{d}) off skeleton table")),
     };
     let (entries, relocs) = tail_meta(skel);
-    rebuild_tail_at_text(skel, 0x33f0, 0x8000, &entries, &relocs, mil_path, out_path)
+    rebuild_tail_at_text(skel, skel_tail_off(skel), 0x8000, &entries, &relocs, mil_path, out_path)
         .map_err(|e| e.to_string())
 }
 
@@ -5143,11 +5215,18 @@ pub fn emit_attn_v(t: u32, d: u32, mil_path: &str, out_path: &str) -> Result<Vec
         (256, 64) => SKELETON_AV256X64,
         (1024, 64) => SKELETON_AV1024X64,
         (1024, 128) => SKELETON_AV1024X128,
+        (128, 64) => SKELETON_AV128X64,
+        (64, 256) => SKELETON_AV64X256,
+        (512, 64) => SKELETON_AV512X64,
+        (64, 512) => SKELETON_AV64X512,
+        (64, 1024) => SKELETON_AV64X1024,
+        (256, 128) => SKELETON_AV256X128,
+        (128, 128) => SKELETON_AV128X128,
         _ => return Err(format!("attn_v (t={t},d={d}) not on skeleton table")),
     };
     let (entries, relocs) = tail_meta(skel);
     // this family keeps __text at fileoff 0x8000, not 0x4000
-    rebuild_tail_at_text(skel, 0x34a8, 0x8000, &entries, &relocs, mil_path, out_path)
+    rebuild_tail_at_text(skel, skel_tail_off(skel), 0x8000, &entries, &relocs, mil_path, out_path)
 }
 
 /// Emit `p = softmax(matmul(x, y^T))` — both operands activations —
