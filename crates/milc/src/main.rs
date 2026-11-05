@@ -1514,7 +1514,16 @@ fn cmd_run(args: &[String]) -> ExitCode {
         eprintln!("milc run: needs <pkg.mlpackage>");
         return ExitCode::from(2);
     };
-    if path.join("manifest.json").exists() {
+    // .milshards bundles carry a lowercase `manifest.json`; .mlpackage
+    // dirs carry Apple's `Manifest.json`. On case-insensitive APFS
+    // `exists()` can't tell them apart — match the dir entry exactly.
+    let is_sharded = std::fs::read_dir(&path)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .any(|e| e.file_name() == "manifest.json")
+        })
+        .unwrap_or(false);
+    if is_sharded {
         return run_sharded(&path, units, steps);
     }
     let spec_path = path.join("Data/com.apple.CoreML/model.mlmodel");
