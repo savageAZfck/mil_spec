@@ -483,6 +483,7 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
      -> Result<usize, String> {
         let idx = nodes.len();
         let path = format!("{out_dir}/n{idx}_{name}.macho");
+        crate::resource_guard::check(out_dir)?;
         std::fs::write(&path, &img).map_err(|e| format!("{path}: {e}"))?;
         nodes.push(Node::Prog {
             name,
@@ -878,6 +879,7 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
                                 emit_repack(n, mil_path, &format!("{out_dir}/.tmpa{n}_{name}"))?;
                             let aidx = nodes.len();
                             let path = format!("{out_dir}/n{aidx}_{name}_rp.macho");
+                            crate::resource_guard::check(out_dir)?;
                             std::fs::write(&path, &img).map_err(|e| format!("{path}: {e}"))?;
                             nodes.push(Node::Prog {
                                 name: format!("{name}_rp"),
@@ -905,6 +907,7 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
                             )?;
                             let aidx = nodes.len();
                             let path = format!("{out_dir}/n{aidx}_{name}_unrp.macho");
+                            crate::resource_guard::check(out_dir)?;
                             std::fs::write(&path, &img).map_err(|e| format!("{path}: {e}"))?;
                             nodes.push(Node::Prog {
                                 name: format!("{name}_unrp"),

@@ -62,6 +62,10 @@ mod conv_ns_table;
 pub mod hwx;
 mod mm_ns_table;
 pub use hwx::{EwOp, FusedAct};
+/// Emit-time resource guard: disk/vnode/memory floors checked at a
+/// bounded interval so runaway program emission fails loudly instead
+/// of starving the host.
+pub mod resource_guard;
 /// Multi-op graph scheduler: MIL DAG -> per-op HWX programs wired by
 /// IOSurface adoption (`compile_graph` + `GraphRuntime`).
 pub mod graph;

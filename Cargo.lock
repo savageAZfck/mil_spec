@@ -115,6 +115,7 @@ name = "mil_infer"
 version = "0.6.0"
 dependencies = [
  "half",
+ "libc",
  "mil_compile",
  "mil_machines",
  "mil_spec",
