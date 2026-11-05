@@ -2,18 +2,24 @@
 //!
 //! Per-node ANE compilation writes one `.macho` per graph node — a
 //! d=512/L=4 brain is ~135k programs (~9 GiB). Unguarded, a runaway
-//! compile can fill the disk, pin the vnode table, or spike memory
-//! pressure until the host organism starves. This guard samples the
-//! output volume, the vnode table, and memory pressure at a bounded
-//! interval and fails the emit with a clear error *before* resources
-//! are exhausted — turning a silent system failure into a loud,
-//! attributable one.
+//! compile can fill the disk, exhaust the system open-file table, or
+//! spike memory pressure until the host organism starves. This guard
+//! samples the output volume, the kernel file table, and memory
+//! pressure at a bounded interval and fails the emit with a clear
+//! error *before* resources are exhausted — turning a silent system
+//! failure into a loud, attributable one.
+//!
+//! The vnode table is deliberately not sampled: on 16 GiB hosts
+//! `kern.num_vnodes` sits at `kern.maxvnodes` as steady state — the
+//! kernel recycles it continuously — so it carries no exhaustion
+//! signal. `kern.num_files`/`kern.maxfiles` is the table whose
+//! exhaustion produced the ENFILE that killed the identity agent.
 //!
 //! Env knobs (all optional):
 //!   MIL_EMIT_GUARD=0               disable the guard entirely
 //!   MIL_EMIT_GUARD_MS=<ms>         check interval (default 5000)
 //!   MIL_EMIT_MIN_FREE_BYTES=<n>    disk floor (default 2 GiB)
-//!   MIL_EMIT_MAX_VNODE_PCT=<n>     vnode-table ceiling % (default 90)
+//!   MIL_EMIT_MAX_FILE_PCT=<n>      open-file table ceiling % (default 90)
 //!   MIL_EMIT_MIN_MEM_FREE_PCT=<n>  memory free-% floor (default 10)
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -54,7 +60,7 @@ fn avail_bytes(path: &str) -> Option<u64> {
     }
 }
 
-/// `kern.num_vnodes` / `kern.maxvnodes` — tolerates 4- or 8-byte ints.
+/// `kern.num_files` / `kern.maxfiles` — tolerates 4- or 8-byte ints.
 #[cfg(target_os = "macos")]
 fn sysctl_uint(name: &str) -> Option<u64> {
     unsafe {
@@ -98,7 +104,8 @@ fn mem_free_pct() -> Option<f64> {
         })
 }
 
-/// Sample disk, vnode, and memory pressure at a bounded interval; fail
+/// Sample disk, the open-file table, and memory pressure at a bounded
+/// interval; fail
 /// the emit when any resource is near exhaustion. The first call after
 /// each interval performs the checks — a failure aborts the compile
 /// immediately via `?`, so no sticky state is needed.
@@ -128,15 +135,15 @@ pub fn check(out_dir: &str) -> Result<(), String> {
 
     #[cfg(target_os = "macos")]
     {
-        let max_pct = env_u64("MIL_EMIT_MAX_VNODE_PCT", 90);
+        let max_pct = env_u64("MIL_EMIT_MAX_FILE_PCT", 90);
         if max_pct > 0 {
             if let (Some(used), Some(max)) =
-                (sysctl_uint("kern.num_vnodes"), sysctl_uint("kern.maxvnodes"))
+                (sysctl_uint("kern.num_files"), sysctl_uint("kern.maxfiles"))
             {
                 if max > 0 && used * 100 / max > max_pct {
                     return Err(format!(
-                        "emit guard: vnode table {used}/{max} ({}%) >= {max_pct}% — \
-                         refusing to emit; system file table saturated",
+                        "emit guard: file table {used}/{max} ({}%) >= {max_pct}% — \
+                         refusing to emit; system open-file table saturated",
                         used * 100 / max
                     ));
                 }
@@ -170,8 +177,8 @@ mod tests {
         // interval 0 → every call performs the checks
         std::env::set_var("MIL_EMIT_GUARD_MS", "0");
 
-        // isolate the disk check: disable vnode + memory floors
-        std::env::set_var("MIL_EMIT_MAX_VNODE_PCT", "0");
+        // isolate the disk check: disable file-table + memory floors
+        std::env::set_var("MIL_EMIT_MAX_FILE_PCT", "0");
         std::env::set_var("MIL_EMIT_MIN_MEM_FREE_PCT", "0");
         std::env::set_var("MIL_EMIT_MIN_FREE_BYTES", u64::MAX.to_string());
         let err = check("/tmp").expect_err("disk floor must fail closed");
@@ -188,7 +195,7 @@ mod tests {
         }
 
         std::env::remove_var("MIL_EMIT_GUARD_MS");
-        std::env::remove_var("MIL_EMIT_MAX_VNODE_PCT");
+        std::env::remove_var("MIL_EMIT_MAX_FILE_PCT");
         std::env::remove_var("MIL_EMIT_MIN_MEM_FREE_PCT");
         std::env::remove_var("MIL_EMIT_MIN_FREE_BYTES");
     }
