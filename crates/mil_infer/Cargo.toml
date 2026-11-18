@@ -13,6 +13,7 @@ keywords = ["coreml", "inference", "ane", "apple-silicon", "compiler"]
 mil_spec = { path = "../..", version = "0.4.2" }
 mil_compile = { path = "../mil_compile", version = "0.2.0" }
 half = "2"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"
 

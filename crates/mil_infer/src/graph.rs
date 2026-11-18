@@ -75,7 +75,7 @@ enum Cur {
 }
 
 /// Where a program input port draws its bytes.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum BindSrc {
     /// Function input or persistent tensor — the program keeps its
     /// own input surface; the host buffer is written through
@@ -86,7 +86,7 @@ pub enum BindSrc {
 }
 
 /// Host-side step between evals.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum HostOp {
     /// Read `src` surface (`n` elements), compute `rsqrt(mean(x^2) + eps)`
     /// (scaled by `gamma` when present), and broadcast it strided into
@@ -107,7 +107,7 @@ pub enum HostOp {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum Node {
     /// An emitted HWX program on disk.
     Prog {
@@ -125,7 +125,7 @@ pub enum Node {
 /// Source for a const-filled external. `Blob` defers the weight read
 /// to host-buffer materialization; `Values` holds eagerly-computed
 /// (dequantized) f32 data.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub enum ConstFill {
     Blob {
         dir: PathBuf,
@@ -136,6 +136,7 @@ pub enum ConstFill {
     Values(Vec<f32>),
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Plan {
     pub nodes: Vec<Node>,
     /// Eval order over `nodes` — adapters appear before their consumer.
@@ -232,12 +233,51 @@ fn expand_rms(o: &MilOp, eps: f32, fold_gamma: bool) -> Vec<MilOp> {
 /// Compile a MIL program into a [`Plan`]. `out_dir` receives one
 /// `.macho` per node — distinct paths are mandatory because aned's
 /// patch cache keys on the embedded out-path.
+/// FNV-1a fingerprint of the MIL text — emit-cache key only.
+fn mil_fingerprint(text: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in text.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PlanCache {
+    fp: u64,
+    plan: Plan,
+}
+
+/// Compile a MIL program into a [`Plan`]. `out_dir` receives one
+/// `.macho` per node — distinct paths are mandatory because aned's
+/// patch cache keys on the embedded out-path.
 pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
     let text = std::fs::read_to_string(mil_path).map_err(|e| format!("{mil_path}: {e}"))?;
     let mil_dir = Path::new(mil_path)
         .parent()
         .unwrap_or(Path::new("."))
         .to_path_buf();
+    let fp = mil_fingerprint(&text);
+    // Warm path: a serialized plan whose fingerprint matches this MIL
+    // skips the whole emit — the per-node .macho bytes are deterministic
+    // so re-writing them (16 GB of I/O and a multi-GB malloc spike for a
+    // ~40k-node model) buys nothing. Any MIL or artifact change falls
+    // through to the full emit below.
+    let cache_path = format!("{out_dir}/graph_plan.json");
+    if let Ok(cached) = std::fs::read_to_string(&cache_path) {
+        if let Ok(cache) = serde_json::from_str::<PlanCache>(&cached) {
+            if cache.fp == fp
+                && !cache.plan.nodes.is_empty()
+                && cache.plan.nodes.iter().all(|n| match n {
+                    Node::Prog { path, .. } => path.exists(),
+                    Node::Host(_) => true,
+                })
+            {
+                return Ok(cache.plan);
+            }
+        }
+    }
     let (ops, blobs) = hwx::mil_ops(&text);
     if ops.is_empty() {
         return Err(format!("{mil_path}: no compute ops found"));
@@ -978,13 +1018,22 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
             }
         }
     }
-    Ok(Plan {
+    let plan = Plan {
         nodes,
         order,
         externals,
         const_fills,
         outputs,
-    })
+    };
+    #[derive(serde::Serialize)]
+    struct PlanCacheRef<'a> {
+        fp: u64,
+        plan: &'a Plan,
+    }
+    if let Ok(json) = serde_json::to_string(&PlanCacheRef { fp, plan: &plan }) {
+        let _ = std::fs::write(&cache_path, json);
+    }
+    Ok(plan)
 }
 
 // ---------------------------------------------------------------------------
