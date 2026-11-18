@@ -22,9 +22,16 @@ fn main() {
     let cc = CompileCfg {
         cache_dir: cache.clone(),
         force_recompile: true,
+        profiling: false,
     };
     // stateful: use compile_auto which discovers inout ports itself
-    match Program::compile_auto_cfg(&mil, DeviceMask::Ane, &cc) {
+    let mask = match std::env::var("E5_MASK").as_deref() {
+        Ok("cpu") => DeviceMask::Cpu,
+        Ok("gpu") => DeviceMask::Gpu,
+        Ok("auto") => DeviceMask::Auto,
+        _ => DeviceMask::Ane,
+    };
+    match Program::compile_auto_cfg(&mil, mask, &cc) {
         Ok((prog, map)) => {
             println!(
                 "compiled. inputs={:?} outputs={:?} inouts={:?}",

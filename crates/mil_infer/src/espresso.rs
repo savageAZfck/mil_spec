@@ -376,24 +376,50 @@ pub struct SharedSurface {
     len: usize,
 }
 
+/// Live-surface counter — IOSurface caps at 16384 live objects per
+/// process; this catches who's holding them when creates start failing.
+pub static LIVE_SURFACES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 impl SharedSurface {
     /// Allocate `bytes` of zeroed surface memory.
     pub fn new(bytes: usize) -> Result<Self, EspError> {
         let objc = Objc::open()?;
         let io = IoApi::open()?;
-        let surf = unsafe {
-            let f = msg!((usize, usize, usize) -> Id);
-            f(
-                objc.ane_surf,
-                selp("createIOSurfaceWithWidth:pixel_size:height:"),
-                bytes / 2,
-                2,
-                1,
-            )
+        // create/destroy churn outruns the driver's async reclaim path —
+        // a burst of frees (e.g. the previous layer's ~2k surfaces
+        // dropping at once) leaves the kernel pool drained for a moment
+        // and createIOSurface returns null. Back off and retry rather
+        // than pooling (recycling races in-flight unloads) or dying.
+        let mut waited = 0u64;
+        let surf = loop {
+            let s = unsafe {
+                let f = msg!((usize, usize, usize) -> Id);
+                f(
+                    objc.ane_surf,
+                    selp("createIOSurfaceWithWidth:pixel_size:height:"),
+                    bytes / 2,
+                    2,
+                    1,
+                )
+            };
+            if !s.is_null() {
+                break s;
+            }
+            if waited == 0 {
+                eprintln!(
+                    "createIOSurface: null (live={})",
+                    LIVE_SURFACES.load(std::sync::atomic::Ordering::Relaxed)
+                );
+            }
+            if waited >= 60_000 {
+                return Err(EspError::Msg("createIOSurface failed".into()));
+            }
+            let ms = (25 + waited / 4).min(500);
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            waited += ms;
         };
-        if surf.is_null() {
-            return Err(EspError::Msg("createIOSurface failed".into()));
-        }
+        LIVE_SURFACES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Self {
             io,
             surf,
@@ -421,6 +447,7 @@ impl SharedSurface {
 
 impl Drop for SharedSurface {
     fn drop(&mut self) {
+        LIVE_SURFACES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         unsafe { (self.io.cf_release)(self.surf) };
     }
 }
@@ -628,6 +655,7 @@ impl EspressoProgram {
                 if surf.is_null() {
                     return Err(EspError::Msg("createIOSurface failed".into()));
                 }
+                LIVE_SURFACES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let wrap = msg!((Id) -> Id)(objc.ane_surf, selp("objectWithIOSurface:"), surf);
                 if wrap.is_null() {
                     return Err(EspError::Msg("objectWithIOSurface nil".into()));
@@ -1601,6 +1629,7 @@ fn err_desc(err: Id) -> String {
 
 impl Drop for EspressoProgram {
     fn drop(&mut self) {
+        let pool = unsafe { objc_autoreleasePoolPush() };
         unsafe {
             let opts = self.objc.empty_dict();
             let mut err: Id = std::ptr::null_mut();
@@ -1618,10 +1647,12 @@ impl Drop for EspressoProgram {
             if s.owned {
                 release(s.wrap);
                 unsafe { (self.io.cf_release)(s.surf) };
+                LIVE_SURFACES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
         release(self.model);
         release(self.client);
+        unsafe { objc_autoreleasePoolPop(pool) };
     }
 }
 

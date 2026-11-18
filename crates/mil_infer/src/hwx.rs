@@ -5443,7 +5443,7 @@ struct BlobDecl {
     offset: u64,
 }
 
-fn load_blob_bytes_at(
+pub(crate) fn load_blob_bytes_at(
     path: &std::path::Path,
     offset: u64,
     raw_len: usize,
@@ -5725,6 +5725,54 @@ pub(crate) fn load_mil_weight_u16(
     Err(format!(
         "weight `{target}` is not a blob or constexpr const"
     ))
+}
+
+/// Decl info for a direct `BLOBFILE` const — `(path, offset, shape)`.
+/// `None` when `name` isn't a plain blob decl (constexpr/inline/absent).
+/// Used to defer weight bytes to surface-materialization time so the
+/// runtime never holds every const fill in memory at once.
+pub(crate) fn mil_blob_decl(
+    text: &str,
+    name: &str,
+) -> Option<(String, u64, Vec<usize>)> {
+    const BLOB_PFX: &str = "BLOBFILE(path = string(\"";
+    for raw in text.lines() {
+        let line = raw.trim();
+        let Some(eq) = line.find(" = ") else { continue };
+        let (lhs, rhs) = line.split_at(eq);
+        let rhs = &rhs[3..];
+        let lname = lhs
+            .rsplit([' ', '>'])
+            .next()
+            .unwrap_or("")
+            .trim();
+        if lname != name {
+            continue;
+        }
+        let bp = rhs.find(BLOB_PFX)? + BLOB_PFX.len();
+        let rest = &rhs[bp..];
+        let end = rest.find('"')?;
+        let path = rest[..end].to_string();
+        let offset = rhs
+            .find("offset = uint64(")
+            .and_then(|p| {
+                let a = &rhs[p + 16..];
+                a.find(')').and_then(|e| a[..e].trim().parse::<u64>().ok())
+            })
+            .unwrap_or(0);
+        let shape: Vec<usize> = lhs
+            .find('[')
+            .zip(lhs.find(']'))
+            .map(|(l, r)| {
+                lhs[l + 1..r]
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<usize>().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        return Some((path, offset, shape));
+    }
+    None
 }
 
 /// Resolve a `BLOBFILE` path — `@model_path/` prefixes and relative

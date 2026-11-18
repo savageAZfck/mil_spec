@@ -102,6 +102,7 @@ fn run(mil: &Path, cache: &Path, force: bool) {
     let cfg = CompileCfg {
         cache_dir: cache.to_path_buf(),
         force_recompile: force,
+        profiling: false,
     };
     let t0 = std::time::Instant::now();
     let (prog, map) = Program::compile_auto_cfg(mil, DeviceMask::Ane, &cfg).expect("compile");

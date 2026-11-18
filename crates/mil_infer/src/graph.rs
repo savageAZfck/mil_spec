@@ -1,12 +1,12 @@
 //! `graph` — multi-op graph scheduler: MIL DAG -> per-op emitted HWX
-//! programs wired by IOSurface adoption.
+//! programs wired by host-buffer staging into program-owned surfaces.
 //!
 //! `emit_from_mil` covers whole-graph families that fit one `__text`
 //! (conv chains, fused matmul+softmax partitions). This module handles
 //! the general case: each op becomes its own emitted program, layout
 //! adapters (strided <-> contiguous repacks) are inserted automatically
 //! when producer/consumer currencies differ, and a [`Plan`] records the
-//! surface bindings plus a topological eval order so [`GraphRuntime`]
+//! tensor bindings plus a topological eval order so [`GraphRuntime`]
 //! executes the whole DAG as one unit.
 //!
 //! Op routes (all hw-verified emitters):
@@ -22,7 +22,7 @@
 //!   rms_norm              expanded: mul -> repack -> ones-matvec ->
 //!                         host rsqrt -> mul(x,rvec) -> mul(gamma)?
 
-use crate::espresso::{EspressoProgram, SharedSurface, TensorDesc};
+use crate::espresso::{EspressoProgram, TensorDesc};
 use crate::hwx::{
     self, emit_add4d, emit_attn_v, emit_avw, emit_conv1x1_w, emit_conv_act, emit_conv_chain,
     emit_elementwise2, emit_matmul_ns, emit_outer_t, emit_relu, emit_repack, emit_sigmoid_strided,
@@ -31,56 +31,39 @@ use crate::hwx::{
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::cell::RefCell;
 
-thread_local! {
-    /// Process-wide surface pool. IOSurfaces are a bounded global
-    /// resource — create/destroy churn outruns the driver's reclaim
-    /// path, so released surfaces go back to a bounded reuse pool
-    /// instead of dying. Live set stays at one program's working set
-    /// regardless of runtime count. (GraphRuntime is single-threaded;
-    /// Rc everywhere already.)
-    static SURF_POOL: RefCell<VecDeque<(usize, Rc<SharedSurface>)>> =
-        RefCell::new(VecDeque::new());
-}
-const SURF_POOL_CAP: usize = 4096;
 
-/// Take a surface of at least `bytes` from the pool, else allocate.
-fn surface_pooled(bytes: usize) -> Result<Rc<SharedSurface>, String> {
-    let s = SURF_POOL.with(|p| {
-        let mut p = p.borrow_mut();
-        // smallest fit — keeps big surfaces free for big requests
-        let best = p
-            .iter()
-            .enumerate()
-            .filter(|(_, (b, _))| *b >= bytes)
-            .min_by_key(|(_, (b, _))| *b)
-            .map(|(i, _)| i);
-        best.map(|i| p.remove(i).unwrap().1)
-    });
-    match s {
-        Some(surf) => {
-            for b in surf.bytes_mut().iter_mut() {
-                *b = 0;
+/// Copy `src` (layout `sd`) into program surface `dst` (layout `dd`),
+/// elementwise through each side's desc offsets; memcpy fast-path when
+/// strides match.
+fn stage_tensor(dst: &mut [u8], dd: &TensorDesc, src: &[u8], sd: &TensorDesc) {
+    if dd.plane_stride == sd.plane_stride
+        && dd.row_stride == sd.row_stride
+        && dd.batch_stride == sd.batch_stride
+        && dd.depth_stride == sd.depth_stride
+        && dd.elem == sd.elem
+    {
+        let n = dst.len().min(src.len());
+        dst[..n].copy_from_slice(&src[..n]);
+        return;
+    }
+    for b in 0..dd.n.max(1) {
+        for c in 0..dd.k.max(1) {
+            for h in 0..dd.h.max(1) {
+                for w in 0..dd.w.max(1) {
+                    let o = dd.offset(b, 0, c, h, w);
+                    let so = sd.offset(b, 0, c, h, w);
+                    if o + 2 <= dst.len() && so + 2 <= src.len() {
+                        dst[o..o + 2].copy_from_slice(&src[so..so + 2]);
+                    }
+                }
             }
-            Ok(surf)
         }
-        None => SharedSurface::new(bytes).map(Rc::new).map_err(|e| format!("{e:?}")),
     }
 }
 
-fn surface_release(surf: Rc<SharedSurface>) {
-    SURF_POOL.with(|p| {
-        let mut p = p.borrow_mut();
-        p.push_back((surf.bytes().len(), surf));
-        while p.len() > SURF_POOL_CAP {
-            p.pop_front();
-        }
-    });
-}
-
-/// Physical tensor currency — byte-level layouts that must match for
-/// zero-copy surface adoption.
+/// Physical tensor currency — byte-level layouts used by `stage_tensor`
+/// when moving a tensor between a host buffer and a program surface.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Cur {
     /// One fp16 per 64B channel plane (`[1,N,1,1]`, plane_stride 64).
@@ -94,10 +77,11 @@ enum Cur {
 /// Where a program input port draws its bytes.
 #[derive(Clone, Debug)]
 pub enum BindSrc {
-    /// Function input or const-filled surface — the program keeps its
-    /// own surface; the host writes through [`GraphRuntime::write_ext`].
+    /// Function input or persistent tensor — the program keeps its
+    /// own input surface; the host buffer is written through
+    /// [`GraphRuntime::write_ext`] and staged in before each eval.
     Ext(String),
-    /// Adopt `nodes[i]`'s output surface (port 0).
+    /// Stage `nodes[i]`'s harvested output bytes into this input port.
     Out(usize),
 }
 
@@ -138,6 +122,20 @@ pub enum Node {
     Host(HostOp),
 }
 
+/// Source for a const-filled external. `Blob` defers the weight read
+/// to host-buffer materialization; `Values` holds eagerly-computed
+/// (dequantized) f32 data.
+#[derive(Clone)]
+pub enum ConstFill {
+    Blob {
+        dir: PathBuf,
+        path: String,
+        offset: u64,
+        numel: usize,
+    },
+    Values(Vec<f32>),
+}
+
 pub struct Plan {
     pub nodes: Vec<Node>,
     /// Eval order over `nodes` — adapters appear before their consumer.
@@ -145,8 +143,10 @@ pub struct Plan {
     /// External inputs by name -> every (node, port) bound to it.
     pub externals: Vec<(String, Vec<(usize, usize)>)>,
     /// Externals pre-filled from blob consts (`name`, fp16 values laid
-    /// out strided over `n` channels).
-    pub const_fills: Vec<(String, Vec<f32>)>,
+    /// out strided over `n` channels). Blob fills stay as file
+    /// references — weight bytes are read when the host buffer
+    /// materializes, not held in the plan.
+    pub const_fills: Vec<(String, ConstFill)>,
     /// Function outputs -> producing node index.
     pub outputs: Vec<(String, usize)>,
 }
@@ -473,7 +473,7 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
     // pending bindings: node idx -> (arg names, want currencies)
     let mut wants: Vec<(usize, Vec<(String, Cur)>)> = Vec::new();
     let mut ext_uses: Vec<(String, usize, usize)> = Vec::new();
-    let mut const_fills: Vec<(String, Vec<f32>)> = Vec::new();
+    let mut const_fills: Vec<(String, ConstFill)> = Vec::new();
 
     let push_prog = |nodes: &mut Vec<Node>,
                      created: &mut Vec<usize>,
@@ -930,8 +930,19 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
                 bs.push(BindSrc::Out(src));
             } else {
                 // external or const-fill or virtual rvec
-                if let Some(vals) = blob_f32(name) {
-                    const_fills.push((name.clone(), vals));
+                if let Some((path, offset, shape)) = hwx::mil_blob_decl(&text, name) {
+                    let numel: usize = shape.iter().product();
+                    const_fills.push((
+                        name.clone(),
+                        ConstFill::Blob {
+                            dir: mil_dir.clone(),
+                            path,
+                            offset,
+                            numel,
+                        },
+                    ));
+                } else if let Some(vals) = blob_f32(name) {
+                    const_fills.push((name.clone(), ConstFill::Values(vals)));
                 }
                 ext_uses.push((name.clone(), *nidx, port));
                 bs.push(BindSrc::Ext(name.clone()));
@@ -983,17 +994,22 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
 pub struct GraphRuntime {
     pub progs: Vec<Option<EspressoProgram>>,
     pub plan: Plan,
-    /// One shared surface per node output (Rc: aliased nodes share the
-    /// bound input surface — e.g. in-place KV-cache adds).
-    bufs: Vec<Option<Rc<SharedSurface>>>,
-    /// External input surfaces by name.
-    ext_bufs: HashMap<String, Rc<SharedSurface>>,
+    /// Host-side byte buffer per node output — harvested from the
+    /// program's own output surface after each eval.
+    bufs: Vec<Option<Vec<u8>>>,
+    /// External / persistent tensors by name, as host byte buffers.
+    ext_bufs: HashMap<String, Vec<u8>>,
     /// Producer output descs cached from each node's first load.
     out_descs: Vec<Option<TensorDesc>>,
     ext_descs: HashMap<String, TensorDesc>,
-    /// Ext writes recorded before the surface materialized (first
+    /// Ext writes recorded before the buffer materialized (first
     /// consumer bind creates it).
     pending: HashMap<String, Vec<ExtWrite>>,
+    /// Persistent ext writes (const fills) — applied on EVERY
+    /// materialization of their surface, unlike `pending` which is
+    /// consumed once. Weight blobs must re-fill after release_all
+    /// drains ext_bufs or the next call computes on zeroed weights.
+    fills: HashMap<String, Vec<ExtWrite>>,
     /// Resident node indices, oldest first.
     lru: VecDeque<usize>,
 }
@@ -1001,10 +1017,14 @@ pub struct GraphRuntime {
 type ExtWrite = Rc<dyn Fn(&mut [u8], &TensorDesc)>;
 
 impl GraphRuntime {
-    /// Wire the plan without loading every program: surfaces are
-    /// runtime-owned and programs load lazily on first eval, with
-    /// LRU-style eviction whenever `loadModel` reports resource
-    /// exhaustion (the ANE residency pool is finite).
+    /// Wire the plan without loading every program: programs load
+    /// lazily on first eval with their own IO surfaces, and LRU-evict
+    /// whenever `loadModel` reports resource exhaustion (the ANE
+    /// residency pool is finite). Tensor bytes live in host buffers
+    /// and stage into program surfaces per eval — no cross-program
+    /// surface sharing (adopted surfaces stayed charged to this
+    /// process until aned's async unbind drained, blowing the
+    /// 16,384-live-IOSurface cap by ~l14 of a 36-layer decode).
     pub fn load(plan: Plan) -> Result<Self, String> {
         let n = plan.nodes.len();
         let mut rt = Self {
@@ -1014,19 +1034,47 @@ impl GraphRuntime {
             ext_bufs: HashMap::new(),
             ext_descs: HashMap::new(),
             pending: HashMap::new(),
+            fills: HashMap::new(),
             lru: VecDeque::new(),
             plan,
         };
         let fills = rt.plan.const_fills.clone();
-        for (name, vals) in fills {
-            rt.write_ext(&name, move |b, d| {
-                for (i, v) in vals.iter().enumerate() {
-                    let o = d.offset(0, 0, i as u64, 0, 0);
-                    if o + 2 <= b.len() {
-                        b[o..o + 2].copy_from_slice(&half::f16::from_f32(*v).to_le_bytes());
-                    }
+        for (name, fill) in fills {
+            match fill {
+                ConstFill::Values(vals) => {
+                    rt.fill_ext(&name, move |b, d| {
+                        for (i, v) in vals.iter().enumerate() {
+                            let o = d.offset(0, 0, i as u64, 0, 0);
+                            if o + 2 <= b.len() {
+                                b[o..o + 2]
+                                    .copy_from_slice(&half::f16::from_f32(*v).to_le_bytes());
+                            }
+                        }
+                    });
                 }
-            });
+                ConstFill::Blob {
+                    dir,
+                    path,
+                    offset,
+                    numel,
+                } => {
+                    rt.fill_ext(&name, move |b, d| {
+                        let resolved = hwx::resolve_blob(&dir, &path);
+                        if let Ok(raw) = hwx::load_blob_bytes_at(
+                            &resolved,
+                            offset,
+                            numel.saturating_mul(2),
+                        ) {
+                            for (i, c) in raw.chunks_exact(2).enumerate() {
+                                let o = d.offset(0, 0, i as u64, 0, 0);
+                                if o + 2 <= b.len() {
+                                    b[o..o + 2].copy_from_slice(&c[..2]);
+                                }
+                            }
+                        }
+                    });
+                }
+            }
         }
         Ok(rt)
     }
@@ -1038,51 +1086,31 @@ impl GraphRuntime {
         self.lru.push_back(i);
     }
 
-    /// The shared surface backing node `i`'s output, honoring in-place
-    /// aliases (`add`'s out aliases its cache input).
-    fn node_surf(&self, i: usize) -> Option<Rc<SharedSurface>> {
-        if let Node::Prog { alias, binds, .. } = &self.plan.nodes[i] {
-            for (o, ii) in alias {
-                if *o == 0 {
-                    return self.port_surf(i, *ii);
-                }
-            }
-            let _ = binds;
-        }
-        self.bufs[i].clone()
-    }
 
-    /// The surface bound to node `i` input port `p`.
-    fn port_surf(&self, i: usize, p: usize) -> Option<Rc<SharedSurface>> {
-        if let Node::Prog { binds, .. } = &self.plan.nodes[i] {
-            match binds.get(p)? {
-                BindSrc::Ext(name) => self.ext_bufs.get(name).cloned(),
-                BindSrc::Out(src) => self.node_surf(*src),
-            }
-        } else {
-            None
+    /// Materialize the ext host buffer for `name` using `desc`, apply
+    /// persistent fills then pending writes. Host-side only — bytes get
+    /// staged into each consumer program's own input surfaces.
+    fn ext_surface(&mut self, name: &str, desc: &TensorDesc) -> Result<(), String> {
+        if self.ext_bufs.contains_key(name) {
+            return Ok(());
         }
-    }
-
-    /// Materialize the ext surface for `name` using `desc`, apply
-    /// pending writes.
-    fn ext_surface(&mut self, name: &str, desc: &TensorDesc) -> Result<Rc<SharedSurface>, String> {
-        if let Some(s) = self.ext_bufs.get(name) {
-            return Ok(s.clone());
-        }
-        let rc = surface_pooled(desc.bytes())
-            .map_err(|e| format!("ext {name}: {e}"))?;
+        let mut buf = vec![0u8; desc.bytes()];
         self.ext_descs.insert(name.to_string(), desc.clone());
+        if let Some(ws) = self.fills.get(name) {
+            for w in ws {
+                w(&mut buf, desc);
+            }
+        }
         if let Some(ws) = self.pending.remove(name) {
             for w in ws {
-                w(rc.bytes_mut(), desc);
+                w(&mut buf, desc);
             }
         }
-        self.ext_bufs.insert(name.to_string(), rc.clone());
-        Ok(rc)
+        self.ext_bufs.insert(name.to_string(), buf);
+        Ok(())
     }
 
-    /// Load program `i` and bind all ports to runtime surfaces.
+    /// Load program `i` — its own surfaces carry all IO.
     fn load_node(&mut self, i: usize) -> Result<(), String> {
         let Node::Prog {
             path,
@@ -1095,117 +1123,33 @@ impl GraphRuntime {
             return Ok(());
         };
         let path = path.clone();
-        let binds = binds.clone();
         let alias = alias.clone();
-        let _ = zero.clone(); // fresh SharedSurfaces are zeroed at creation
+        let _ = binds;
+        let _ = zero.clone(); // program-created input surfaces are zeroed at creation
         let mut p = EspressoProgram::load_precompiled(&path, &[])
             .map_err(|e| format!("{}: {e:?}", path.display()))?;
-        // producer output desc + surface
         if self.out_descs[i].is_none() {
             self.out_descs[i] = p.output_descs.first().cloned();
         }
-        let aliased = alias.iter().any(|(o, _)| *o == 0);
-        if !aliased {
-            if self.bufs[i].is_none() {
-                let bytes = self.out_descs[i]
-                    .as_ref()
-                    .map(|d| d.bytes())
-                    .unwrap_or(16384);
-                self.bufs[i] = Some(
-                    surface_pooled(bytes).map_err(|e| format!("n{i} out: {e}"))?,
-                );
-            }
-            let s = self.bufs[i].clone().unwrap();
-            p.adopt_output(0, s.as_ptr())
-                .map_err(|e| format!("n{i} adopt out: {e:?}"))?;
-        }
-        // input ports
-        for (port, b) in binds.iter().enumerate() {
-            let surf = match b {
-                BindSrc::Out(src) => self.node_surf(*src),
-                BindSrc::Ext(name) => {
-                    let d = p.input_descs[port].clone();
-                    Some(self.ext_surface(name, &d)?)
-                }
-            };
-            if let Some(s) = surf {
-                p.adopt_input(port, s.as_ptr())
-                    .map_err(|e| format!("bind node{i} port{port}: {e:?}"))?;
-            }
-        }
-        // in-place aliases: out port rides the input's surface
+        // Ports stay on the program's OWN surfaces — foreign-surface
+        // adoption keeps the kernel object charged to us until aned
+        // finishes unbinding it (unobservable from here); ~1.1k binds
+        // per layer blew the 16,384-IOSurface cap by ~l14, and pooled
+        // reuse raced the in-flight unbinds (nondeterministic output).
+        // Tensor bytes stage into the program's surfaces per eval.
         for (o, ii) in &alias {
-            if let Some(s) = self.port_surf(i, *ii) {
-                p.adopt_output(*o, s.as_ptr())
-                    .map_err(|e| format!("n{i} alias: {e:?}"))?;
-                if *o == 0 {
-                    self.bufs[i] = Some(s);
-                }
-            }
+            p.alias_out_to_in(*o, *ii);
         }
         self.progs[i] = Some(p);
         self.touch(i);
         Ok(())
     }
 
-    /// Re-bind resident program `i` to this pass's surfaces. `adopt_*`
-    /// is a retain+wrap swap (~µs) versus a ~ms `load_precompiled`, so
-    /// programs stay resident across `run()` calls while liveness
-    /// recycles the surfaces beneath them — each pass re-points every
-    /// port at the live `Rc` instead of invalidating the program.
+    /// Resident programs keep their own surfaces — nothing rebinds;
+    /// staging happens inside the eval step.
     fn rebind_node(&mut self, i: usize) -> Result<(), String> {
-        let Node::Prog { binds, alias, .. } = &self.plan.nodes[i] else {
-            return Ok(());
-        };
-        let binds = binds.clone();
-        let alias = alias.clone();
-        let mut p = self.progs[i].take().unwrap();
-        let r = (|| {
-            let aliased = alias.iter().any(|(o, _)| *o == 0);
-            if !aliased && self.bufs[i].is_none() {
-                let bytes = self
-                    .out_descs[i]
-                    .as_ref()
-                    .map(|d| d.bytes())
-                    .unwrap_or(16384);
-                self.bufs[i] = Some(
-                    surface_pooled(bytes).map_err(|e| format!("n{i} out: {e}"))?,
-                );
-            }
-            if !aliased {
-                let s = self.bufs[i].clone().unwrap();
-                p.adopt_output(0, s.as_ptr())
-                    .map_err(|e| format!("n{i} adopt out: {e:?}"))?;
-            }
-            for (port, b) in binds.iter().enumerate() {
-                let surf = match b {
-                    BindSrc::Out(src) => self.node_surf(*src),
-                    BindSrc::Ext(name) => {
-                        let d = p.input_descs[port].clone();
-                        Some(self.ext_surface(name, &d)?)
-                    }
-                };
-                if let Some(s) = surf {
-                    p.adopt_input(port, s.as_ptr())
-                        .map_err(|e| format!("bind node{i} port{port}: {e:?}"))?;
-                }
-            }
-            for (o, ii) in &alias {
-                if let Some(s) = self.port_surf(i, *ii) {
-                    p.adopt_output(*o, s.as_ptr())
-                        .map_err(|e| format!("n{i} alias: {e:?}"))?;
-                    if *o == 0 {
-                        self.bufs[i] = Some(s);
-                    }
-                }
-            }
-            Ok(())
-        })();
-        self.progs[i] = Some(p);
-        if r.is_ok() {
-            self.touch(i);
-        }
-        r
+        self.touch(i);
+        Ok(())
     }
 
     /// Ensure node `i`'s program is resident; on resource exhaustion
@@ -1241,22 +1185,48 @@ impl GraphRuntime {
                         .map(|p| self.lru.remove(p).unwrap());
                     match victim {
                         Some(v) => self.progs[v] = None,
-                        None => return Err(e),
+                        None => {
+                            // No resident program left in this graph to
+                            // evict — the pressure is external: the
+                            // previous layer's ~1k async unloads are
+                            // still draining through aned's queue. Back
+                            // off until the device pool frees, then fail.
+                            let mut waited = 0u64;
+                            loop {
+                                let ms = (25 + waited / 4).min(500);
+                                std::thread::sleep(
+                                    std::time::Duration::from_millis(ms),
+                                );
+                                waited += ms;
+                                if self.load_node(i).is_ok() {
+                                    if waited > 100 {
+                                        eprintln!(
+                                            "ensure n{i}: loaded after \
+                                             {waited}ms of ANE-drain backoff"
+                                        );
+                                    }
+                                    return Ok(());
+                                }
+                                if waited >= 10_000 {
+                                    return Err(e);
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    /// Write external input `name` into its shared surface via
+    /// Write external input `name` into its host buffer via
     /// `f(bytes, desc)`; defers if no consumer has materialized it yet.
     pub fn write_ext(
         &mut self,
         name: &str,
         f: impl Fn(&mut [u8], &crate::espresso::TensorDesc) + 'static,
     ) {
-        if let (Some(s), Some(d)) = (self.ext_bufs.get(name), self.ext_descs.get(name)) {
-            f(s.bytes_mut(), d);
+        if let (Some(s), Some(d)) = (self.ext_bufs.get_mut(name), self.ext_descs.get(name)) {
+            f(s.as_mut_slice(), d);
             return;
         }
         self.pending
@@ -1265,8 +1235,26 @@ impl GraphRuntime {
             .push(Rc::new(f));
     }
 
+    /// Persistent ext write — re-applied on EVERY materialization of
+    /// `name`'s buffer. Const fills / weight blobs use this so they
+    /// re-fill after `release_all` drains `ext_bufs` (`pending` writes
+    /// are consumed on first materialization).
+    pub fn fill_ext(
+        &mut self,
+        name: &str,
+        f: impl Fn(&mut [u8], &crate::espresso::TensorDesc) + 'static,
+    ) {
+        if let (Some(s), Some(d)) = (self.ext_bufs.get_mut(name), self.ext_descs.get(name)) {
+            f(s.as_mut_slice(), d);
+        }
+        self.fills
+            .entry(name.to_string())
+            .or_default()
+            .push(Rc::new(f));
+    }
+
     pub fn output(&self, i: usize) -> &[u8] {
-        self.bufs[i].as_ref().map(|s| s.bytes()).unwrap_or(&[])
+        self.bufs[i].as_deref().unwrap_or(&[])
     }
     pub fn out_desc(&self, i: usize) -> crate::espresso::TensorDesc {
         self.out_descs[i].clone().unwrap_or_default()
@@ -1288,8 +1276,8 @@ impl GraphRuntime {
     }
 
     /// Evict every resident program — frees the runtime's share of the
-    /// ANE residency pool. Surfaces persist; programs lazily reload on
-    /// the next `run`. For multi-runtime hosts (one GraphRuntime per
+    /// ANE residency pool. Host buffers persist; programs lazily reload
+    /// on the next `run`. For multi-runtime hosts (one GraphRuntime per
     /// compiled program) the pool is global, so a finished call should
     /// give its residents back.
     pub fn release_residents(&mut self) {
@@ -1299,31 +1287,25 @@ impl GraphRuntime {
         self.lru.clear();
     }
 
-    /// Drop everything — resident programs AND every IOSurface. For
+    /// Drop everything — resident programs AND every host buffer. For
     /// hosts that stage all inputs per call and mirror state outside
     /// the runtime (coyote's VM), nothing here needs to survive a
-    /// call boundary; both bounded pools (programs, IOSurfaces) get
+    /// call boundary; both bounded pools (programs, host memory) get
     /// fully released. Pending ext writes are kept — they re-apply
-    /// when the surface re-materializes.
+    /// when the buffer re-materializes; persistent `fills` too.
     pub fn release_all(&mut self) {
         self.release_residents();
-        // surfaces go back to the pool for reuse — create/destroy
-        // churn outruns the driver's reclaim path.
         for b in self.bufs.iter_mut() {
-            if let Some(s) = b.take() {
-                surface_release(s);
-            }
+            *b = None;
         }
         for d in self.out_descs.iter_mut() {
             *d = None;
         }
-        for (_, s) in self.ext_bufs.drain() {
-            surface_release(s);
-        }
+        self.ext_bufs.clear();
         self.ext_descs.clear();
     }
 
-    /// Zero all persistent state surfaces (KV-cache accumulators marked
+    /// Zero all persistent state buffers (KV-cache accumulators marked
     /// with `zero` ports) for a fresh decode horizon without unloading
     /// resident ANE programs.
     pub fn reset_state(&mut self) {
@@ -1336,24 +1318,34 @@ impl GraphRuntime {
             }
         }
         for (i, port) in ports {
-            if let Some(s) = self.port_surf(i, port) {
-                for b in s.bytes_mut().iter_mut() {
-                    *b = 0;
+            if let Node::Prog { binds, .. } = &self.plan.nodes[i] {
+                match binds.get(port) {
+                    Some(BindSrc::Ext(name)) => {
+                        if let Some(b) = self.ext_bufs.get_mut(name) {
+                            b.iter_mut().for_each(|v| *v = 0);
+                        }
+                    }
+                    Some(BindSrc::Out(src)) => {
+                        if let Some(Some(b)) = self.bufs.get_mut(*src) {
+                            b.iter_mut().for_each(|v| *v = 0);
+                        }
+                    }
+                    None => {}
                 }
             }
         }
     }
 
     /// Execute the whole graph once in scheduled order; programs load
-    /// lazily on first use, stay resident across passes, and re-bind
-    /// their surfaces each pass (`rebind_node` — `adopt_*` is a
-    /// retain+wrap swap, not a reload). Intermediate node-output
-    /// surfaces are recycled as soon as their last consumer has run —
-    /// without this a wide graph materializes one IOSurface per node
-    /// and blows the global surface budget mid-run. Recycled surfaces
-    /// may be re-adopted by later nodes; that is safe because every
-    /// resident program re-points its ports at the live surfaces
-    /// immediately before it evals.
+    /// lazily on first use and stay resident across passes. Each eval
+    /// stages input bytes from host buffers into the program's own
+    /// surfaces, runs, then harvests output bytes back — no cross-
+    /// program surface sharing. Intermediate node-output buffers are
+    /// freed as soon as their last consumer has run, keeping host
+    /// memory bounded on wide graphs. Ext-bound input ports marked in
+    /// `alias` are persistent in-place tensors (KV caches): after eval
+    /// their mutated surface bytes are written back into `ext_bufs` so
+    /// later consumers stage current state.
     pub fn run(&mut self) -> Result<(), String> {
         // liveness: consumers of each node's output surface
         let mut remaining = vec![0usize; self.plan.nodes.len()];
@@ -1378,16 +1370,16 @@ impl GraphRuntime {
                 },
             }
         }
-        // Resident programs are NOT evicted when surfaces recycle:
-        // `rebind_node` re-points every port at the live surface each
-        // pass, so pooled/re-adopted IOSurfaces can never leave a
-        // stale binding. Residency persists across `run()` calls;
-        // ANE memory pressure is handled by `ensure`'s LRU eviction.
+        // Residency persists across `run()` calls — host buffers own
+        // no ANE bindings, so there is no stale-surface hazard to
+        // rebind against. ANE memory pressure is handled by `ensure`'s
+        // LRU eviction.
         let t_run = std::time::Instant::now();
         let mut t_ensure = std::time::Duration::ZERO;
         let mut t_eval = std::time::Duration::ZERO;
         let mut n_loads = 0usize;
-        for i in self.plan.order.clone() {
+        for i in self.plan.order.clone().iter() {
+            let i = *i;
             // sources this node consumes — their use counts drop once it ran
             let consumed: Vec<usize> = match &self.plan.nodes[i] {
                 Node::Prog { binds, .. } => binds
@@ -1406,6 +1398,11 @@ impl GraphRuntime {
                     }
                 },
             };
+            // cloned up-front so the dispatch borrow ends before &mut calls
+            let (binds_c, alias_c) = match &self.plan.nodes[i] {
+                Node::Prog { binds, alias, .. } => (binds.clone(), alias.clone()),
+                _ => (Vec::new(), Vec::new()),
+            };
             match &self.plan.nodes[i] {
                 Node::Prog { .. } => {
                     let was = self.progs[i].is_some();
@@ -1420,11 +1417,67 @@ impl GraphRuntime {
                         n_loads += 1;
                     }
                     let t1 = std::time::Instant::now();
-                    self.progs[i]
-                        .as_ref()
-                        .unwrap()
-                        .eval()
-                        .map_err(|e| format!("node {i}: {e:?}"))?;
+                    // Stage input bytes into the program's own surfaces:
+                    // ext tensors from ext_bufs, producer outs from bufs.
+                    let binds = binds_c;
+                    let alias = alias_c;
+                    let mut ext_stage: Vec<(usize, String, TensorDesc)> = Vec::new();
+                    let mut out_stage: Vec<(usize, usize)> = Vec::new();
+                    {
+                        let p = self.progs[i].as_ref().unwrap();
+                        for (port, b) in binds.iter().enumerate() {
+                            match b {
+                                BindSrc::Ext(name) => ext_stage.push((
+                                    port,
+                                    name.clone(),
+                                    p.input_descs[port].clone(),
+                                )),
+                                BindSrc::Out(src) => out_stage.push((port, *src)),
+                            }
+                        }
+                    }
+                    for (_, name, d) in &ext_stage {
+                        self.ext_surface(name, d)?;
+                    }
+                    let mut wb: Vec<(String, Vec<u8>)> = Vec::new();
+                    {
+                        let p = self.progs[i].as_mut().unwrap();
+                        for (port, name, d) in &ext_stage {
+                            let srcb = self.ext_bufs[name.as_str()].clone();
+                            let sd = self.ext_descs[name.as_str()].clone();
+                            stage_tensor(p.input_mut(*port), d, &srcb, &sd);
+                        }
+                        for (port, src) in &out_stage {
+                            let sd = self.out_descs[*src].clone().unwrap_or_default();
+                            let sb: Vec<u8> =
+                                self.bufs[*src].clone().unwrap_or_default();
+                            let dd = p.input_descs[*port].clone();
+                            stage_tensor(p.input_mut(*port), &dd, &sb, &sd);
+                        }
+                        p.eval()
+                            .map_err(|e| format!("node {i}: {e:?}"))?;
+                        // Harvest out0 — an aliased out0 rides the input
+                        // surface (in-place KV accumulators).
+                        let out = if let Some((_, ii)) = alias.iter().find(|(o, _)| *o == 0) {
+                            p.input_bytes(*ii).to_vec()
+                        } else {
+                            p.output(0).to_vec()
+                        };
+                        // Write-back: an Ext-bound input surface is the
+                        // persistent tensor (KV accumulator, in-place
+                        // state). The eval's in-place writes live on the
+                        // program-owned surface — mirror them into
+                        // ext_bufs so later consumers stage current data.
+                        for (port, name, _) in &ext_stage {
+                            if alias.iter().any(|(_, ii)| ii == port) {
+                                wb.push((name.clone(), p.input_bytes(*port).to_vec()));
+                            }
+                        }
+                        self.bufs[i] = Some(out);
+                    }
+                    for (name, b) in wb {
+                        self.ext_bufs.insert(name, b);
+                    }
                     t_eval += t1.elapsed();
                 }
                 Node::Host(HostOp::RsqrtBroadcast {
@@ -1438,25 +1491,34 @@ impl GraphRuntime {
                         (src.clone(), ext.clone(), *n, *eps, gamma.clone());
                     let (surf, d) = match &src {
                         BindSrc::Out(idx) => {
-                            (self.bufs[*idx].clone().unwrap(), self.out_desc(*idx))
+                            (self.bufs[*idx]
+                                .as_deref()
+                                .unwrap_or_else(|| panic!("hostop: producer bufs[{idx}] empty")),
+                            self.out_desc(*idx))
                         }
                         BindSrc::Ext(name) => {
                             if !self.ext_bufs.contains_key(name) {
                                 if let Some((_, uses)) =
                                     self.plan.externals.iter().find(|(nm, _)| nm == name)
                                 {
-                                    if let Some(&(ni, _)) = uses.first() {
+                                    if let Some(&(ni, port)) = uses.first() {
                                         self.ensure(ni)?;
+                                        let d = self.progs[ni]
+                                            .as_ref()
+                                            .unwrap()
+                                            .input_descs[port]
+                                            .clone();
+                                        self.ext_surface(name, &d)?;
                                     }
                                 }
                             }
                             (
-                                self.ext_bufs.get(name).unwrap().clone(),
+                                self.ext_bufs.get(name).unwrap().as_slice(),
                                 self.ext_descs.get(name).unwrap().clone(),
                             )
                         }
                     };
-                    let b = surf.bytes();
+                    let b = surf;
                     // element axis: small-n layouts use channels (k), the
                     // n>256 family moves elements to the batch dim (n),
                     // and W handles the strided-vector fallthrough.
@@ -1496,25 +1558,34 @@ impl GraphRuntime {
                     let (src, ext, n) = (src.clone(), ext.clone(), *n);
                     let (surf, d) = match &src {
                         BindSrc::Out(idx) => {
-                            (self.bufs[*idx].clone().unwrap(), self.out_desc(*idx))
+                            (self.bufs[*idx]
+                                .as_deref()
+                                .unwrap_or_else(|| panic!("hostop: producer bufs[{idx}] empty")),
+                            self.out_desc(*idx))
                         }
                         BindSrc::Ext(name) => {
                             if !self.ext_bufs.contains_key(name) {
                                 if let Some((_, uses)) =
                                     self.plan.externals.iter().find(|(nm, _)| nm == name)
                                 {
-                                    if let Some(&(ni, _)) = uses.first() {
+                                    if let Some(&(ni, port)) = uses.first() {
                                         self.ensure(ni)?;
+                                        let d = self.progs[ni]
+                                            .as_ref()
+                                            .unwrap()
+                                            .input_descs[port]
+                                            .clone();
+                                        self.ext_surface(name, &d)?;
                                     }
                                 }
                             }
                             (
-                                self.ext_bufs.get(name).unwrap().clone(),
+                                self.ext_bufs.get(name).unwrap().as_slice(),
                                 self.ext_descs.get(name).unwrap().clone(),
                             )
                         }
                     };
-                    let b = surf.bytes();
+                    let b = surf;
                     let off = |d: &crate::espresso::TensorDesc, i: u64| {
                         if d.k > 1 {
                             d.offset(0, 0, i, 0, 0)
@@ -1546,20 +1617,17 @@ impl GraphRuntime {
             for s in consumed {
                 remaining[s] = remaining[s].saturating_sub(1);
                 if remaining[s] == 0 && !pinned[s] {
-                    if let Some(surf) = self.bufs[s].take() {
-                        if Rc::strong_count(&surf) == 1 {
-                            surface_release(surf);
-                        }
-                    }
+                    self.bufs[s] = None;
                 }
             }
         }
         eprintln!(
-            "graph run: {} nodes, {n_loads} loads, ensure {:?}, eval {:?}, total {:?}",
+            "graph run: {} nodes, {n_loads} loads, ensure {:?}, eval {:?}, total {:?} (live_surf={})",
             self.plan.order.len(),
             t_ensure,
             t_eval,
-            t_run.elapsed()
+            t_run.elapsed(),
+            crate::espresso::LIVE_SURFACES.load(std::sync::atomic::Ordering::Relaxed)
         );
         Ok(())
     }
