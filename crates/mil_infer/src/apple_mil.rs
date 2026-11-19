@@ -298,8 +298,29 @@ const DEFAULT_RMS_EPS: f32 = 1e-5;
 
 /// Translate coyote MIL text (blob consts resolved against mil_dir).
 pub fn translate(text: &str, mil_dir: &Path) -> Result<AppleMil, String> {
-    let (ops, _) = hwx::mil_ops(text);
+    let (mut ops, _) = hwx::mil_ops(text);
     let sigs = hwx::func_input_shapes(text);
+    // In-place parity with the HWX runtime: there a packed 4-D `add` on a
+    // function input X writes X's surface in place, and programs run in
+    // MIL order, so every later reader of X sees the new value (e.g.
+    // decode attends over the cache after `kv.k[pos] = ...`). One Apple
+    // program has no such side effect, so later reads of X are rewritten
+    // to the add's result here; the last such result is written back.
+    let mut cur: HashMap<String, String> = HashMap::new();
+    let mut inplace_src: Vec<(String, String)> = Vec::new(); // (result, input)
+    for o in ops.iter_mut() {
+        let x0 = arg(o, "x").map(str::to_string);
+        for (_, v) in o.args.iter_mut() {
+            if let Some(n) = cur.get(v.as_str()) {
+                *v = n.clone();
+            }
+        }
+        let packed = o.op == "add" && o.shape.len() == 4 && o.shape[1] > 1 && o.shape[3] > 1;
+        if let Some(x) = x0.filter(|x| packed && sigs.iter().any(|(n, _)| n == x)) {
+            cur.insert(x.clone(), o.result.clone());
+            inplace_src.push((o.result.clone(), x));
+        }
+    }
     let consts = parse_consts(text);
     let outputs = func_outputs(text);
     if outputs.is_empty() {
@@ -493,15 +514,10 @@ pub fn translate(text: &str, mil_dir: &Path) -> Result<AppleMil, String> {
     let _ = writeln!(text_out, "    func main<ios18>({}) {{", params.join(", "));
     text_out.push_str(&em.body);
     let _ = writeln!(text_out, "    }} -> ({});\n}}", outputs.join(", "));
-    let inplace: Vec<(String, String)> = ops
+    let inplace: Vec<(String, String)> = inplace_src
         .iter()
-        .filter(|o| o.op == "add" && o.shape.len() == 4 && o.shape[1] > 1 && o.shape[3] > 1)
-        .filter(|o| outputs.contains(&o.result))
-        .filter_map(|o| {
-            arg(o, "x")
-                .filter(|x| sigs.iter().any(|(n, _)| n == x))
-                .map(|x| (o.result.clone(), x.to_string()))
-        })
+        .filter(|(r, x)| outputs.contains(r) && cur.get(x) == Some(r))
+        .cloned()
         .collect();
     Ok(AppleMil {
         text: text_out,
@@ -630,6 +646,21 @@ mod tests {
             .collect();
         assert!(bad.is_empty(), "missing {bad:?} in:\n{}", p.text);
         assert!(!p.text.contains("relu"), "dead op kept:\n{}", p.text);
+
+        // in-place accumulator: reads of kv after `kv + outer` see the sum
+        let src2 = r#"program(1.3)
+{
+    func main<ios18>(tensor<fp16, [1, 4, 1, 1]> pos, tensor<fp16, [1, 1, 1, 3]> v, tensor<fp16, [1, 4, 1, 3]> kv) {
+        tensor<bool, []> __bt = const()[val = bool(true)];
+        tensor<fp16, [1, 4, 1, 3]> o1 = matmul(x = pos, y = v, transpose_x = __bt)[name = string("o1")];
+        tensor<fp16, [1, 4, 1, 3]> k2 = add(x = kv, y = o1)[name = string("k2")];
+        tensor<fp16, [1, 1, 1, 3]> r = matmul(x = pos, y = kv, transpose_x = __bt)[name = string("r")];
+    } -> (r, k2);
+}
+"#;
+        let p2 = translate(src2, &dir).unwrap();
+        assert!(p2.text.contains("_v_r = matmul(x = _c_pos, y = _v_k2"), "stale read:\n{}", p2.text);
+        assert_eq!(p2.inplace, vec![("k2".to_string(), "kv".to_string())]);
         // header count=1, version=2; one 64 B meta + 24 B payload padded to 64
         assert_eq!(&p.weights[0..8], &[1, 0, 0, 0, 2, 0, 0, 0]);
         assert_eq!(p.weights.len(), 64 + 64 + 64);
