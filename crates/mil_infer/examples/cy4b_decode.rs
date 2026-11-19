@@ -486,20 +486,27 @@ fn main() {
 
     // ---- decode ------------------------------------------------------------
     // serve mode (`cy4b_decode <st> serve`): stdin line protocol over
-    // the resident decode state —
-    //   gen <n> <id> <id> ...   reset seq to ids, run n forwards,
-    //                           prints "tok <id>" per step
-    //   step <id>               one forward, prints "tok <next>"
-    //   reset                   clear sequence position (KV masked)
-    //   ping / quit
+    // the resident decode state. Teacher-forced sequence model:
+    //   seq[pos] is always the token embedded at position pos;
+    //   positions < prompt_len-1 are prompt (outputs printed "pre"),
+    //   positions >= prompt_len-1 are generation (outputs "tok").
+    //   gen <n> <id> ...  fresh seq of ids, n generated tokens
+    //   step <id>         force-feed id, one forward, "tok <next>"
+    //   eos <id>|none     halt a job when the model emits id
+    //   reset / ping / quit
     let serving = args.get(2).map(|s| s == "serve").unwrap_or(false);
     let embed = st.f32s("model.embed_tokens.weight");
-    let mut feed: Vec<usize> = seed.clone();
+    let mut seq: Vec<usize> = seed.clone();
     let mut pos = 0usize;
+    let mut prompt_len = seq.len();
+    let mut eos: Option<usize> = None;
     let mut remaining = if serving { 0usize } else { steps };
     let mut did_ref = false;
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
+    if serving {
+        println!("ready");
+    }
     'outer: loop {
         if remaining == 0 {
             if !serving {
@@ -510,24 +517,45 @@ fn main() {
             match it.next() {
                 Some("gen") => {
                     let n: usize = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-                    feed = it.filter_map(|s| s.parse().ok()).collect();
-                    if feed.is_empty() {
+                    seq = it.filter_map(|s| s.parse().ok()).collect();
+                    if seq.is_empty() {
                         println!("err empty prompt");
                         continue;
                     }
                     pos = 0;
-                    remaining = n + feed.len() - 1; // prefill + n generated
-                    println!("job: {} prompt tokens, {} forwards", feed.len(), remaining);
+                    prompt_len = seq.len();
+                    remaining = n + seq.len() - 1; // prefill + n generated
+                    println!(
+                        "job: {} prompt tokens, {} forwards",
+                        seq.len(),
+                        remaining
+                    );
                 }
                 Some("step") => {
                     if let Some(id) = it.next().and_then(|s| s.parse::<usize>().ok()) {
-                        feed.push(id);
+                        if seq.is_empty() {
+                            pos = 0;
+                        } else {
+                            pos += 1;
+                        }
+                        prompt_len = pos + 1;
+                        seq.push(id);
                         remaining = 1;
                     }
                 }
+                Some("eos") => {
+                    eos = it.next().and_then(|s| {
+                        if s == "none" {
+                            None
+                        } else {
+                            s.parse().ok()
+                        }
+                    });
+                }
                 Some("reset") => {
-                    feed.clear();
+                    seq.clear();
                     pos = 0;
+                    prompt_len = 0;
                 }
                 Some("ping") => println!("pong"),
                 Some("quit") | None => break 'outer,
@@ -535,8 +563,13 @@ fn main() {
             }
             continue;
         }
+        if pos >= seq.len() {
+            println!("err seq exhausted");
+            remaining = 0;
+            continue 'outer;
+        }
         let st_t = std::time::Instant::now();
-        let x_v: Vec<f32> = (0..D).map(|i| embed[feed[pos] * D + i]).collect();
+        let x_v: Vec<f32> = (0..D).map(|i| embed[seq[pos] * D + i]).collect();
         write_strided(embed_s.bytes_mut(), &dxs, &x_v);
         let mut xs = embed_s.as_ptr();
 
@@ -680,7 +713,7 @@ fn main() {
             // and causal softmax over one position is 1.0, so each
             // attention head emits its V slice directly.
             did_ref = true;
-            let ref_logits = cpu_forward(&st, &embed, feed[0]);
+            let ref_logits = cpu_forward(&st, &embed, seq[0]);
             let rn = argmax(&ref_logits);
             println!(
                 "  ref: argmax={rn} top5={:?} | ane top5={:?} agree={}",
@@ -689,10 +722,23 @@ fn main() {
                 rn == next
             );
         }
-        println!("tok {next} pos={pos} {:?}", st_t.elapsed());
-        feed.push(next);
+        // Prompt positions (< prompt_len-1) already have their true
+        // next token in seq — argmax there is only a prediction. From
+        // prompt_len-1 on, argmax IS the next sequence token.
+        let generated = pos + 1 >= prompt_len;
+        if generated {
+            println!("tok {next} pos={pos} {:?}", st_t.elapsed());
+            seq.push(next);
+        } else {
+            println!("pre {next} pos={pos} {:?}", st_t.elapsed());
+        }
         pos += 1;
         remaining = remaining.saturating_sub(1);
+        if generated && eos == Some(next) {
+            println!("eos");
+            remaining = 0;
+            continue 'outer;
+        }
         if pos >= T_MAX {
             println!("err T_MAX reached");
             remaining = 0;
@@ -700,7 +746,7 @@ fn main() {
         }
     }
     if !serving {
-        println!("tokens: {feed:?}");
+        println!("tokens: {seq:?}");
     }
 }
 
