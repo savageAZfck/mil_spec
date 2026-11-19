@@ -1642,6 +1642,13 @@ impl Drop for EspressoProgram {
                 0,
                 &mut err,
             );
+            // aned keeps a patched copy of every precompiled program
+            // keyed by source path, in a SIP-locked cache that nothing
+            // reclaims — fresh emit dirs leak the full program size per
+            // load. Purge on drop; `ESP_KEEP_CACHE=1` opts out.
+            if std::env::var_os("ESP_KEEP_CACHE").is_none() {
+                msg!((Id) -> ())(self.client, selp("purgeCompiledModel:"), self.model);
+            }
         }
         for s in self.inputs.iter().chain(self.outputs.iter()) {
             if s.owned {
