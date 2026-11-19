@@ -625,6 +625,19 @@ fn main() {
                 .collect()
         };
         let next = argmax(&logits);
+        if pos == 0 {
+            // CPU f32 reference at pos==0: rope is identity (angle 0)
+            // and causal softmax over one position is 1.0, so each
+            // attention head emits its V slice directly.
+            let ref_logits = cpu_forward(&st, &embed, tokens[0]);
+            let rn = argmax(&ref_logits);
+            println!(
+                "  ref: argmax={rn} top5={:?} | ane top5={:?} agree={}",
+                top5(&ref_logits),
+                top5(&logits),
+                rn == next
+            );
+        }
         println!(
             "step {step}: pos={pos} next={next} top5={:?} ({:?}/step)",
             top5(&logits),
@@ -638,4 +651,52 @@ fn main() {
         }
     }
     println!("tokens: {tokens:?}");
+}
+
+// ---- CPU f32 reference forward (pos==0 only: rope=identity, attn=V) --
+fn matvec_f32(w: &[f32], x: &[f32], n: usize, k: usize) -> Vec<f32> {
+    let mut out = vec![0f32; n];
+    for j in 0..n {
+        let row = &w[j * k..(j + 1) * k];
+        let mut acc = 0f32;
+        for i in 0..k {
+            acc += x[i] * row[i];
+        }
+        out[j] = acc;
+    }
+    out
+}
+
+fn cpu_forward(st: &SafeTensors, embed: &[f32], tok: usize) -> Vec<f32> {
+    let mut x: Vec<f32> = (0..D).map(|i| embed[tok * D + i]).collect();
+    for l in 0..LAYERS {
+        let p = format!("model.layers.{l}.");
+        let mut h = x.clone();
+        rms_norm(&mut h, &st.f32s(&format!("{p}input_layernorm.weight")), EPS);
+        // v only — q/k irrelevant at pos==0
+        let v = matvec_f32(&st.f32s(&format!("{p}self_attn.v_proj.weight")), &h, KV_DIM, D);
+        let mut attn = vec![0f32; Q_DIM];
+        for hq in 0..NQH {
+            let g = hq / 4;
+            attn[hq * HD..(hq + 1) * HD].copy_from_slice(&v[g * HD..(g + 1) * HD]);
+        }
+        let po = matvec_f32(&st.f32s(&format!("{p}self_attn.o_proj.weight")), &attn, D, Q_DIM);
+        for i in 0..D {
+            x[i] += po[i];
+        }
+        let mut h2 = x.clone();
+        rms_norm(&mut h2, &st.f32s(&format!("{p}post_attention_layernorm.weight")), EPS);
+        let mut ug = st.f32s(&format!("{p}mlp.up_proj.weight"));
+        let g = st.f32s(&format!("{p}mlp.gate_proj.weight"));
+        for i in 0..FF {
+            ug[i] = ug[i] * g[i] / (1.0 + (-g[i]).exp());
+        }
+        let dn = matvec_f32(&st.f32s(&format!("{p}mlp.down_proj.weight")), &ug, D, FF);
+        for i in 0..D {
+            x[i] += dn[i];
+        }
+    }
+    let mut xf = x;
+    rms_norm(&mut xf, &st.f32s("model.norm.weight"), EPS);
+    matvec_f32(&st.f32s("lm_head.weight"), &xf, VOCAB, D)
 }
