@@ -69,6 +69,9 @@ pub mod resource_guard;
 /// Multi-op graph scheduler: MIL DAG -> per-op HWX programs wired by
 /// IOSurface adoption (`compile_graph` + `GraphRuntime`).
 pub mod graph;
+/// Coyote MIL -> one Apple-MIL program compiled by aned (H13–H15 ANEs,
+/// where third-party precompiled HWX is refused).
+pub mod apple_mil;
 
 /// Differential fuzzer: random MIL generation + verdict classification
 /// for ANECompiler vs the empirically mapped dialect.
