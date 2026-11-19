@@ -120,6 +120,16 @@ pub enum Node {
         zero: Vec<usize>,
     },
     Host(HostOp),
+    /// Output `name` of multi-output program node `src` — the
+    /// Apple-MIL backend compiles the whole graph into one program.
+    Tap {
+        src: usize,
+        name: String,
+        /// External input this output is written back into after each
+        /// run (in-place accumulator); see `AppleMil::inplace`.
+        #[serde(default)]
+        into: Option<String>,
+    },
 }
 
 /// Source for a const-filled external. `Blob` defers the weight read
@@ -249,6 +259,48 @@ struct PlanCache {
     plan: Plan,
 }
 
+/// Apple-MIL backend plan: one program node (a directory aned compiles)
+/// plus one [`Node::Tap`] per function output, so callers keep the
+/// node-index API (`out_node` / `output` / `out_desc`).
+fn compile_apple_mil(text: &str, mil_dir: &Path, out_dir: &str) -> Result<Plan, String> {
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("{out_dir}: {e}"))?;
+    let p = crate::apple_mil::translate(text, mil_dir)?;
+    let dir = crate::apple_mil::write_program(&p, Path::new(out_dir))?;
+    let mut nodes = vec![Node::Prog {
+        name: "apple_mil".into(),
+        path: dir,
+        binds: p.inputs.iter().map(|n| BindSrc::Ext(n.clone())).collect(),
+        alias: Vec::new(),
+        zero: Vec::new(),
+    }];
+    let mut outputs = Vec::new();
+    for o in &p.outputs {
+        outputs.push((o.clone(), nodes.len()));
+        nodes.push(Node::Tap {
+            src: 0,
+            name: o.clone(),
+            into: p.inplace.iter().find(|(out, _)| out == o).map(|(_, i)| i.clone()),
+        });
+    }
+    Ok(Plan {
+        order: (0..nodes.len()).collect(),
+        externals: p
+            .inputs
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), vec![(0, i)]))
+            .collect(),
+        const_fills: Vec::new(),
+        outputs,
+        nodes,
+    })
+}
+
+/// aned port symbol without its `@output` / `@input` suffix.
+fn port_name(sym: &str) -> &str {
+    sym.split('@').next().unwrap_or(sym)
+}
+
 /// Compile a MIL program into a [`Plan`]. `out_dir` receives one
 /// `.macho` per node — distinct paths are mandatory because aned's
 /// patch cache keys on the embedded out-path.
@@ -258,6 +310,9 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
         .parent()
         .unwrap_or(Path::new("."))
         .to_path_buf();
+    if crate::apple_mil::wanted() {
+        return compile_apple_mil(&text, &mil_dir, out_dir);
+    }
     let fp = mil_fingerprint(&text);
     // Warm path: a serialized plan whose fingerprint matches this MIL
     // skips the whole emit — the per-node .macho bytes are deterministic
@@ -271,7 +326,7 @@ pub fn compile_graph(mil_path: &str, out_dir: &str) -> Result<Plan, String> {
                 && !cache.plan.nodes.is_empty()
                 && cache.plan.nodes.iter().all(|n| match n {
                     Node::Prog { path, .. } => path.exists(),
-                    Node::Host(_) => true,
+                    Node::Host(_) | Node::Tap { .. } => true,
                 })
             {
                 return Ok(cache.plan);
@@ -1173,10 +1228,49 @@ impl GraphRuntime {
         };
         let path = path.clone();
         let alias = alias.clone();
-        let _ = binds;
+        let want: Vec<String> = binds
+            .iter()
+            .filter_map(|b| match b {
+                BindSrc::Ext(n) => Some(n.clone()),
+                BindSrc::Out(_) => None,
+            })
+            .collect();
         let _ = zero.clone(); // program-created input surfaces are zeroed at creation
-        let mut p = EspressoProgram::load_precompiled(&path, &[])
-            .map_err(|e| format!("{}: {e:?}", path.display()))?;
+        let is_mil = path.is_dir();
+        let mut p = if is_mil {
+            EspressoProgram::load_mil(&path)
+        } else {
+            EspressoProgram::load_precompiled(&path, &[])
+        }
+        .map_err(|e| format!("{}: {e:?}", path.display()))?;
+        if is_mil {
+            // aned lists ports in its own (symbol) order — rebind by name.
+            let names: Vec<String> = p
+                .input_descs
+                .iter()
+                .map(|d| port_name(&d.name).to_string())
+                .collect();
+            let mut a = names.clone();
+            let mut b = want.clone();
+            a.sort();
+            b.sort();
+            if a != b {
+                return Err(format!(
+                    "{}: aned inputs {names:?} != function inputs {want:?}",
+                    path.display()
+                ));
+            }
+            if let Node::Prog { binds, .. } = &mut self.plan.nodes[i] {
+                *binds = names.iter().map(|n| BindSrc::Ext(n.clone())).collect();
+            }
+            for (nm, uses) in self.plan.externals.iter_mut() {
+                for u in uses.iter_mut().filter(|u| u.0 == i) {
+                    if let Some(port) = names.iter().position(|n| n == nm) {
+                        u.1 = port;
+                    }
+                }
+            }
+        }
         if self.out_descs[i].is_none() {
             self.out_descs[i] = p.output_descs.first().cloned();
         }
@@ -1312,6 +1406,7 @@ impl GraphRuntime {
     pub fn node_named(&self, name: &str) -> Option<usize> {
         self.plan.nodes.iter().position(|n| match n {
             Node::Prog { name: n2, .. } => n2 == name,
+            Node::Tap { name: n2, .. } => n2 == name,
             Node::Host(_) => false,
         })
     }
@@ -1417,6 +1512,7 @@ impl GraphRuntime {
                 Node::Host(h) => match h {
                     HostOp::RsqrtBroadcast { src, .. } | HostOp::Recip { src, .. } => count(src),
                 },
+                Node::Tap { .. } => {}
             }
         }
         // Residency persists across `run()` calls — host buffers own
@@ -1446,6 +1542,7 @@ impl GraphRuntime {
                         }
                     }
                 },
+                Node::Tap { .. } => vec![],
             };
             // cloned up-front so the dispatch borrow ends before &mut calls
             let (binds_c, alias_c) = match &self.plan.nodes[i] {
@@ -1468,7 +1565,11 @@ impl GraphRuntime {
                     let t1 = std::time::Instant::now();
                     // Stage input bytes into the program's own surfaces:
                     // ext tensors from ext_bufs, producer outs from bufs.
-                    let binds = binds_c;
+                    // re-read: a first load may rebind ports by name
+                    let binds = match &self.plan.nodes[i] {
+                        Node::Prog { binds, .. } => binds.clone(),
+                        _ => binds_c,
+                    };
                     let alias = alias_c;
                     let mut ext_stage: Vec<(usize, String, TensorDesc)> = Vec::new();
                     let mut out_stage: Vec<(usize, usize)> = Vec::new();
@@ -1660,6 +1761,32 @@ impl GraphRuntime {
                             }
                         }
                     });
+                }
+                Node::Tap { src, name, into } => {
+                    let (src, name, into) = (*src, name.clone(), into.clone());
+                    let p = self.progs[src]
+                        .as_ref()
+                        .ok_or_else(|| format!("tap {name}: program n{src} not resident"))?;
+                    let j = p
+                        .output_descs
+                        .iter()
+                        .position(|d| port_name(&d.name) == name)
+                        .ok_or_else(|| format!("tap {name}: no such program output"))?;
+                    let (out, od) = (p.output(j).to_vec(), p.output_descs[j].clone());
+                    if let Some(into) = into {
+                        let dd = self
+                            .ext_descs
+                            .get(&into)
+                            .cloned()
+                            .ok_or_else(|| format!("tap {name}: external {into} not staged"))?;
+                        let buf = self
+                            .ext_bufs
+                            .get_mut(&into)
+                            .ok_or_else(|| format!("tap {name}: external {into} not staged"))?;
+                        stage_tensor(buf, &dd, &out, &od);
+                    }
+                    self.bufs[i] = Some(out);
+                    self.out_descs[i] = Some(od);
                 }
             }
             // liveness release: producers whose last consumer just ran
@@ -1882,10 +2009,13 @@ mod tests {
         .unwrap();
         // 6 logical ops (c1, c2, g, gs, gsl, y) fused into 3 ANE programs:
         // node 0 = __conv_chain(c1->c2), node 1 = __conv_act(g->gs->gsl), node 2 = add(c2, gsl)
+        // The Apple-MIL backend (H13-H15) compiles the whole graph as one
+        // program plus one Tap per output instead.
+        let want_nodes = if crate::apple_mil::wanted() { 2 } else { 3 };
         assert_eq!(
             plan.nodes.len(),
-            3,
-            "expected 3 fused nodes, got {}",
+            want_nodes,
+            "expected {want_nodes} nodes, got {}",
             plan.nodes.len()
         );
 
