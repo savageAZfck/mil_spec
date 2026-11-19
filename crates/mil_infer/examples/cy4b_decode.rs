@@ -18,6 +18,27 @@ use mil_infer::hwx::{emit_attn_v, emit_avw, emit_elementwise2, emit_matmul_ns, E
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// SIGTERM/SIGINT/SIGHUP must unwind through `main` so EspressoProgram
+// drops run `unloadModel` — a signal-killed decoder leaks every baked
+// ANE program instance into the daemon until it reaps the dead client,
+// and enough leaks wedge the next bake ("no memory"). SIGKILL can't
+// be caught; ranknode sends TERM first and only KILLs as fallback.
+static STOP: AtomicBool = AtomicBool::new(false);
+extern "C" fn stop_handler(_: libc::c_int) {
+    STOP.store(true, Ordering::Relaxed);
+}
+fn install_stop_handler() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = stop_handler as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
 
 // ---- CY4B dims --------------------------------------------------------
 const D: usize = 2560;
@@ -306,6 +327,7 @@ fn linear(
 }
 
 fn main() {
+    install_stop_handler();
     let args: Vec<String> = std::env::args().collect();
     let st_path = args
         .get(1)
@@ -321,7 +343,11 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(4_500_000_000);
 
-    let dir = format!("/tmp/cyd_{}", std::process::id());
+    // Program images are ~100MB each and transient — write them to a
+    // RAM disk when one's provided (CY4B_TMPDIR) so a full system disk
+    // can't kill the bake. Falls back to /tmp.
+    let base = std::env::var("CY4B_TMPDIR").unwrap_or_else(|_| "/tmp".into());
+    let dir = format!("{base}/cyd_{}", std::process::id());
     std::fs::create_dir_all(&dir).unwrap();
     let dir = Path::new(&dir);
     let t0 = std::time::Instant::now();
@@ -382,7 +408,11 @@ fn main() {
         let wo_f = st.f32s(&format!("{p}self_attn.o_proj.weight"));
         let wd_f = st.f32s(&format!("{p}mlp.down_proj.weight"));
         let wbytes = (wqkv_f.len() + wug_f.len() + wo_f.len() + wd_f.len()) as u64 * 2;
-        let bake = baked_bytes + wbytes <= bake_budget;
+        // STOP mid-bake degrades remaining layers to the dynamic
+        // matvec — every Layer entry still gets built with real
+        // weights, so the seat serves correctly (slower), and unwind
+        // drops every program loaded so far.
+        let bake = !STOP.load(Ordering::Relaxed) && baked_bytes + wbytes <= bake_budget;
         if bake {
             baked_bytes += wbytes;
         }
@@ -517,11 +547,38 @@ fn main() {
         println!("ready");
     }
     'outer: loop {
+        if STOP.load(Ordering::Relaxed) {
+            println!("stop");
+            break;
+        }
         if remaining == 0 {
             if !serving {
                 break;
             }
-            let Some(Ok(line)) = lines.next() else { break };
+            // poll(200ms) instead of a blocking read so SIGTERM wakes
+            // the idle wait — `lines.next()` would sit in read(2)
+            // forever and the process would die without dropping.
+            let line = loop {
+                if STOP.load(Ordering::Relaxed) {
+                    break 'outer;
+                }
+                let mut pfd = libc::pollfd {
+                    fd: 0,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let pr = unsafe { libc::poll(&mut pfd, 1, 200) };
+                if pr <= 0 {
+                    if pr == 0 {
+                        continue;
+                    }
+                    break 'outer;
+                }
+                match lines.next() {
+                    Some(Ok(l)) => break l,
+                    _ => break 'outer,
+                }
+            };
             let mut it = line.split_whitespace();
             match it.next() {
                 Some("gen") => {
