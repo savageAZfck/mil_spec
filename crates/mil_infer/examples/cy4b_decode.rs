@@ -16,6 +16,7 @@
 use mil_infer::espresso::{EspressoProgram, SharedSurface};
 use mil_infer::hwx::{emit_attn_v, emit_avw, emit_elementwise2, emit_matmul_ns, EwOp};
 use std::collections::HashMap;
+use std::io::BufRead;
 use std::path::Path;
 
 // ---- CY4B dims --------------------------------------------------------
@@ -484,12 +485,58 @@ fn main() {
     };
 
     // ---- decode ------------------------------------------------------------
+    // serve mode (`cy4b_decode <st> serve`): stdin line protocol over
+    // the resident decode state —
+    //   gen <n> <id> <id> ...   reset seq to ids, run n forwards,
+    //                           prints "tok <id>" per step
+    //   step <id>               one forward, prints "tok <next>"
+    //   reset                   clear sequence position (KV masked)
+    //   ping / quit
+    let serving = args.get(2).map(|s| s == "serve").unwrap_or(false);
     let embed = st.f32s("model.embed_tokens.weight");
-    let mut tokens = seed.clone();
+    let mut feed: Vec<usize> = seed.clone();
     let mut pos = 0usize;
-    for step in 0..steps {
+    let mut remaining = if serving { 0usize } else { steps };
+    let mut did_ref = false;
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+    'outer: loop {
+        if remaining == 0 {
+            if !serving {
+                break;
+            }
+            let Some(Ok(line)) = lines.next() else { break };
+            let mut it = line.split_whitespace();
+            match it.next() {
+                Some("gen") => {
+                    let n: usize = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    feed = it.filter_map(|s| s.parse().ok()).collect();
+                    if feed.is_empty() {
+                        println!("err empty prompt");
+                        continue;
+                    }
+                    pos = 0;
+                    remaining = n + feed.len() - 1; // prefill + n generated
+                    println!("job: {} prompt tokens, {} forwards", feed.len(), remaining);
+                }
+                Some("step") => {
+                    if let Some(id) = it.next().and_then(|s| s.parse::<usize>().ok()) {
+                        feed.push(id);
+                        remaining = 1;
+                    }
+                }
+                Some("reset") => {
+                    feed.clear();
+                    pos = 0;
+                }
+                Some("ping") => println!("pong"),
+                Some("quit") | None => break 'outer,
+                _ => println!("err"),
+            }
+            continue;
+        }
         let st_t = std::time::Instant::now();
-        let x_v: Vec<f32> = (0..D).map(|i| embed[tokens[pos] * D + i]).collect();
+        let x_v: Vec<f32> = (0..D).map(|i| embed[feed[pos] * D + i]).collect();
         write_strided(embed_s.bytes_mut(), &dxs, &x_v);
         let mut xs = embed_s.as_ptr();
 
@@ -628,11 +675,12 @@ fn main() {
                 .collect()
         };
         let next = argmax(&logits);
-        if pos == 0 {
+        if pos == 0 && !did_ref {
             // CPU f32 reference at pos==0: rope is identity (angle 0)
             // and causal softmax over one position is 1.0, so each
             // attention head emits its V slice directly.
-            let ref_logits = cpu_forward(&st, &embed, tokens[0]);
+            did_ref = true;
+            let ref_logits = cpu_forward(&st, &embed, feed[0]);
             let rn = argmax(&ref_logits);
             println!(
                 "  ref: argmax={rn} top5={:?} | ane top5={:?} agree={}",
@@ -641,19 +689,19 @@ fn main() {
                 rn == next
             );
         }
-        println!(
-            "step {step}: pos={pos} next={next} top5={:?} ({:?}/step)",
-            top5(&logits),
-            st_t.elapsed()
-        );
-        tokens.push(next);
+        println!("tok {next} pos={pos} {:?}", st_t.elapsed());
+        feed.push(next);
         pos += 1;
+        remaining = remaining.saturating_sub(1);
         if pos >= T_MAX {
-            println!("T_MAX reached");
-            break;
+            println!("err T_MAX reached");
+            remaining = 0;
+            continue 'outer;
         }
     }
-    println!("tokens: {tokens:?}");
+    if !serving {
+        println!("tokens: {feed:?}");
+    }
 }
 
 // ---- CPU f32 reference forward (pos==0 only: rope=identity, attn=V) --
