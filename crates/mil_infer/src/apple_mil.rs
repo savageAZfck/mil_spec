@@ -98,9 +98,13 @@ fn parse_consts(text: &str) -> HashMap<String, ConstDecl> {
     let mut out = HashMap::new();
     for raw in text.lines() {
         let l = raw.trim();
-        let Some(eq) = l.find(" = const()") else { continue };
+        let Some(eq) = l.find(" = const()") else {
+            continue;
+        };
         let lhs = &l[..eq];
-        let Some(name) = lhs.rsplit(' ').next() else { continue };
+        let Some(name) = lhs.rsplit(' ').next() else {
+            continue;
+        };
         let dtype = lhs
             .strip_prefix("tensor<")
             .and_then(|s| s.split([',', '>']).next())
@@ -291,7 +295,9 @@ fn bcast(a: Sh, b: Sh, op: &str) -> Result<Sh, String> {
 }
 
 const BINARY: &[&str] = &["add", "sub", "mul", "real_div", "maximum", "minimum", "pow"];
-const UNARY: &[&str] = &["sigmoid", "tanh", "relu", "silu", "exp", "sqrt", "abs", "sin", "cos"];
+const UNARY: &[&str] = &[
+    "sigmoid", "tanh", "relu", "silu", "exp", "sqrt", "abs", "sin", "cos",
+];
 /// Blob file name aned resolves against the program dir.
 const WEIGHT_REF: &str = "@model_path/weights/weight.bin";
 const DEFAULT_RMS_EPS: f32 = 1e-5;
@@ -495,7 +501,9 @@ pub fn translate(text: &str, mil_dir: &Path) -> Result<AppleMil, String> {
     // outputs: reshape back to their host layout under the coyote name
     for out in &outputs {
         if sigs.iter().any(|(n, _)| n == out) {
-            return Err(format!("output {out} is a function input (passthrough unsupported)"));
+            return Err(format!(
+                "output {out} is a function input (passthrough unsupported)"
+            ));
         }
         let (n, s) = em.val(out)?;
         let d = out_dims(declared.get(out), s);
@@ -630,7 +638,10 @@ mod tests {
         // (case, expected substring) — every failing cell is reported
         let cases = [
             ("x canon", "tensor<fp16, [1, 1, 1, 3]> _c_x = reshape(x = x"),
-            ("x·Wᵀ", "tensor<fp16, [1, 1, 1, 4]> _v_v1 = matmul(x = _c_x, y = _w_w"),
+            (
+                "x·Wᵀ",
+                "tensor<fp16, [1, 1, 1, 4]> _v_v1 = matmul(x = _c_x, y = _w_w",
+            ),
             ("δ·W", "tensor<fp16, [1, 1, 1, 3]> _v_v3 = matmul"),
             ("outer", "tensor<fp16, [1, 1, 4, 3]> _v_v4 = matmul"),
             ("weight const", "tensor<fp16, [1, 1, 4, 3]> _w_w = const()"),
@@ -659,7 +670,11 @@ mod tests {
 }
 "#;
         let p2 = translate(src2, &dir).unwrap();
-        assert!(p2.text.contains("_v_r = matmul(x = _c_pos, y = _v_k2"), "stale read:\n{}", p2.text);
+        assert!(
+            p2.text.contains("_v_r = matmul(x = _c_pos, y = _v_k2"),
+            "stale read:\n{}",
+            p2.text
+        );
         assert_eq!(p2.inplace, vec![("k2".to_string(), "kv".to_string())]);
         // header count=1, version=2; one 64 B meta + 24 B payload padded to 64
         assert_eq!(&p.weights[0..8], &[1, 0, 0, 0, 2, 0, 0, 0]);
