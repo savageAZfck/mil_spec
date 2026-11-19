@@ -92,13 +92,18 @@ struct ConstDecl {
     blob: Option<(String, u64)>,
     /// The raw "val = ..." expression for inline consts.
     val: String,
+    /// `constexpr_*` op (quantized/palettized weight): dequantized on the
+    /// host to an fp16 blob — aned's ANECCompile rejects the native op on
+    /// H13 (see translate()).
+    constexpr: bool,
 }
 
 fn parse_consts(text: &str) -> HashMap<String, ConstDecl> {
     let mut out = HashMap::new();
     for raw in text.lines() {
         let l = raw.trim();
-        let Some(eq) = l.find(" = const()") else {
+        let constexpr = l.contains(" = constexpr_");
+        let Some(eq) = l.find(" = const()").or_else(|| l.find(" = constexpr_")) else {
             continue;
         };
         let lhs = &l[..eq];
@@ -149,6 +154,7 @@ fn parse_consts(text: &str) -> HashMap<String, ConstDecl> {
                 dims,
                 blob,
                 val,
+                constexpr,
             },
         );
     }
@@ -229,6 +235,9 @@ struct Em {
     alias: HashMap<String, String>,
     n_tmp: usize,
     consts_emitted: HashMap<String, String>,
+    /// Conv weights/biases in their native layout: coyote name ->
+    /// (MIL name, dims). Conv weights are [Cout,Cin,1,1], not canonical.
+    native: HashMap<String, (String, Vec<i64>)>,
 }
 
 impl Em {
@@ -343,6 +352,7 @@ pub fn translate(text: &str, mil_dir: &Path) -> Result<AppleMil, String> {
         alias: HashMap::new(),
         n_tmp: 0,
         consts_emitted: HashMap::new(),
+        native: HashMap::new(),
     };
     // Liveness from the outputs: aned's compiler fails the whole program
     // (CompilationFailure) on any dead op, e.g. an unused gradient.
@@ -367,35 +377,94 @@ pub fn translate(text: &str, mil_dir: &Path) -> Result<AppleMil, String> {
         ));
         em.def(name, t, s);
     }
-    // blob consts -> baked canonical consts (live ones only)
+    // Consts feeding a conv weight/bias keep their native layout
+    // ([Cout,Cin,1,1] / [Cout]); every other use takes the canonical one.
+    let mut native_dims: HashMap<&str, Vec<i64>> = HashMap::new();
+    let mut canon_need: HashSet<&str> = HashSet::new();
+    for o in ops.iter().filter(|o| live.contains(o.result.as_str())) {
+        let cout = o.shape.get(1).copied().unwrap_or(1).max(1);
+        for (k, v) in &o.args {
+            let numel: i64 = consts.get(v).map_or(0, |c| c.dims.iter().product());
+            match (o.op.as_str(), k.as_str()) {
+                ("conv", "weight") => {
+                    if numel == 0 || numel % cout != 0 {
+                        return Err(format!(
+                            "conv {}: weight {v} has {numel} elems for Cout {cout}",
+                            o.result
+                        ));
+                    }
+                    native_dims.insert(v, vec![cout, numel / cout, 1, 1]);
+                }
+                ("conv", "bias") => {
+                    if numel != cout {
+                        return Err(format!(
+                            "conv {}: bias {v} has {numel} elems for Cout {cout}",
+                            o.result
+                        ));
+                    }
+                    native_dims.insert(v, vec![cout]);
+                }
+                _ => {
+                    canon_need.insert(v);
+                }
+            }
+        }
+    }
+    // Blob consts and constexpr (host-dequantized) consts -> baked fp16
+    // consts (live ones only).
     let mut blob_names: Vec<&String> = consts
         .iter()
-        .filter(|(n, c)| c.blob.is_some() && live.contains(n.as_str()))
+        .filter(|(n, c)| (c.blob.is_some() || c.constexpr) && live.contains(n.as_str()))
         .map(|(n, _)| n)
         .collect();
     blob_names.sort();
     for name in blob_names {
         let c = &consts[name];
-        if c.dtype != "fp16" {
-            return Err(format!("const {name}: dtype {} (only fp16 blobs)", c.dtype));
-        }
-        let (path, off) = c.blob.clone().unwrap();
-        let s = canon(&c.dims)?;
-        let nbytes = s.numel() as usize * 2;
-        let raw = hwx::load_blob_bytes_at(&hwx::resolve_blob(mil_dir, &path), off, nbytes)?;
+        let numel: i64 = c.dims.iter().product();
+        let nbytes = numel as usize * 2;
+        let raw: Vec<u8> = if c.constexpr {
+            // Native `constexpr_blockwise_shift_scale` /
+            // `constexpr_affine_dequantize` fail ANECCompile on h13g, so
+            // the weight is dequantized here, exactly as the HWX path does.
+            hwx::load_mil_weight_u16(text, mil_dir, name)?
+                .iter()
+                .flat_map(|u| u.to_le_bytes())
+                .collect()
+        } else {
+            if c.dtype != "fp16" {
+                return Err(format!("const {name}: dtype {} (only fp16 blobs)", c.dtype));
+            }
+            let (path, off) = c.blob.clone().unwrap();
+            let raw = hwx::load_blob_bytes_at(&hwx::resolve_blob(mil_dir, &path), off, nbytes)?;
+            if raw.len() < nbytes {
+                return Err(format!(
+                    "const {name}: blob {path} holds {} B, need {nbytes}",
+                    raw.len()
+                ));
+            }
+            raw
+        };
         if raw.len() < nbytes {
-            return Err(format!(
-                "const {name}: blob {path} holds {} B, need {nbytes}",
-                raw.len()
-            ));
+            return Err(format!("const {name}: {} B, need {nbytes}", raw.len()));
         }
-        let meta = push_blob(&mut weights, &raw[..nbytes]);
-        let t = format!("_w_{name}");
-        em.line(format!(
-            "tensor<fp16, {sh}> {t} = const()[name = string(\"{t}\"), val = tensor<fp16, {sh}>(BLOBFILE(path = string(\"{WEIGHT_REF}\"), offset = uint64({meta})))];",
-            sh = s.mil()
-        ));
-        em.def(name, t, s);
+        let emit = |t: String, dims: &[i64], w: &mut Vec<u8>, em: &mut Em| {
+            let meta = push_blob(w, &raw[..nbytes]);
+            let sh = dims_mil(dims);
+            em.line(format!(
+                "tensor<fp16, {sh}> {t} = const()[name = string(\"{t}\"), val = tensor<fp16, {sh}>(BLOBFILE(path = string(\"{WEIGHT_REF}\"), offset = uint64({meta})))];"
+            ));
+        };
+        if canon_need.contains(name.as_str()) {
+            let s = canon(&c.dims)?;
+            let t = format!("_w_{name}");
+            emit(t.clone(), &[1, 1, s.r, s.c], &mut weights, &mut em);
+            em.def(name, t, s);
+        }
+        if let Some(d) = native_dims.get(name.as_str()) {
+            let t = format!("_wn_{name}");
+            emit(t.clone(), d, &mut weights, &mut em);
+            em.native.insert(name.clone(), (t, d.clone()));
+        }
     }
 
     for o in ops.iter().filter(|o| live.contains(o.result.as_str())) {
@@ -449,6 +518,59 @@ pub fn translate(text: &str, mil_dir: &Path) -> Result<AppleMil, String> {
             let (bx, by) = (em.bool_k(tx), em.bool_k(ty));
             em.line(format!(
                 "tensor<fp16, {}> {res} = matmul(x = {xn}, y = {yn}, transpose_x = {bx}, transpose_y = {by})[name = string(\"{res}\")];",
+                s.mil()
+            ));
+            em.def(&o.result, res, s);
+        } else if op == "conv" {
+            // 1x1 conv in Apple's [N,C,H,W] layout: reshape in, conv, reshape
+            // back to the canonical view (matrices/vectors stay [1,1,R,C]).
+            let w = arg(o, "weight").ok_or_else(|| format!("conv {}: no weight", o.result))?;
+            let (wn, wd) = em
+                .native
+                .get(w)
+                .cloned()
+                .ok_or_else(|| format!("conv {}: weight {w} is not a const", o.result))?;
+            let (cout, cin) = (wd[0], wd[1]);
+            let od = &o.shape;
+            if od.len() != 4 || od[0] != 1 || od[1] != cout {
+                return Err(format!("conv {}: output {od:?} vs Cout {cout}", o.result));
+            }
+            if xs.numel() != cin * od[2] * od[3] {
+                return Err(format!(
+                    "conv {}: input {xs:?} is not [1,{cin},{},{}]",
+                    o.result, od[2], od[3]
+                ));
+            }
+            let xd = [1, cin, od[2], od[3]];
+            let (xr, sk) = (em.tmp("cx"), em.shape_k(&xd));
+            em.line(format!(
+                "tensor<fp16, {}> {xr} = reshape(x = {xn}, shape = {sk})[name = string(\"{xr}\")];",
+                dims_mil(&xd)
+            ));
+            let st = em.konst("tensor<int32, [2]>", "tensor<int32, [2]>([1, 1])");
+            let pt = em.konst("string", "string(\"valid\")");
+            let pd = em.konst("tensor<int32, [4]>", "tensor<int32, [4]>([0, 0, 0, 0])");
+            let gr = em.konst("tensor<int32, []>", "int32(1)");
+            let bias = match arg(o, "bias") {
+                Some(b) => {
+                    let (bn, _) = em
+                        .native
+                        .get(b)
+                        .cloned()
+                        .ok_or_else(|| format!("conv {}: bias {b} is not a const", o.result))?;
+                    format!(", bias = {bn}")
+                }
+                None => String::new(),
+            };
+            let cr = em.tmp("conv");
+            em.line(format!(
+                "tensor<fp16, {}> {cr} = conv(x = {xr}, weight = {wn}{bias}, strides = {st}, pad_type = {pt}, pad = {pd}, dilations = {st}, groups = {gr})[name = string(\"{cr}\")];",
+                dims_mil(od)
+            ));
+            let s = canon(od)?;
+            let sk = em.shape_k(&[1, 1, s.r, s.c]);
+            em.line(format!(
+                "tensor<fp16, {}> {res} = reshape(x = {cr}, shape = {sk})[name = string(\"{res}\")];",
                 s.mil()
             ));
             em.def(&o.result, res, s);
@@ -619,18 +741,27 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("apple_mil_t_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("w.bin"), vec![0u8; 4 * 3 * 2]).unwrap();
+        // int8 [4,3] of 2s, fp16 scale [4,1] of 0.5 (0x3800) -> dequantized 1.0 (0x3C00)
+        std::fs::write(dir.join("q.bin"), vec![2u8; 4 * 3]).unwrap();
+        std::fs::write(dir.join("s.bin"), [0x00u8, 0x38].repeat(4)).unwrap();
         let src = r#"program(1.3)
 {
     func main<ios18>(tensor<fp16, [1, 3, 1, 1]> x, tensor<fp16, [1, 4, 1, 1]> t) {
         tensor<bool, []> __bt = const()[val = bool(true)];
         tensor<fp16, [4, 3]> w = const()[val = tensor<fp16, [4, 3]>(BLOBFILE(path = string("w.bin"), offset = uint64(0)))];
+        tensor<fp16, [4, 3, 1, 1]> cw = const()[val = tensor<fp16, [4, 3, 1, 1]>(BLOBFILE(path = string("w.bin"), offset = uint64(0)))];
+        tensor<int8, [4, 3]> Wq_q = const()[val = tensor<int8, [4, 3]>(BLOBFILE(path = string("q.bin"), offset = uint64(0)))];
+        tensor<fp16, [4, 1]> Wq_s = const()[val = tensor<fp16, [4, 1]>(BLOBFILE(path = string("s.bin"), offset = uint64(0)))];
+        tensor<fp16, [4, 3]> Wq = constexpr_blockwise_shift_scale(data = Wq_q, scale = Wq_s)[name = string("Wq")];
         tensor<fp16, [1, 1, 1, 4]> v1 = matmul(x = x, y = w, transpose_y = __bt)[name = string("v1")];
         tensor<fp16, [1, 4, 1, 1]> v2 = sub(x = v1, y = t)[name = string("v2")];
         tensor<fp16, [1, 1, 1, 3]> v3 = matmul(x = v2, y = w, transpose_x = __bt)[name = string("v3")];
         tensor<fp16, [1, 4, 1, 3]> v4 = matmul(x = v2, y = x, transpose_x = __bt)[name = string("v4")];
         tensor<fp16, [1, 4, 1, 1]> v5 = rms_norm(x = v2, eps = fp16(0.00001))[name = string("v5")];
+        tensor<fp16, [1, 4, 1, 1]> v6 = conv(weight = cw, x = x)[name = string("v6")];
+        tensor<fp16, [1, 1, 1, 4]> v7 = matmul(x = x, y = Wq, transpose_y = __bt)[name = string("v7")];
         tensor<fp16, [1, 4, 1, 1]> dead = relu(x = v2)[name = string("dead")];
-    } -> (v3, v4, v5);
+    } -> (v3, v4, v5, v6, v7);
 }
 "#;
         let p = translate(src, &dir).unwrap();
@@ -648,7 +779,18 @@ mod tests {
             ("out vec", "tensor<fp16, [1, 1, 1, 3]> v3 = reshape"),
             ("out mat", "tensor<fp16, [1, 4, 1, 3]> v4 = reshape"),
             ("rms", "reduce_mean(x = _t1_sq"),
-            ("ret", "} -> (v3, v4, v5);"),
+            (
+                "conv w native",
+                "tensor<fp16, [4, 3, 1, 1]> _wn_cw = const()",
+            ),
+            ("conv in NCHW", "tensor<fp16, [1, 3, 1, 1]> _t"),
+            ("conv", "= conv(x = _t"),
+            ("conv weight", "weight = _wn_cw, strides"),
+            ("conv canon", "tensor<fp16, [1, 1, 1, 4]> _v_v6 = reshape"),
+            ("conv out", "tensor<fp16, [1, 4, 1, 1]> v6 = reshape"),
+            ("q8 const", "tensor<fp16, [1, 1, 4, 3]> _w_Wq = const()"),
+            ("q8 matmul", "_v_v7 = matmul(x = _c_x, y = _w_Wq"),
+            ("ret", "} -> (v3, v4, v5, v6, v7);"),
         ];
         let bad: Vec<&str> = cases
             .iter()
@@ -676,9 +818,12 @@ mod tests {
             p2.text
         );
         assert_eq!(p2.inplace, vec![("k2".to_string(), "kv".to_string())]);
-        // header count=1, version=2; one 64 B meta + 24 B payload padded to 64
-        assert_eq!(&p.weights[0..8], &[1, 0, 0, 0, 2, 0, 0, 0]);
-        assert_eq!(p.weights.len(), 64 + 64 + 64);
+        // header count=3 (Wq, cw native, w canonical), version=2; each blob is
+        // a 64 B meta + 24 B payload padded to 64
+        assert_eq!(&p.weights[0..8], &[3, 0, 0, 0, 2, 0, 0, 0]);
+        assert_eq!(p.weights.len(), 64 + 3 * 128);
+        // Wq payload (first blob, sorted by name) is host-dequantized: 2 * 0.5 = 1.0
+        assert_eq!(&p.weights[128..130], &[0x00, 0x3C], "q8 dequant");
         assert_eq!(p.inputs, vec!["x", "t"]);
     }
 }

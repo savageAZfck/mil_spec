@@ -2009,10 +2009,13 @@ mod tests {
         .unwrap();
         // 6 logical ops (c1, c2, g, gs, gsl, y) fused into 3 ANE programs:
         // node 0 = __conv_chain(c1->c2), node 1 = __conv_act(g->gs->gsl), node 2 = add(c2, gsl)
+        // The Apple-MIL backend (H13-H15) compiles the whole graph as one
+        // program plus one Tap per output instead.
+        let want_nodes = if crate::apple_mil::wanted() { 2 } else { 3 };
         assert_eq!(
             plan.nodes.len(),
-            3,
-            "expected 3 fused nodes, got {}",
+            want_nodes,
+            "expected {want_nodes} nodes, got {}",
             plan.nodes.len()
         );
 
