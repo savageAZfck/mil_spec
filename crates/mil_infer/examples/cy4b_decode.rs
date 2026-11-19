@@ -205,16 +205,17 @@ struct WChunks {
 impl WChunks {
     fn new(w: &[f32], n: usize, k: usize) -> Self {
         const RK: usize = 1024; // avw k extent
-        let rows_per = 127usize;
+        const ROWS: usize = 128; // avw r extent
+        let rows_per = ROWS - 1; // lane 0 dead
         let n_chunks = n.div_ceil(rows_per);
         let k_slices = k.div_ceil(RK);
         let stride = (RK * 2 + 255) & !255;
         let mut surf = Vec::with_capacity(n_chunks * k_slices);
         for c in 0..n_chunks {
             for s in 0..k_slices {
-                let sf = SharedSurface::new(128 * stride).unwrap();
+                let sf = SharedSurface::new(ROWS * stride).unwrap();
                 let b = sf.bytes_mut();
-                for lane in 1..128usize {
+                for lane in 1..ROWS {
                     let j = c * rows_per + (lane - 1);
                     if j >= n {
                         break;
@@ -337,7 +338,9 @@ fn main() {
             .unwrap(),
         &dir.join("atv.macho"),
     );
-    // shared dynamic-weight matvec: avw(128 rows, k=1024)
+    // shared dynamic-weight matvec: avw(128 rows, k=1024) — r=256
+    // breaks lane->row mapping (parity gate catches it); k-slice
+    // count is the remaining lever (avw k=1792 fits the lane mask).
     let mut mmv = emit_load(
         &emit_avw(128, 1024, mil(), &dir.join("mmv.macho").to_string_lossy()),
         &dir.join("mmv.macho"),
