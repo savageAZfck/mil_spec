@@ -504,6 +504,15 @@ fn main() {
     let mut did_ref = false;
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
+    // Verb-constraint trie: `verbs` commands add token-id sequences
+    // (e.g. each game action's BPE ids, bare and leading-space
+    // variants). While a job's generated stream sits inside a verb
+    // prefix, argmax is masked to trie continuations — the substrate
+    // chooses WHICH verb by its own probabilities, grammar does the
+    // rest. Releases once every live path completes a verb.
+    let mut vseqs: Vec<Vec<u32>> = Vec::new();
+    let mut vactive: Vec<(usize, usize)> = Vec::new();
+    let mut vdone = false;
     if serving {
         println!("ready");
     }
@@ -525,9 +534,36 @@ fn main() {
                     pos = 0;
                     prompt_len = seq.len();
                     remaining = n + seq.len() - 1; // prefill + n generated
+                    vactive = (0..vseqs.len()).map(|i| (i, 0)).collect();
+                    vdone = false;
                     println!(
                         "job: {} prompt tokens, {} forwards",
                         seq.len(),
+                        remaining
+                    );
+                }
+                Some("gencont") => {
+                    // Prefix-cache continue: keep KV for the first
+                    // `keep` positions, truncate the self-generated
+                    // tail, append new prompt ids, generate n.
+                    //   gencont <keep> <n> <id> <id> ...
+                    let keep: usize = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let n: usize = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let tail: Vec<usize> = it.filter_map(|s| s.parse().ok()).collect();
+                    if keep > pos || keep >= T_MAX || tail.is_empty() {
+                        println!("err bad gencont");
+                        continue;
+                    }
+                    seq.truncate(keep);
+                    pos = keep;
+                    prompt_len = keep + tail.len();
+                    let tail_len = tail.len();
+                    seq.extend(tail);
+                    remaining = n + tail_len - 1;
+                    vactive = (0..vseqs.len()).map(|i| (i, 0)).collect();
+                    vdone = false;
+                    println!(
+                        "job: continue @{keep}, {tail_len} new prompt tokens, {} forwards",
                         remaining
                     );
                 }
@@ -541,6 +577,24 @@ fn main() {
                         prompt_len = pos + 1;
                         seq.push(id);
                         remaining = 1;
+                        vactive = (0..vseqs.len()).map(|i| (i, 0)).collect();
+                        vdone = false;
+                    }
+                }
+                Some("verbs") => {
+                    // verbs <id>,<id>,...;<id>,<id>,...  — each
+                    // semicolon group is one token-id sequence.
+                    if let Some(arg) = it.next() {
+                        for grp in arg.split(';') {
+                            let seq: Vec<u32> = grp
+                                .split(',')
+                                .filter_map(|s| s.trim().parse().ok())
+                                .collect();
+                            if !seq.is_empty() {
+                                vseqs.push(seq);
+                            }
+                        }
+                        println!("verbs: {} sequences", vseqs.len());
                     }
                 }
                 Some("eos") => {
@@ -707,7 +761,49 @@ fn main() {
                 .map(|i| rd16(b, dh.offset(0, 0, i as u64, 0, 0)))
                 .collect()
         };
-        let next = argmax(&logits);
+        // Prompt positions (< prompt_len-1) already have their true
+        // next token in seq — argmax there is only a prediction. From
+        // prompt_len-1 on, argmax IS the next sequence token.
+        let generated = pos + 1 >= prompt_len;
+        // Verb mask: while the generated stream sits inside a known
+        // action prefix, argmax is restricted to trie continuations.
+        // The substrate still chooses — among grammar-valid tokens.
+        let mut next = usize::MAX;
+        if generated && !vdone && !vseqs.is_empty() {
+            if vactive.is_empty() {
+                vdone = true;
+            } else {
+                let mut bv = f32::NEG_INFINITY;
+                for &(si, p) in &vactive {
+                    if p < vseqs[si].len() {
+                        let id = vseqs[si][p] as usize;
+                        if logits[id] > bv {
+                            bv = logits[id];
+                            next = id;
+                        }
+                    }
+                }
+                if next == usize::MAX {
+                    vdone = true;
+                } else {
+                    let chosen = next as u32;
+                    vactive.retain_mut(|(si, p)| {
+                        if *p < vseqs[*si].len() && vseqs[*si][*p] == chosen {
+                            *p += 1;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    if vactive.iter().all(|&(si, p)| p >= vseqs[si].len()) {
+                        vdone = true;
+                    }
+                }
+            }
+        }
+        if next == usize::MAX {
+            next = argmax(&logits);
+        }
         if pos == 0 && !did_ref {
             // CPU f32 reference at pos==0: rope is identity (angle 0)
             // and causal softmax over one position is 1.0, so each
@@ -722,10 +818,6 @@ fn main() {
                 rn == next
             );
         }
-        // Prompt positions (< prompt_len-1) already have their true
-        // next token in seq — argmax there is only a prediction. From
-        // prompt_len-1 on, argmax IS the next sequence token.
-        let generated = pos + 1 >= prompt_len;
         if generated {
             println!("tok {next} pos={pos} {:?}", st_t.elapsed());
             seq.push(next);
