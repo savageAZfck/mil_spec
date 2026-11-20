@@ -453,6 +453,20 @@ impl Drop for SharedSurface {
 }
 
 /// A precompiled Espresso package loaded into `aned`, buffers bound.
+/// How `load_inner` asks aned for the program.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LoadKind {
+    /// Espresso package dir (`model.espresso.net` + friends).
+    Package,
+    /// Bare `.hwx`/`.macho` (`kANEFModelPreCompiled`).
+    PreCompiled,
+    /// Directory with a text MIL program (`kANEFModelMIL`).
+    Mil,
+}
+
+/// File name `load_mil` expects inside its directory.
+pub const MIL_FILE_NAME: &str = "model.mil";
+
 pub struct EspressoProgram {
     objc: Objc,
     io: IoApi,
@@ -482,7 +496,7 @@ impl EspressoProgram {
     /// own `NetworkStatusList` descriptors.
     pub fn load(dir: &Path) -> Result<Self, EspError> {
         let pool = unsafe { objc_autoreleasePoolPush() };
-        let r = Self::load_inner(dir, false, &[]);
+        let r = Self::load_inner(dir, LoadKind::Package, &[]);
         unsafe { objc_autoreleasePoolPop(pool) };
         r
     }
@@ -496,7 +510,22 @@ impl EspressoProgram {
     /// (`kANEFIntermediateBufferSizeHint`, `kANEFSkipPreparePhaseKey`, ...).
     pub fn load_precompiled(hwx: &Path, extra: &[(&str, u64)]) -> Result<Self, EspError> {
         let pool = unsafe { objc_autoreleasePoolPush() };
-        let r = Self::load_inner(hwx, true, extra);
+        let r = Self::load_inner(hwx, LoadKind::PreCompiled, extra);
+        unsafe { objc_autoreleasePoolPop(pool) };
+        r
+    }
+
+    /// Load a directory holding a plain-text Apple MIL program
+    /// (`model.mil`) — aned compiles it for the local ANE through
+    /// ANECompilerService (options `kANEFModelType = kANEFModelMIL`,
+    /// `kANEFNetPlistFilenameKey = model.mil`) and caches the result.
+    /// This is the path that works on chips whose aned refuses
+    /// third-party precompiled binaries (M1/H13: `ANEProgramCreate()`
+    /// 0x17 on `load_precompiled`). IO ports are listed by aned in
+    /// symbol-name order, not signature order — bind by `TensorDesc::name`.
+    pub fn load_mil(dir: &Path) -> Result<Self, EspError> {
+        let pool = unsafe { objc_autoreleasePoolPush() };
+        let r = Self::load_inner(dir, LoadKind::Mil, &[]);
         unsafe { objc_autoreleasePoolPop(pool) };
         r
     }
@@ -555,7 +584,7 @@ impl EspressoProgram {
         }
     }
 
-    fn load_inner(path: &Path, precompiled: bool, extra: &[(&str, u64)]) -> Result<Self, EspError> {
+    fn load_inner(path: &Path, kind: LoadKind, extra: &[(&str, u64)]) -> Result<Self, EspError> {
         let objc = Objc::open()?;
         let io = IoApi::open()?;
         unsafe {
@@ -590,7 +619,7 @@ impl EspressoProgram {
                 return Err(EspError::Msg("_ANEClient connection nil".into()));
             }
             retain(client);
-            let opts = if precompiled {
+            let opts = if kind == LoadKind::PreCompiled {
                 let mut keys: Vec<Id> = vec![
                     objc.ns_string("kANEFModelType"),
                     // aned's _ANEMachoPatcher transforms the relocatable
@@ -619,9 +648,45 @@ impl EspressoProgram {
                     keys.as_ptr(),
                     keys.len(),
                 )
+            } else if kind == LoadKind::Mil {
+                let keys = [
+                    objc.ns_string("kANEFModelType"),
+                    objc.ns_string("kANEFNetPlistFilenameKey"),
+                ];
+                let vals = [
+                    objc.ns_string("kANEFModelMIL"),
+                    objc.ns_string(MIL_FILE_NAME),
+                ];
+                msg!((*const Id, *const Id, usize) -> Id)(
+                    objc.ns_dict,
+                    selp("dictionaryWithObjects:forKeys:count:"),
+                    vals.as_ptr(),
+                    keys.as_ptr(),
+                    keys.len(),
+                )
             } else {
                 objc.empty_dict()
             };
+            if kind == LoadKind::Mil {
+                // aned skips the compile when its cache already holds
+                // this model (keyed on the dir URL + file contents).
+                let mut err: Id = std::ptr::null_mut();
+                let f = msg!((Id, Id, u64, *mut Id) -> bool);
+                let ok = f(
+                    client,
+                    selp("compileModel:options:qos:error:"),
+                    model,
+                    opts,
+                    0,
+                    &mut err,
+                );
+                if !ok {
+                    let msg = err_desc(err);
+                    release(model);
+                    release(client);
+                    return Err(EspError::Msg(format!("compileModel failed: {msg}")));
+                }
+            }
             let mut err: Id = std::ptr::null_mut();
             let f = msg!((Id, Id, u64, *mut Id) -> bool);
             let ok = f(
@@ -638,10 +703,17 @@ impl EspressoProgram {
                 release(client);
                 return Err(EspError::Msg(format!("loadModel failed: {msg}")));
             }
-            let num_inputs = u64v(model, "numInputs");
-            let num_outputs = u64v(model, "numOutputs");
             let program_handle = u64v(model, "programHandle");
             let (input_descs, output_descs, procedures) = Self::parse_attrs(&objc, model);
+            // fall back to the attribute lists when aned has no count getters
+            let num_inputs = match u64v(model, "numInputs") {
+                0 => input_descs.len() as u64,
+                n => n,
+            };
+            let num_outputs = match u64v(model, "numOutputs") {
+                0 => output_descs.len() as u64,
+                n => n,
+            };
 
             let mk = |objc: &Objc, bytes: usize| -> Result<Surface, EspError> {
                 let f = msg!((usize, usize, usize) -> Id);
@@ -1600,6 +1672,14 @@ fn u64v(o: Id, name: &str) -> u64 {
     unsafe {
         let ns = objc_getClass(cstr("NSString").as_ptr());
         let k = msg!((Id) -> Id)(ns, selp("stringWithUTF8String:"), cstr(name).as_ptr() as Id);
+        // Older aned builds don't expose every property (macOS 26 on M1
+        // has no `numInputs`); KVC on a missing key raises an ObjC
+        // exception Rust can't unwind through, so probe the getter first.
+        let responds: bool =
+            msg!((Sel) -> bool)(o, selp("respondsToSelector:"), selp(name));
+        if !responds {
+            return 0;
+        }
         let v = msg!((Id) -> Id)(o, selp("valueForKey:"), k);
         if v.is_null() {
             0
