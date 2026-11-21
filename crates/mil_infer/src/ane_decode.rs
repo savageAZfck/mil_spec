@@ -165,6 +165,16 @@ impl Decoder {
         self.manifest.hidden_size * 2
     }
 
+    /// Concatenated head logits (fp16 bits, flat index = token id) as
+    /// of the last `push`/`push_row` step. `pipe.step()` evaluates the
+    /// heads on every step — `project` only controls the argmax
+    /// shortcut — so these are valid after any push, projected or not.
+    /// Callers doing constrained decoding read this and argmax over a
+    /// masked subset themselves.
+    pub fn logits(&self) -> Vec<u16> {
+        self.pipe.logits()
+    }
+
     /// Feed one token through all layers. With `project`, also reads the
     /// head logits and returns the argmax token.
     pub fn push(&mut self, token: u32, project: bool) -> Result<Option<u32>, E5Error> {
